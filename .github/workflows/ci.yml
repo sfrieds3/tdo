@@ -20,11 +20,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Ubuntu only: macOS runners bill at 10x on private repos; develop and test locally on macOS.
         os: [ubuntu-latest]
         node: [22, 24, 26]
-        include:
-          - os: macos-latest
-            node: 26
     steps:
       - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v6
