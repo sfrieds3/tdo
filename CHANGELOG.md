@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0](https://github.com/sfrieds3/tdo/compare/v0.1.0...v0.2.0) (2026-11-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* the default database moved from ~/.pi/state/tdo.db to $XDG_DATA_HOME/tdo/tdo.db, the .pi/tdo-project override file is now .tdo-project, and PI_STATE_DIR is no longer read. Move an existing database with: mv ~/.pi/state/tdo.db ~/.local/share/tdo/tdo.db
+
+### Features
+
+* XDG paths, agent skill, and config file ([a09bdf2](https://github.com/sfrieds3/tdo/commit/a09bdf2c7cbaec77902b2c3fd76ceef39f3e9caf))
+
 ## 0.1.0 (2026-11-03)
 
 
