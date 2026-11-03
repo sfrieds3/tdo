@@ -1,0 +1,8 @@
+# Local development installs peers for tests and type checks; Pi supplies them at runtime.
+autoInstallPeers: true
+
+allowBuilds:
+  '@google/genai': false
+  esbuild: false
+  koffi: true
+  protobufjs: true

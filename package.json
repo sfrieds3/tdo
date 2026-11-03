@@ -1,0 +1,53 @@
+{
+  "name": "tdo",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A per-project backlog for things to fix later, for your shell and the Pi coding agent.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Scott F",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sfrieds3/tdo.git"
+  },
+  "keywords": [
+    "pi-package",
+    "todo",
+    "backlog",
+    "sqlite",
+    "cli"
+  ],
+  "engines": {
+    "node": ">=22.18"
+  },
+  "packageManager": "pnpm@12.6.0",
+  "bin": {
+    "tdo": "./src/cli.ts"
+  },
+  "files": [
+    "src",
+    "extensions",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test --test-concurrency=4 \"tests/**/*.test.mjs\"",
+    "typecheck": "tsc --noEmit",
+    "check": "pnpm typecheck && pnpm test"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/tdo.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "typescript": "^7.0.0"
+  }
+}
