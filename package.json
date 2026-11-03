@@ -1,8 +1,8 @@
 {
   "name": "tdo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "A per-project backlog for things to fix later \u2014 a CLI, an agent skill, and a Pi extension.",
+  "description": "A per-project backlog for things to fix later — a CLI, an agent skill, and a Pi extension.",
   "type": "module",
   "license": "MIT",
   "author": "Scott F",
