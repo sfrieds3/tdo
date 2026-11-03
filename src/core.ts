@@ -6,9 +6,33 @@
  */
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
+import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import type * as Sqlite from "node:sqlite";
+
+type DatabaseSync = Sqlite.DatabaseSync;
+
+/**
+ * Loads node:sqlite without its one-time ExperimentalWarning (printed on Node < 23.4),
+ * which would otherwise end up on stderr of every CLI call. Other warnings pass through.
+ */
+function loadSqlite(): typeof Sqlite {
+  const emitWarning = process.emitWarning;
+  process.emitWarning = ((warning: string | Error, ...rest: unknown[]) => {
+    const message = typeof warning === "string" ? warning : warning?.message;
+    const type = typeof rest[0] === "string" ? rest[0] : (rest[0] as { type?: string } | undefined)?.type ?? (warning as Error)?.name;
+    if (type === "ExperimentalWarning" && /SQLite/i.test(String(message))) return;
+    return (emitWarning as (...args: unknown[]) => void).call(process, warning, ...rest);
+  }) as typeof process.emitWarning;
+  try {
+    return createRequire(import.meta.url)("node:sqlite") as typeof Sqlite;
+  } finally {
+    process.emitWarning = emitWarning;
+  }
+}
+
+const { DatabaseSync } = loadSqlite();
 
 export const PRIORITIES = ["urgent", "high", "normal", "low"] as const;
 export type Priority = (typeof PRIORITIES)[number];
