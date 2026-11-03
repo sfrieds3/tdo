@@ -7,6 +7,8 @@ import test from "node:test";
 
 const tdo = await import("../src/core.ts");
 
+const NO_CONFIG = { aliases: {} };
+
 function tempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "tdo-test-"));
 }
@@ -32,25 +34,24 @@ test("resolveProject prefers env, override file, remote, then home-relative path
   const repo = path.join(home, "code", "widgets");
   fs.mkdirSync(repo, { recursive: true });
   const env = {};
-  assert.equal(tdo.resolveProject(repo, { env, home }).key, "local:~/code/widgets");
+  assert.equal(tdo.resolveProject(repo, { env, home, config: NO_CONFIG }).key, "local:~/code/widgets");
 
   git(repo, "init", "-q");
-  assert.equal(tdo.resolveProject(repo, { env, home }).key, "local:~/code/widgets");
+  assert.equal(tdo.resolveProject(repo, { env, home, config: NO_CONFIG }).key, "local:~/code/widgets");
 
   git(repo, "remote", "add", "upstream", "https://github.com/upstream/widgets.git");
   git(repo, "remote", "add", "origin", "git@github.com:example/widgets.git");
   const sub = path.join(repo, "src");
   fs.mkdirSync(sub);
-  const project = tdo.resolveProject(sub, { env, home });
+  const project = tdo.resolveProject(sub, { env, home, config: NO_CONFIG });
   assert.equal(project.key, "github.com/example/widgets");
   assert.equal(project.name, "widgets");
   assert.equal(fs.realpathSync(project.root), fs.realpathSync(repo));
 
-  fs.mkdirSync(path.join(repo, ".pi"));
-  fs.writeFileSync(path.join(repo, ".pi", "tdo-project"), "example/custom\n");
-  assert.equal(tdo.resolveProject(sub, { env, home }).key, "example/custom");
+  fs.writeFileSync(path.join(repo, ".tdo-project"), "example/custom\n");
+  assert.equal(tdo.resolveProject(sub, { env, home, config: NO_CONFIG }).key, "example/custom");
 
-  assert.equal(tdo.resolveProject(sub, { env: { TDO_PROJECT: "forced" }, home }).key, "forced");
+  assert.equal(tdo.resolveProject(sub, { env: { TDO_PROJECT: "forced" }, home, config: NO_CONFIG }).key, "forced");
 });
 
 test("priority, tag, and quick-add parsing", () => {
@@ -131,4 +132,36 @@ test("formatters render lines, detail, and markdown", () => {
   assert.equal(tdo.formatItemLine(item), `#${item.id}  high    Fix it  #ci  @ a.ts:1`);
   assert.match(tdo.formatItemDetail(item), /priority: high[\s\S]*\n\nwhy$/);
   assert.equal(tdo.formatMarkdown([item]), `## github.com/example/widgets\n\n- [ ] #${item.id} Fix it (high #ci \`a.ts:1\`)\n`);
+});
+
+test("paths follow XDG base directories with env and config overrides", () => {
+  const home = tempDir();
+  assert.equal(tdo.getDbPath({}, { home }), path.join(home, ".local", "share", "tdo", "tdo.db"));
+  assert.equal(tdo.getConfigPath({}, home), path.join(home, ".config", "tdo", "config.json"));
+  assert.equal(tdo.getDbPath({ XDG_DATA_HOME: "/data" }, { home }), path.join("/data", "tdo", "tdo.db"));
+  assert.equal(tdo.getConfigPath({ XDG_CONFIG_HOME: "/cfg" }, home), path.join("/cfg", "tdo", "config.json"));
+  // Relative XDG values are invalid per the spec and ignored.
+  assert.equal(tdo.getDbPath({ XDG_DATA_HOME: "relative" }, { home }), path.join(home, ".local", "share", "tdo", "tdo.db"));
+  assert.equal(tdo.getDbPath({ TDO_DB: "/x/y.db" }, { home }), "/x/y.db");
+  assert.equal(tdo.getConfigPath({ TDO_CONFIG: "/x/c.json" }, home), "/x/c.json");
+});
+
+test("config file sets the database path and project aliases", () => {
+  const home = tempDir();
+  const env = { XDG_CONFIG_HOME: path.join(home, "cfg") };
+  assert.deepEqual(tdo.loadConfig(env, home), { aliases: {} });
+
+  fs.mkdirSync(path.join(home, "cfg", "tdo"), { recursive: true });
+  const file = path.join(home, "cfg", "tdo", "config.json");
+  fs.writeFileSync(file, JSON.stringify({ db: "~/backlog/tdo.db", aliases: { "github.com/me/widgets": "github.com/example/widgets" } }));
+  const config = tdo.loadConfig(env, home);
+  assert.equal(config.db, path.join(home, "backlog", "tdo.db"));
+  assert.equal(tdo.getDbPath(env, { home }), path.join(home, "backlog", "tdo.db"));
+  assert.equal(tdo.getDbPath({ ...env, TDO_DB: "/override.db" }, { home }), "/override.db");
+  assert.equal(tdo.resolveProject(home, { env: { TDO_PROJECT: "github.com/me/widgets" }, home, config }).key, "github.com/example/widgets");
+
+  fs.writeFileSync(file, "{ nope");
+  assert.throws(() => tdo.loadConfig(env, home), /invalid JSON/);
+  fs.writeFileSync(file, JSON.stringify({ aliases: { a: 1 } }));
+  assert.throws(() => tdo.loadConfig(env, home), /"aliases" must map/);
 });

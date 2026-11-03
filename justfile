@@ -17,8 +17,10 @@ typecheck:
 # Run all validation.
 check: typecheck test
 
-# Link the CLI onto PATH (~/.local/bin/tdo).
+# Link the CLI onto PATH and the skill into ~/.agents/skills and ~/.claude/skills.
 link:
-    mkdir -p ~/.local/bin
-    ln -sf "{{justfile_directory()}}/src/cli.ts" ~/.local/bin/tdo
-    @echo "linked ~/.local/bin/tdo -> {{justfile_directory()}}/src/cli.ts"
+    mkdir -p ~/.local/bin ~/.agents/skills ~/.claude/skills
+    ln -sfn "{{justfile_directory()}}/src/cli.ts" ~/.local/bin/tdo
+    ln -sfn "{{justfile_directory()}}/skills/tdo" ~/.agents/skills/tdo
+    ln -sfn "{{justfile_directory()}}/skills/tdo" ~/.claude/skills/tdo
+    @echo "linked ~/.local/bin/tdo, ~/.agents/skills/tdo, ~/.claude/skills/tdo"

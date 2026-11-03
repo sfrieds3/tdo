@@ -2,7 +2,7 @@
   "name": "tdo",
   "version": "0.1.0",
   "private": true,
-  "description": "A per-project backlog for things to fix later, for your shell and the Pi coding agent.",
+  "description": "A per-project backlog for things to fix later \u2014 a CLI, an agent skill, and a Pi extension.",
   "type": "module",
   "license": "MIT",
   "author": "Scott F",
@@ -11,11 +11,14 @@
     "url": "git+https://github.com/sfrieds3/tdo.git"
   },
   "keywords": [
-    "pi-package",
-    "todo",
+    "agent-skills",
     "backlog",
+    "claude-code",
+    "cli",
+    "codex",
+    "pi-package",
     "sqlite",
-    "cli"
+    "todo"
   ],
   "engines": {
     "node": ">=22.18"
@@ -27,6 +30,7 @@
   "files": [
     "src",
     "extensions",
+    "skills",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
@@ -39,6 +43,9 @@
   "pi": {
     "extensions": [
       "./extensions/tdo.ts"
+    ],
+    "skills": [
+      "./skills"
     ]
   },
   "peerDependencies": {

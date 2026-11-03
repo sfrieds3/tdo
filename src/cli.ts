@@ -2,6 +2,7 @@
 /**
  * tdo — per-project "fix later" backlog. See README.md.
  */
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
@@ -16,11 +17,13 @@ import {
   formatItemLine,
   formatItemList,
   formatMarkdown,
+  getConfigPath,
   getDbPath,
   getItem,
   listItems,
   listProjects,
   listTags,
+  loadConfig,
   openDb,
   parseQuickAdd,
   parseStatusFilter,
@@ -36,7 +39,8 @@ import {
 const USAGE = `tdo — per-project backlog for things to fix later
 
 usage:
-  tdo add <title...> [-p PRIO] [-t TAGS] [-b BODY] [-f PATH[:LINE]]   (inline !high and #tag work too)
+  tdo add <title...> [-p PRIO] [-t TAGS] [-b BODY] [-f PATH[:LINE]] [--source NAME]
+                            (inline !high and #tag work too)
   tdo ls [-a] [-s STATUS] [-t TAGS] [-p PRIO] [-q TEXT] [-n N]
   tdo show <id>
   tdo edit <id> [--title T] [-p PRIO] [-t +tag,-tag] [-b BODY] [-f REF]
@@ -46,6 +50,7 @@ usage:
   tdo tags [-a]             tag counts for active items
   tdo projects              all projects with active counts
   tdo project               show the resolved project key
+  tdo paths                 show the database and config file locations
   tdo export [-a] [--md]    dump items as JSON (default) or Markdown
 
 options:
@@ -56,7 +61,9 @@ options:
 
 priorities: ${PRIORITIES.join(", ")} (prefixes and 0-3 accepted)
 statuses:   ${STATUS_FILTERS.join(", ")} (ls default: active = open + doing)
-env:        TDO_DB (default ~/.pi/state/tdo.db), TDO_PROJECT`;
+files:      database $XDG_DATA_HOME/tdo/tdo.db (default ~/.local/share/tdo/tdo.db)
+            config   $XDG_CONFIG_HOME/tdo/config.json (optional; keys: db, aliases)
+env:        TDO_DB, TDO_CONFIG, TDO_PROJECT, TDO_SOURCE (who is adding: cli, claude, codex, ...)`;
 
 const OPTIONS = {
   project: { type: "string" },
@@ -73,6 +80,7 @@ const OPTIONS = {
   title: { type: "string" },
   message: { type: "string", short: "m" },
   md: { type: "boolean" },
+  source: { type: "string" },
   help: { type: "boolean", short: "h" },
 } as const;
 
@@ -108,15 +116,22 @@ export function run(argv: string[], io: { out: (text: string) => void; cwd: stri
   const json = !!values.json;
   const emit = (data: unknown, text: string) => io.out(json ? JSON.stringify(data, null, 2) : text);
   const cwd = values.C ? path.resolve(io.cwd, values.C) : io.cwd;
-  const project = (): Project => (values.project ? projectFromKey(values.project) : resolveProject(cwd, { env: io.env }));
+  const config = loadConfig(io.env);
+  const project = (): Project => (values.project ? projectFromKey(values.project) : resolveProject(cwd, { env: io.env, config }));
+  const dbPath = getDbPath(io.env, { config });
 
   if (command === "project") {
     const resolved = project();
     emit(resolved, resolved.key);
     return 0;
   }
+  if (command === "paths") {
+    const paths = { db: dbPath, config: getConfigPath(io.env), configExists: fs.existsSync(getConfigPath(io.env)) };
+    emit(paths, `db:     ${paths.db}\nconfig: ${paths.config}${paths.configExists ? "" : " (not present)"}`);
+    return 0;
+  }
 
-  const db = openDb(getDbPath(io.env));
+  const db = openDb(dbPath);
   try {
     switch (command) {
       case "add": {
@@ -129,7 +144,7 @@ export function run(argv: string[], io: { out: (text: string) => void; cwd: stri
           tags: [...quick.tags, ...(values.tags ?? [])],
           body: values.body,
           fileRef: values.file,
-          source: io.env.TDO_SOURCE || "cli",
+          source: values.source || io.env.TDO_SOURCE || "cli",
           sessionId: io.env.TDO_SESSION_ID,
           host: os.hostname().split(".")[0],
         });

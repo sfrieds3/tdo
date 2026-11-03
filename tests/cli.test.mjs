@@ -11,7 +11,7 @@ const PROJECT = "github.com/example/widgets";
 
 function harness() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tdo-cli-"));
-  const env = { TDO_DB: path.join(dir, "tdo.db"), TDO_PROJECT: PROJECT };
+  const env = { TDO_DB: path.join(dir, "tdo.db"), TDO_PROJECT: PROJECT, XDG_CONFIG_HOME: path.join(dir, "config") };
   return (...argv) => {
     const out = [];
     const code = run(argv, { out: (text) => out.push(text), cwd: dir, env });
@@ -46,6 +46,15 @@ test("add, list, edit, close, and export round-trip", () => {
   assert.equal(tdo("export").json().length, 2);
   assert.match(tdo("projects").out, /1 {2}github\.com\/example\/widgets/);
   assert.match(tdo("ls", "-a").out, /\(github\.com\/example\/widgets\)/);
+  assert.equal(tdo("add", "from an agent", "--source", "claude", "--json").json().source, "claude");
+});
+
+test("paths reports the database and config locations", () => {
+  const tdo = harness();
+  const paths = tdo("paths", "--json").json();
+  assert.match(paths.db, /tdo\.db$/);
+  assert.match(paths.config, /config[\\/]tdo[\\/]config\.json$/);
+  assert.equal(paths.configExists, false);
 });
 
 test("invalid input raises clear errors", () => {
@@ -58,7 +67,7 @@ test("invalid input raises clear errors", () => {
 });
 
 test("the script runs as a CLI with usage-error exit codes", () => {
-  const env = { ...process.env, TDO_DB: path.join(fs.mkdtempSync(path.join(os.tmpdir(), "tdo-bin-")), "tdo.db"), TDO_PROJECT: PROJECT };
+  const env = { ...process.env, XDG_CONFIG_HOME: fs.mkdtempSync(path.join(os.tmpdir(), "tdo-cfg-")), TDO_DB: path.join(fs.mkdtempSync(path.join(os.tmpdir(), "tdo-bin-")), "tdo.db"), TDO_PROJECT: PROJECT };
   const ok = spawnSync(process.execPath, [SCRIPT, "add", "hello"], { env, encoding: "utf8" });
   assert.equal(ok.status, 0, ok.stderr);
   assert.match(ok.stdout, /added #1/);

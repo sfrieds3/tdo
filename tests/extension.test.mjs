@@ -16,15 +16,16 @@ function harness({ selections = [] } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tdo-ext-"));
   process.env.TDO_DB = path.join(dir, "tdo.db");
   process.env.TDO_PROJECT = PROJECT;
+  process.env.XDG_CONFIG_HOME = path.join(dir, "config");
   const handlers = new Map();
   const notifications = [];
   const statuses = new Map();
   const sent = [];
-  let tool;
+  const tools = [];
   let command;
   const pi = {
     on(name, handler) { handlers.set(name, [...(handlers.get(name) || []), handler]); },
-    registerTool(definition) { tool = definition; },
+    registerTool(definition) { tools.push(definition); },
     registerCommand(_name, definition) { command = definition; },
     sendUserMessage(text, options) { sent.push({ text, options }); },
   };
@@ -42,36 +43,24 @@ function harness({ selections = [] } = {}) {
   };
   extension.default(pi);
   const emit = async (name, event = {}) => { for (const handler of handlers.get(name) || []) await handler(event, ctx); };
-  const call = (params) => tool.execute("call-1", params, undefined, undefined, ctx);
   const items = () => { const db = core.openDb(process.env.TDO_DB); try { return core.listItems(db, { status: "all" }); } finally { db.close(); } };
-  return { tool, command, ctx, emit, call, items, notifications, statuses, sent };
+  const addDirect = (input) => { const db = core.openDb(process.env.TDO_DB); try { return core.addItem(db, { project: PROJECT, ...input }); } finally { db.close(); } };
+  return { tools, command, ctx, emit, items, addDirect, notifications, statuses, sent };
 }
 
-test("tool adds, lists, updates, and closes items for the resolved project", async () => {
+test("registers no model-facing tool; agents use the CLI through the skill", () => {
+  assert.deepEqual(harness().tools, []);
+});
+
+test("footer count refreshes on session start and after agent runs", async () => {
   const h = harness();
   await h.emit("session_start");
   assert.equal(h.statuses.get("tdo"), undefined);
-
-  const added = await h.call({ action: "add", title: "Handle empty config", priority: "high", tags: ["config"], file: "src/config.ts:10", body: "Crashes on {}" });
-  assert.match(added.content[0].text, /^Added #1 {2}high/);
-  assert.equal(added.details.item.source, "agent");
-  assert.equal(added.details.item.sessionId, "session-1");
-  assert.equal(added.details.item.project, PROJECT);
-  assert.equal(h.statuses.get("tdo"), "tdo 1 (1!)");
-
-  await h.call({ action: "add", title: "Tidy logging", priority: "low" });
-  const listed = await h.call({ action: "list" });
-  assert.match(listed.content[0].text, /^tdo items \(github\.com\/example\/widgets, active\):\n#1 .*\n#2 /);
-  assert.equal((await h.call({ action: "list", query: "logging" })).details.items.length, 1);
-
-  const updated = await h.call({ action: "update", id: 2, priority: "normal", tags: ["logs"] });
-  assert.deepEqual(updated.details.item.tags, ["logs"]);
-
-  const done = await h.call({ action: "done", id: 1, note: "guarded parse" });
-  assert.equal(done.details.item.status, "done");
-  assert.equal(h.statuses.get("tdo"), "tdo 1");
-  await assert.rejects(() => h.call({ action: "done" }), /requires an item id/);
-  await assert.rejects(() => h.call({ action: "add", title: "x", priority: "meh" }), /priority must be one of/);
+  // Simulate an agent adding items through the CLI during a run.
+  h.addDirect({ title: "Handle empty config", priority: "high" });
+  h.addDirect({ title: "Tidy logging", priority: "low" });
+  await h.emit("agent_end");
+  assert.equal(h.statuses.get("tdo"), "tdo 2 (1!)");
 });
 
 test("/tdo quick-adds with inline priority and tags, and changes status by id", async () => {
@@ -82,11 +71,17 @@ test("/tdo quick-adds with inline priority and tags, and changes status by id", 
   assert.equal(item.priority, "urgent");
   assert.deepEqual(item.tags, ["ci"]);
   assert.equal(item.source, "user");
+  assert.equal(item.sessionId, "session-1");
   assert.match(h.notifications.at(-1).message, /^tdo: added #1/);
+  assert.equal(h.statuses.get("tdo"), "tdo 1 (1!)");
 
   await h.command.handler("done #1 retried", h.ctx);
   assert.equal(h.items()[0].status, "done");
   assert.match(h.items()[0].body, /retried/);
+  assert.equal(h.statuses.get("tdo"), undefined);
+
+  await h.command.handler("show 1", h.ctx);
+  assert.match(h.notifications.at(-1).message, /^#1 fix flaky login test/);
 
   await h.command.handler("done 99", h.ctx);
   assert.equal(h.notifications.at(-1).level, "error");
@@ -105,5 +100,5 @@ test("/tdo browse picks an item and can hand it to the agent", async () => {
   assert.equal(h.items()[0].status, "doing");
   assert.equal(h.sent.length, 1);
   assert.match(h.sent[0].text, /Let's work on tdo item #1/);
-  assert.match(h.sent[0].text, /rename helpers/);
+  assert.match(h.sent[0].text, /tdo done 1 -m/);
 });

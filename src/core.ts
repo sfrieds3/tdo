@@ -1,7 +1,7 @@
 /**
  * tdo — per-project "fix later" backlog stored in SQLite.
  *
- * Shared by the `tdo` CLI (src/cli.ts) and the Pi extension (extensions/tdo.ts).
+ * Shared by the `tdo` CLI (src/cli.ts) and the Pi extension (extensions/tdo.ts); agents use the CLI via skills/tdo.
  * Uses only erasable TypeScript syntax so Node can run it directly with type stripping.
  */
 import { execFileSync } from "node:child_process";
@@ -268,18 +268,15 @@ export function projectFromKey(key: string): Project {
   return { key: trimmed, name: nameFromKey(trimmed) };
 }
 
-/**
- * Resolves the project for a directory: `TDO_PROJECT`, then a `.pi/tdo-project` file at the repo root,
- * then the normalized git remote (origin first), then `local:<home-relative main worktree path>`.
- */
-export function resolveProject(cwd: string, options: { env?: NodeJS.ProcessEnv; home?: string } = {}): Project {
-  const env = options.env ?? process.env;
-  const home = options.home ?? os.homedir();
+/** Repo-root file whose first line overrides the project key (for example, so a fork shares upstream's backlog). */
+export const PROJECT_FILE = ".tdo-project";
+
+function detectProject(cwd: string, env: NodeJS.ProcessEnv, home: string): Project {
   if (env.TDO_PROJECT?.trim()) return projectFromKey(env.TDO_PROJECT);
   const top = git(cwd, ["rev-parse", "--show-toplevel"]);
   if (!top) return { ...projectFromKey(`local:${homeRelative(path.resolve(cwd), home)}`), root: path.resolve(cwd) };
   try {
-    const override = fs.readFileSync(path.join(top, ".pi", "tdo-project"), "utf8").split("\n")[0]?.trim();
+    const override = fs.readFileSync(path.join(top, PROJECT_FILE), "utf8").split("\n")[0]?.trim();
     if (override) return { ...projectFromKey(override), root: top };
   } catch {
     // No override file.
@@ -294,13 +291,82 @@ export function resolveProject(cwd: string, options: { env?: NodeJS.ProcessEnv; 
   return { ...projectFromKey(`local:${homeRelative(mainRoot, home)}`), root: top };
 }
 
+/**
+ * Resolves the project for a directory: `TDO_PROJECT`, then a `.tdo-project` file at the repo root,
+ * then the normalized git remote (origin first), then `local:<home-relative main worktree path>`.
+ * The result is then mapped through the config's `aliases`.
+ */
+export function resolveProject(cwd: string, options: { env?: NodeJS.ProcessEnv; home?: string; config?: Config } = {}): Project {
+  const env = options.env ?? process.env;
+  const home = options.home ?? os.homedir();
+  const project = detectProject(cwd, env, home);
+  const alias = (options.config ?? loadConfig(env, home)).aliases[project.key];
+  return alias ? { ...projectFromKey(alias), root: project.root } : project;
+}
+
 // ---------------------------------------------------------------------------
 // Database
 
-export function getDbPath(env: NodeJS.ProcessEnv = process.env): string {
+/** Resolves an XDG base directory; the spec says relative values are invalid and must be ignored. */
+function xdgDir(env: NodeJS.ProcessEnv, name: "XDG_DATA_HOME" | "XDG_CONFIG_HOME", fallback: string, home: string): string {
+  const value = env[name]?.trim();
+  return value && path.isAbsolute(value) ? value : path.join(home, fallback);
+}
+
+export function getDataDir(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): string {
+  return path.join(xdgDir(env, "XDG_DATA_HOME", path.join(".local", "share"), home), "tdo");
+}
+
+export function getConfigDir(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): string {
+  return path.join(xdgDir(env, "XDG_CONFIG_HOME", ".config", home), "tdo");
+}
+
+export function getConfigPath(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): string {
+  return env.TDO_CONFIG?.trim() || path.join(getConfigDir(env, home), "config.json");
+}
+
+function expandHome(value: string, home: string): string {
+  return value === "~" ? home : value.startsWith("~/") ? path.join(home, value.slice(2)) : value;
+}
+
+/** Optional user config at `$XDG_CONFIG_HOME/tdo/config.json`. */
+export type Config = {
+  /** Database path; `TDO_DB` takes precedence. */
+  db?: string;
+  /** Maps a resolved project key to the key to use instead, e.g. a fork to its upstream. */
+  aliases: Record<string, string>;
+};
+
+export function loadConfig(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): Config {
+  const file = getConfigPath(env, home);
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { aliases: {} };
+    throw error;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`invalid JSON in ${file}: ${(error as Error).message}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${file} must contain a JSON object.`);
+  const { db, aliases } = parsed as { db?: unknown; aliases?: unknown };
+  if (db !== undefined && typeof db !== "string") throw new Error(`${file}: "db" must be a string.`);
+  if (aliases !== undefined && (!aliases || typeof aliases !== "object" || Array.isArray(aliases) || Object.values(aliases).some((value) => typeof value !== "string" || !value.trim()))) {
+    throw new Error(`${file}: "aliases" must map project keys to non-empty strings.`);
+  }
+  return { db: db?.trim() ? expandHome(db.trim(), home) : undefined, aliases: { ...(aliases as Record<string, string> | undefined) } };
+}
+
+/** Database path: `TDO_DB`, then the config's `db`, then `$XDG_DATA_HOME/tdo/tdo.db`. */
+export function getDbPath(env: NodeJS.ProcessEnv = process.env, options: { home?: string; config?: Config } = {}): string {
+  const home = options.home ?? os.homedir();
   if (env.TDO_DB?.trim()) return env.TDO_DB.trim();
-  const stateDir = env.PI_STATE_DIR || path.join(os.homedir(), ".pi", "state");
-  return path.join(stateDir, "tdo.db");
+  const config = options.config ?? loadConfig(env, home);
+  return config.db ?? path.join(getDataDir(env, home), "tdo.db");
 }
 
 export function openDb(dbPath = getDbPath()): DatabaseSync {
