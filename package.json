@@ -1,6 +1,6 @@
 {
   "name": "tdo",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "description": "A per-project backlog for things to fix later, for your shell and the Pi coding agent.",
   "type": "module",
