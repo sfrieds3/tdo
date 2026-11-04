@@ -74,23 +74,66 @@ Use `@v0.2.3` to pin an exact release, or a local path (`"~/code/tdo"`) while ha
 | Command | What it does |
 |---|---|
 | `tdo add <title…> [-p PRIO] [-t TAGS] [-b BODY] [-f PATH[:LINE]]` | Add an item. `!prio` and `#tag` in the title work too. |
-| `tdo ls [-a] [-s STATUS] [-t TAGS] [-p PRIO] [-q TEXT] [-n N]` | List items. Defaults to active (`open` + `doing`) in this project. |
-| `tdo show <id>` | Full details, including the body. |
-| `tdo edit <id> [--title T] [-p PRIO] [-t +add,-remove] [-b BODY] [-f REF]` | Change an item. |
-| `tdo start` / `done` / `drop` / `reopen <id>… [-m NOTE]` | Change status; the note is appended to the body. |
-| `tdo rm <id>` | Delete an item outright. |
+| `tdo` | In a terminal with [fzf](https://github.com/junegunn/fzf): [browse and act on items](#browser). Otherwise the same as `tdo ls`. |
+| `tdo ls [-a] [-s STATUS] [-t TAGS] [-p PRIO] [-q TEXT] [-n N]` | List items. Defaults to active (`open` + `doing`) in this project. `-a` [groups by project](#all-projects). |
+| `tdo show [id]` | Full details, including the body. |
+| `tdo edit [id] [--title T] [-p PRIO] [-t +add,-remove] [-b BODY] [-f REF]` | Change an item. With no flags, opens the title and body in `$VISUAL` / `$EDITOR`. |
+| `tdo start` / `done` / `drop` / `reopen [id…] [-m NOTE]` | Change status; the note is appended to the body. |
+| `tdo rm [id]` | Delete an item outright. |
+| `tdo pick [-a] [-s STATUS]` | Pick items with fzf and print their refs, for scripting: `tdo done $(tdo pick)`. |
 
-Item ids are numbered per project, so every repo's backlog starts at `#1`. `3` or `#3` means item 3 in the current project; reach another project with `NAME#3` (`gadgets#3`, when the name is unambiguous), `KEY#3` (`github.com/example/gadgets#3`), or `--project KEY`. Cross-project listings (`ls -a`) show ids as `NAME#3`. In `--json` output, `id` is the per-project number and `projectId` is the project's UUID; together they identify an item.
 | `tdo count` | One-line summary, e.g. `4 open (1 urgent, 1 high)`. |
 | `tdo tags [-a]` · `tdo projects` · `tdo project` | Tag counts, every project, the resolved project key. |
 | `tdo export [-a] [--md]` | Dump everything as JSON, or as a Markdown checklist. |
 | `tdo migrate [--dry-run]` | Upgrade an older database: back it up, then print which ids changed. |
+
+Item ids are numbered per project, so every repo's backlog starts at `#1`. `3` or `#3` means item 3 in the current project; reach another project with `NAME#3` (`gadgets#3`, when the name is unambiguous), `KEY#3` (`github.com/example/gadgets#3`), or `--project KEY`. Cross-project listings (`ls -a`) show ids as `NAME#3`. In `--json` output, `id` is the per-project number and `projectId` is the project's UUID; together they identify an item.
+
+Leave the id out of `show`, `edit`, `start`, `done`, `drop`, `reopen`, or `rm` and tdo opens fzf to pick it (`tab` marks several for the status commands; `reopen` offers closed items). Add `-a` to pick across projects. Without fzf or a terminal, the id is required.
 
 Global options: `--json` for machine-readable output, `--project KEY` to target another project, `-C DIR` to resolve the project from another directory, `-a` / `--all` to span every project. `add` also takes `--source NAME` (or `TDO_SOURCE`) to record who added the item; it defaults to `cli`.
 
 `tdo project` shows the resolved project key and `tdo paths` shows where the database and config live.
 
 `-p` on `ls` means "this priority or more urgent", so `tdo ls -p high` shows urgent and high items. Priorities accept prefixes (`-p u`).
+
+### Browser
+
+Plain `tdo` opens fzf over the backlog with a preview of the highlighted item. Type to filter; `tab` marks several items for the status and priority keys.
+
+| Key | Action |
+|---|---|
+| `enter` | View the item in `$PAGER` |
+| `ctrl-e` | Edit title and body in `$VISUAL` / `$EDITOR` |
+| `ctrl-s` · `ctrl-d` · `ctrl-x` · `ctrl-r` | Start · done · drop · reopen |
+| `alt-up` · `alt-down` | Raise · lower priority |
+| `alt-d` | Delete (asks first) |
+| `ctrl-n` | Add the typed query as a new item |
+| `ctrl-a` | Toggle all projects |
+| `ctrl-t` | Toggle closed items |
+| `esc` | Quit |
+
+`tdo browse -a -s all` starts with every project and closed items showing. `TDO_FZF_OPTS` adds fzf flags (e.g. `--height=100%`) on top of `FZF_DEFAULT_OPTS`.
+
+### All projects
+
+`tdo ls -a` groups items under a bold project header, most urgent first, and shows the projects with the most urgent work at the top:
+
+```console
+$ tdo ls -a
+widgets  github.com/example/widgets · 7 items, 3!
+  #2  urgent  crash on empty file
+  #1  high    fix flaky test  #ci
+  #6  high    speed up build
+  #4  normal  tidy logs
+  #5  normal  doc the api
+  … 2 more (tdo ls --project github.com/example/widgets)
+
+gadgets  github.com/example/gadgets · 1 item
+  #1  normal  bump deps
+```
+
+It shows 5 items per project; `-n N` changes that for one run (`-n 0` shows everything), and `perProject` in the [config file](#configuration) changes the default. Output is colored on a terminal; `NO_COLOR` turns that off and `FORCE_COLOR` forces it on (e.g. for `less -R`).
 
 ```console
 $ tdo show 4
@@ -168,6 +211,7 @@ Everything works without a config file. To change defaults, create `$XDG_CONFIG_
 ```json
 {
   "db": "~/Sync/tdo/tdo.db",
+  "perProject": 10,
   "aliases": {
     "github.com/me/widgets": "github.com/example/widgets"
   }
@@ -177,9 +221,10 @@ Everything works without a config file. To change defaults, create `$XDG_CONFIG_
 | Key | Meaning |
 |---|---|
 | `db` | Database path (`~` expands). `TDO_DB` wins over it. |
+| `perProject` | Items per project in `tdo ls -a` (default 5; 0 shows all). |
 | `aliases` | Maps a resolved project key to the key to use instead — e.g. your fork to its upstream, so both share one backlog. |
 
-Environment variables: `TDO_DB`, `TDO_CONFIG`, `TDO_PROJECT` (force a project key), `TDO_SOURCE` (default `--source`).
+Environment variables: `TDO_DB`, `TDO_CONFIG`, `TDO_PROJECT` (force a project key), `TDO_SOURCE` (default `--source`), `TDO_FZF_OPTS` (extra fzf flags), `NO_COLOR` / `FORCE_COLOR`.
 
 ## Development
 

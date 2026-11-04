@@ -206,6 +206,25 @@ test("formatters render lines, detail, and markdown", () => {
   assert.equal(tdo.formatMarkdown([item]), `## github.com/example/widgets\n\n- [ ] #${item.id} Fix it (high #ci \`a.ts:1\`)\n`);
 });
 
+test("grouped list renders bold project headers and per-project caps", () => {
+  const db = tdo.openDb(":memory:");
+  for (const [project, title, priority] of [["github.com/example/widgets", "w-low", "low"], ["github.com/example/widgets", "w-urgent", "urgent"], ["github.com/example/gadgets", "g-high", "high"]]) {
+    tdo.addItem(db, { project, title, priority });
+  }
+  const items = tdo.listItems(db);
+  assert.equal(tdo.formatGroupedList(items, { perProject: 1 }), [
+    "widgets  github.com/example/widgets · 2 items, 1!",
+    "  #2  urgent  w-urgent",
+    "  … 1 more (tdo ls --project github.com/example/widgets)",
+    "",
+    "gadgets  github.com/example/gadgets · 1 item, 1!",
+    "  #1  high    g-high",
+  ].join("\n"));
+  assert.match(tdo.formatGroupedList(items, { color: true }), /^\x1b\[1mwidgets\x1b\[22m/);
+  assert.equal(tdo.formatGroupedList([]), "(nothing here)");
+  assert.deepEqual(tdo.parseEditorText("title\r\n\r\nbody\n"), { title: "title", body: "body" });
+});
+
 test("paths follow XDG base directories with env and config overrides", () => {
   const home = tempDir();
   assert.equal(tdo.getDbPath({}, { home }), path.join(home, ".local", "share", "tdo", "tdo.db"));
@@ -234,6 +253,10 @@ test("config file sets the database path and project aliases", () => {
 
   fs.writeFileSync(file, "{ nope");
   assert.throws(() => tdo.loadConfig(env, home), /invalid JSON/);
+  fs.writeFileSync(file, JSON.stringify({ perProject: 3 }));
+  assert.equal(tdo.loadConfig(env, home).perProject, 3);
+  fs.writeFileSync(file, JSON.stringify({ perProject: -1 }));
+  assert.throws(() => tdo.loadConfig(env, home), /"perProject" must be a non-negative integer/);
   fs.writeFileSync(file, JSON.stringify({ aliases: { a: 1 } }));
   assert.throws(() => tdo.loadConfig(env, home), /"aliases" must map/);
 });
