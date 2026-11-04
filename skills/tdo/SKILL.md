@@ -45,4 +45,5 @@ A future session — possibly another agent on another machine — must understa
 
 - If `tdo` is not on PATH, tell the user; don't try to install it.
 - `tdo project` prints the resolved project key; `tdo paths` shows where the database and config live.
+- Item ids are per project: `3` / `#3` is item 3 in the current project. For another project use `NAME#3` or `--project KEY`. In JSON, `id` is that per-project number and `projectId` is the project's UUID.
 - Do not edit the SQLite database directly; always go through the CLI.

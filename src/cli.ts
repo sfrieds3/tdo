@@ -19,12 +19,17 @@ import {
   formatMarkdown,
   getConfigPath,
   getDbPath,
-  getItem,
+  findItem,
   listItems,
   listProjects,
   listTags,
   loadConfig,
+  migrateDb,
   openDb,
+  planMigration,
+  schemaVersion,
+  SCHEMA,
+  type IdChange,
   parseQuickAdd,
   parseStatusFilter,
   projectFromKey,
@@ -42,7 +47,7 @@ usage:
   tdo add <title...> [-p PRIO] [-t TAGS] [-b BODY] [-f PATH[:LINE]] [--source NAME]
                             (inline !high and #tag work too)
   tdo ls [-a] [-s STATUS] [-t TAGS] [-p PRIO] [-q TEXT] [-n N]
-  tdo show <id>
+  tdo show <id>              ids are per project: 3 or #3 here, NAME#3 or KEY#3 elsewhere
   tdo edit <id> [--title T] [-p PRIO] [-t +tag,-tag] [-b BODY] [-f REF]
   tdo start|done|drop|reopen <id>... [-m NOTE]
   tdo rm <id>
@@ -51,6 +56,7 @@ usage:
   tdo projects              all projects with active counts
   tdo project               show the resolved project key
   tdo paths                 show the database and config file locations
+  tdo migrate [--dry-run]   upgrade an older database (backs it up first) and print id changes
   tdo export [-a] [--md]    dump items as JSON (default) or Markdown
 
 options:
@@ -80,6 +86,7 @@ const OPTIONS = {
   title: { type: "string" },
   message: { type: "string", short: "m" },
   md: { type: "boolean" },
+  "dry-run": { type: "boolean" },
   source: { type: "string" },
   help: { type: "boolean", short: "h" },
 } as const;
@@ -88,10 +95,9 @@ const STATUS_COMMANDS: Record<string, Status> = { start: "doing", done: "done", 
 
 class UsageError extends Error {}
 
-function parseId(value: string | undefined): number {
-  const id = Number(String(value ?? "").replace(/^#/, ""));
-  if (!Number.isInteger(id) || id <= 0) throw new UsageError(`expected an item id, got ${JSON.stringify(value ?? "")}.`);
-  return id;
+function requireRef(value: string | undefined): string {
+  if (!/^(?:.+#|#)?\d+$/.test(value?.trim() ?? "") || /^(?:.*#|#)?0+$/.test(value!.trim())) throw new UsageError(`expected an item id, got ${JSON.stringify(value ?? "")}.`);
+  return value!.trim();
 }
 
 /** Splits `-t +a,-b,c` style edits into tags to add and remove. */
@@ -131,7 +137,38 @@ export function run(argv: string[], io: { out: (text: string) => void; cwd: stri
     return 0;
   }
 
+  if (command === "migrate") {
+    const db = openDb(dbPath, { migrate: false });
+    try {
+      const version = schemaVersion(db);
+      const changes = planMigration(db);
+      const lines = (rows: IdChange[]) => rows.filter((row) => row.from !== row.to).map((row) => `  ${row.project}  #${row.from} -> #${row.to}  ${row.title}`);
+      if (version === SCHEMA) {
+        emit({ from: version, to: version, changes: [] }, `${dbPath}: already at schema v${version}.`);
+        return 0;
+      }
+      if (values["dry-run"]) {
+        const renamed = lines(changes);
+        emit({ from: version, to: SCHEMA, dryRun: true, changes }, [`${dbPath}: would upgrade schema v${version} -> v${SCHEMA}.`, renamed.length ? "id changes:" : "no ids change.", ...renamed].join("\n"));
+        return 0;
+      }
+      const result = migrateDb(db, dbPath);
+      const renamed = lines(result.changes);
+      emit(result, [
+        `${dbPath}: upgraded schema v${result.from} -> v${result.to}.`,
+        ...(result.backup ? [`backup: ${result.backup}`] : []),
+        renamed.length ? "id changes:" : "no ids changed.",
+        ...renamed,
+      ].join("\n"));
+      return 0;
+    } finally {
+      db.close();
+    }
+  }
+
   const db = openDb(dbPath);
+  /** Item ids are per project: `3` / `#3` here, `name#3` or `host/owner/repo#3` elsewhere. */
+  const find = (value: string | undefined) => findItem(db, requireRef(value), project().key);
   try {
     switch (command) {
       case "add": {
@@ -167,15 +204,14 @@ export function run(argv: string[], io: { out: (text: string) => void; cwd: stri
         return 0;
       }
       case "show": {
-        const item = getItem(db, parseId(args[0]));
-        if (!item) throw new Error(`No tdo item #${parseId(args[0])}.`);
+        const item = find(args[0]);
         emit(item, formatItemDetail(item));
         return 0;
       }
       case "edit": {
-        const id = parseId(args[0]);
+        const target = find(args[0]);
         const tags = tagEdits(values.tags);
-        const item = updateItem(db, id, {
+        const item = updateItem(db, target, {
           title: values.title,
           priority: values.priority ? requirePriority(values.priority) : undefined,
           body: values.body,
@@ -191,12 +227,13 @@ export function run(argv: string[], io: { out: (text: string) => void; cwd: stri
       case "drop":
       case "reopen": {
         if (!args.length) throw new UsageError(`tdo ${command} needs an item id.`);
-        const items = args.map((arg) => setStatus(db, parseId(arg), STATUS_COMMANDS[command], values.message));
+        const targets = args.map(find);
+        const items = targets.map((target) => setStatus(db, target, STATUS_COMMANDS[command], values.message));
         emit(items.length === 1 ? items[0] : items, items.map((item) => `${item.status} ${formatItemLine(item)}`).join("\n"));
         return 0;
       }
       case "rm": {
-        const item = deleteItem(db, parseId(args[0]));
+        const item = deleteItem(db, find(args[0]));
         emit(item, `deleted #${item.id} ${item.title}`);
         return 0;
       }

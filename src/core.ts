@@ -5,6 +5,7 @@
  * Uses only erasable TypeScript syntax so Node can run it directly with type stripping.
  */
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as os from "node:os";
@@ -41,8 +42,15 @@ export type Status = (typeof STATUSES)[number];
 export const STATUS_FILTERS = ["active", "closed", "all", ...STATUSES] as const;
 export type StatusFilter = (typeof STATUS_FILTERS)[number];
 
+/** Identifies an item: its project's UUID plus the per-project number. */
+export type ItemKey = { projectId: string; id: number };
+
 export type Item = {
+  /** Per-project item number, as shown in `#3`. */
   id: number;
+  /** UUID of the item's project; with `id`, the item's primary key. */
+  projectId: string;
+  /** The project's key, e.g. `github.com/owner/repo`. */
   project: string;
   title: string;
   body: string | null;
@@ -92,19 +100,25 @@ export type ListFilter = {
   limit?: number;
 };
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const MAX_TITLE_CHARS = 200;
 
-const SCHEMA_V1 = `
+/**
+ * v2 schema. Projects have a UUID id; items are keyed by (project_id, id), where id is the per-project
+ * number shown as `#3`. `next_item_id` keeps numbers from being reused after a delete.
+ * Full-text search keeps its own copy of title and body, keyed by the same pair.
+ */
+const SCHEMA_V2 = `
 CREATE TABLE projects (
-  id INTEGER PRIMARY KEY,
+  id TEXT PRIMARY KEY,
   key TEXT UNIQUE NOT NULL,
   display_name TEXT,
+  next_item_id INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL
 );
 CREATE TABLE items (
-  id INTEGER PRIMARY KEY,
-  project_id INTEGER NOT NULL REFERENCES projects(id),
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  id INTEGER NOT NULL CHECK (id > 0),
   title TEXT NOT NULL,
   body TEXT,
   priority INTEGER NOT NULL DEFAULT 2 CHECK (priority BETWEEN 0 AND 3),
@@ -115,27 +129,64 @@ CREATE TABLE items (
   host TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  closed_at TEXT
-);
+  closed_at TEXT,
+  PRIMARY KEY (project_id, id)
+) WITHOUT ROWID;
 CREATE TABLE tags (
-  item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL,
+  item_id INTEGER NOT NULL,
   tag TEXT NOT NULL,
-  PRIMARY KEY (item_id, tag)
-);
+  PRIMARY KEY (project_id, item_id, tag),
+  FOREIGN KEY (project_id, item_id) REFERENCES items(project_id, id) ON DELETE CASCADE
+) WITHOUT ROWID;
 CREATE INDEX items_project_status ON items(project_id, status, priority);
 CREATE INDEX tags_tag ON tags(tag);
-CREATE VIRTUAL TABLE items_fts USING fts5(title, body, content='items', content_rowid='id');
+CREATE VIRTUAL TABLE items_fts USING fts5(project_id UNINDEXED, item_id UNINDEXED, title, body);
 CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN
-  INSERT INTO items_fts(rowid, title, body) VALUES (new.id, new.title, coalesce(new.body, ''));
+  INSERT INTO items_fts(project_id, item_id, title, body) VALUES (new.project_id, new.id, new.title, coalesce(new.body, ''));
 END;
 CREATE TRIGGER items_ad AFTER DELETE ON items BEGIN
-  INSERT INTO items_fts(items_fts, rowid, title, body) VALUES ('delete', old.id, old.title, coalesce(old.body, ''));
+  DELETE FROM items_fts WHERE project_id = old.project_id AND item_id = old.id;
 END;
 CREATE TRIGGER items_au AFTER UPDATE OF title, body ON items BEGIN
-  INSERT INTO items_fts(items_fts, rowid, title, body) VALUES ('delete', old.id, old.title, coalesce(old.body, ''));
-  INSERT INTO items_fts(rowid, title, body) VALUES (new.id, new.title, coalesce(new.body, ''));
+  UPDATE items_fts SET title = new.title, body = coalesce(new.body, '') WHERE project_id = old.project_id AND item_id = old.id;
 END;
 `;
+
+/** v1 had integer project ids and one global item id sequence; renumber items per project in creation order. */
+function migrateFromV1(db: DatabaseSync): void {
+  const projects = db.prepare("SELECT id, key, display_name, created_at FROM projects ORDER BY id").all() as { id: number; key: string; display_name: string | null; created_at: string }[];
+  const items = db.prepare("SELECT * FROM items ORDER BY project_id, id").all() as Record<string, string | number | null>[];
+  const tags = db.prepare("SELECT item_id, tag FROM tags").all() as { item_id: number; tag: string }[];
+  db.exec(`DROP TRIGGER IF EXISTS items_ai; DROP TRIGGER IF EXISTS items_ad; DROP TRIGGER IF EXISTS items_au;
+    DROP TABLE IF EXISTS items_fts; DROP TABLE tags; DROP TABLE items; DROP TABLE projects;`);
+  db.exec(SCHEMA_V2);
+  const projectIds = new Map<number, string>();
+  const insertProject = db.prepare("INSERT INTO projects (id, key, display_name, created_at) VALUES (?, ?, ?, ?)");
+  for (const project of projects) {
+    const id = randomUUID();
+    projectIds.set(Number(project.id), id);
+    insertProject.run(id, project.key, project.display_name, project.created_at);
+  }
+  const itemKeys = new Map<number, [string, number]>();
+  const nextIds = new Map<string, number>();
+  const insertItem = db.prepare(`INSERT INTO items (project_id, id, title, body, priority, status, file_ref, source, session_id, host, created_at, updated_at, closed_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  for (const item of items) {
+    const projectId = projectIds.get(Number(item.project_id))!;
+    const id = nextIds.get(projectId) ?? 1;
+    nextIds.set(projectId, id + 1);
+    itemKeys.set(Number(item.id), [projectId, id]);
+    insertItem.run(projectId, id, item.title, item.body, item.priority, item.status, item.file_ref, item.source, item.session_id, item.host, item.created_at, item.updated_at, item.closed_at);
+  }
+  const insertTag = db.prepare("INSERT OR IGNORE INTO tags (project_id, item_id, tag) VALUES (?, ?, ?)");
+  for (const tag of tags) {
+    const key = itemKeys.get(Number(tag.item_id));
+    if (key) insertTag.run(key[0], key[1], tag.tag);
+  }
+  const setNext = db.prepare("UPDATE projects SET next_item_id = ? WHERE id = ?");
+  for (const [projectId, next] of nextIds) setNext.run(next, projectId);
+}
 
 // ---------------------------------------------------------------------------
 // Parsing helpers
@@ -369,23 +420,70 @@ export function getDbPath(env: NodeJS.ProcessEnv = process.env, options: { home?
   return config.db ?? path.join(getDataDir(env, home), "tdo.db");
 }
 
-export function openDb(dbPath = getDbPath()): DatabaseSync {
+export const SCHEMA = SCHEMA_VERSION;
+
+export function schemaVersion(db: DatabaseSync): number {
+  return Number((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
+}
+
+export type OpenOptions = {
+  /** Upgrade an older schema (default true). With false, the caller must run `migrateDb`. */
+  migrate?: boolean;
+};
+
+export function openDb(dbPath = getDbPath(), options: OpenOptions = {}): DatabaseSync {
   if (dbPath !== ":memory:") fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
   db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;");
   if (dbPath !== ":memory:") db.exec("PRAGMA journal_mode = WAL;");
-  migrate(db);
+  if (options.migrate !== false) migrateDb(db, dbPath);
   return db;
 }
 
-function migrate(db: DatabaseSync): void {
-  const version = Number((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
+/** One row per item whose id changes in a v1 -> v2 upgrade. */
+export type IdChange = { project: string; from: number; to: number; title: string };
+
+/** Previews how a v1 database's global item ids map to per-project ids. Empty for other versions. */
+export function planMigration(db: DatabaseSync): IdChange[] {
+  if (schemaVersion(db) !== 1) return [];
+  const rows = db.prepare("SELECT i.id AS id, i.title AS title, p.key AS project FROM items i JOIN projects p ON p.id = i.project_id ORDER BY i.project_id, i.id").all() as { id: number; title: string; project: string }[];
+  const next = new Map<string, number>();
+  return rows.map((row) => {
+    const to = next.get(row.project) ?? 1;
+    next.set(row.project, to + 1);
+    return { project: row.project, from: Number(row.id), to, title: row.title };
+  });
+}
+
+/** Writes a consistent copy of the database next to it, e.g. `tdo.db.v1-backup-20261104T120000`. */
+export function backupDb(db: DatabaseSync, dbPath: string): string {
+  const stamp = now().replace(/[-:]/g, "").replace(/\..*$/, "");
+  const target = `${dbPath}.v${schemaVersion(db)}-backup-${stamp}`;
+  db.prepare("VACUUM INTO ?").run(target);
+  return target;
+}
+
+export type MigrationResult = { from: number; to: number; backup?: string; changes: IdChange[] };
+
+/**
+ * Brings the schema up to date. A file database on an older schema is backed up first
+ * (see `backupDb`), since the v2 upgrade renumbers items.
+ */
+export function migrateDb(db: DatabaseSync, dbPath?: string): MigrationResult {
+  const version = schemaVersion(db);
   if (version > SCHEMA_VERSION) throw new Error(`tdo database schema v${version} is newer than this tdo (v${SCHEMA_VERSION}).`);
-  if (version === SCHEMA_VERSION) return;
+  if (version === SCHEMA_VERSION) return { from: version, to: version, changes: [] };
+  const changes = planMigration(db);
+  const backup = version > 0 && dbPath && dbPath !== ":memory:" ? backupDb(db, dbPath) : undefined;
   transaction(db, () => {
-    if (version < 1) db.exec(SCHEMA_V1);
+    // Another process may have upgraded it while we waited for the write lock.
+    const locked = schemaVersion(db);
+    if (locked === SCHEMA_VERSION) return;
+    if (locked < 1) db.exec(SCHEMA_V2);
+    else if (locked < 2) migrateFromV1(db);
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   });
+  return { from: version, to: SCHEMA_VERSION, backup, changes };
 }
 
 function transaction<T>(db: DatabaseSync, fn: () => T): T {
@@ -416,18 +514,19 @@ function cleanOptional(value: unknown): string | null {
   return text || null;
 }
 
-function ensureProject(db: DatabaseSync, project: Project): number {
-  db.prepare("INSERT INTO projects (key, display_name, created_at) VALUES (?, ?, ?) ON CONFLICT(key) DO NOTHING").run(project.key, project.name, now());
-  return Number((db.prepare("SELECT id FROM projects WHERE key = ?").get(project.key) as { id: number }).id);
+function ensureProject(db: DatabaseSync, project: Project): string {
+  db.prepare("INSERT INTO projects (id, key, display_name, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO NOTHING").run(randomUUID(), project.key, project.name, now());
+  return String((db.prepare("SELECT id FROM projects WHERE key = ?").get(project.key) as { id: string }).id);
 }
 
 const ITEM_SELECT = `
 SELECT i.*, p.key AS project_key,
-  (SELECT group_concat(tag, ',') FROM (SELECT tag FROM tags WHERE item_id = i.id ORDER BY tag)) AS tag_list
+  (SELECT group_concat(tag, ',') FROM (SELECT tag FROM tags t WHERE t.project_id = i.project_id AND t.item_id = i.id ORDER BY tag)) AS tag_list
 FROM items i JOIN projects p ON p.id = i.project_id`;
 
 type ItemRow = {
   id: number;
+  project_id: string;
   project_key: string;
   title: string;
   body: string | null;
@@ -446,6 +545,7 @@ type ItemRow = {
 function toItem(row: ItemRow): Item {
   return {
     id: Number(row.id),
+    projectId: String(row.project_id),
     project: row.project_key,
     title: row.title,
     body: row.body,
@@ -462,14 +562,42 @@ function toItem(row: ItemRow): Item {
   };
 }
 
-export function getItem(db: DatabaseSync, id: number): Item | undefined {
-  const row = db.prepare(`${ITEM_SELECT} WHERE i.id = ?`).get(id) as ItemRow | undefined;
+export function getItem(db: DatabaseSync, key: ItemKey): Item | undefined {
+  const row = db.prepare(`${ITEM_SELECT} WHERE i.project_id = ? AND i.id = ?`).get(key.projectId, key.id) as ItemRow | undefined;
   return row ? toItem(row) : undefined;
 }
 
-function requireItem(db: DatabaseSync, id: number): Item {
-  const item = getItem(db, id);
-  if (!item) throw new Error(`No tdo item #${id}.`);
+/** Looks an item up by project key and per-project number. */
+export function getItemByNumber(db: DatabaseSync, project: string, id: number): Item | undefined {
+  const row = db.prepare(`${ITEM_SELECT} WHERE p.key = ? AND i.id = ?`).get(project, id) as ItemRow | undefined;
+  return row ? toItem(row) : undefined;
+}
+
+/**
+ * Resolves an item reference: `3` or `#3` in `project`, or `KEY#3` / `NAME#3` in another project
+ * (a bare project name must match exactly one project).
+ */
+export function findItem(db: DatabaseSync, ref: string, project: string): Item {
+  const match = /^(?:(.+?)#|#)?(\d+)$/.exec(ref.trim());
+  const number = match ? Number(match[2]) : NaN;
+  if (!match || !Number.isInteger(number) || number <= 0) throw new Error(`expected an item id, got ${JSON.stringify(ref)}.`);
+  let key = project;
+  if (match[1]) {
+    const named = match[1];
+    const keys = (db.prepare("SELECT key FROM projects WHERE key = ? OR display_name = ?").all(named, named) as { key: string }[]).map((row) => row.key);
+    if (keys.includes(named)) key = named;
+    else if (keys.length === 1) key = keys[0]!;
+    else if (keys.length > 1) throw new Error(`${named} matches several projects: ${keys.join(", ")}.`);
+    else throw new Error(`No tdo project ${named}.`);
+  }
+  const item = getItemByNumber(db, key, number);
+  if (!item) throw new Error(`No tdo item #${number} in ${key}.`);
+  return item;
+}
+
+function requireItem(db: DatabaseSync, key: ItemKey): Item {
+  const item = getItem(db, key);
+  if (!item) throw new Error(`No tdo item #${key.id} in project ${key.projectId}.`);
   return item;
 }
 
@@ -477,24 +605,24 @@ export function addItem(db: DatabaseSync, input: NewItem): Item {
   const project = typeof input.project === "string" ? projectFromKey(input.project) : input.project;
   const title = cleanTitle(input.title);
   const priority = input.priority ? requirePriority(input.priority) : "normal";
-  const id = transaction(db, () => {
+  const key = transaction(db, (): ItemKey => {
     const projectId = ensureProject(db, project);
+    const id = Number((db.prepare("UPDATE projects SET next_item_id = next_item_id + 1 WHERE id = ? RETURNING next_item_id - 1 AS id").get(projectId) as { id: number }).id);
     const timestamp = now();
-    const result = db.prepare(`INSERT INTO items (project_id, title, body, priority, file_ref, source, session_id, host, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      projectId, title, cleanOptional(input.body), PRIORITIES.indexOf(priority), cleanOptional(input.fileRef),
+    db.prepare(`INSERT INTO items (project_id, id, title, body, priority, file_ref, source, session_id, host, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      projectId, id, title, cleanOptional(input.body), PRIORITIES.indexOf(priority), cleanOptional(input.fileRef),
       cleanOptional(input.source), cleanOptional(input.sessionId), cleanOptional(input.host), timestamp, timestamp,
     );
-    const itemId = Number(result.lastInsertRowid);
-    const insertTag = db.prepare("INSERT OR IGNORE INTO tags (item_id, tag) VALUES (?, ?)");
-    for (const tag of normalizeTags(input.tags)) insertTag.run(itemId, tag);
-    return itemId;
+    const insertTag = db.prepare("INSERT OR IGNORE INTO tags (project_id, item_id, tag) VALUES (?, ?, ?)");
+    for (const tag of normalizeTags(input.tags)) insertTag.run(projectId, id, tag);
+    return { projectId, id };
   });
-  return requireItem(db, id);
+  return requireItem(db, key);
 }
 
-export function updateItem(db: DatabaseSync, id: number, patch: ItemPatch): Item {
-  requireItem(db, id);
+export function updateItem(db: DatabaseSync, key: ItemKey, patch: ItemPatch): Item {
+  const { projectId, id } = requireItem(db, key);
   transaction(db, () => {
     const sets: string[] = [];
     const values: (string | number | null)[] = [];
@@ -502,34 +630,34 @@ export function updateItem(db: DatabaseSync, id: number, patch: ItemPatch): Item
     if (patch.body !== undefined) { sets.push("body = ?"); values.push(cleanOptional(patch.body)); }
     if (patch.priority !== undefined) { sets.push("priority = ?"); values.push(PRIORITIES.indexOf(requirePriority(patch.priority))); }
     if (patch.fileRef !== undefined) { sets.push("file_ref = ?"); values.push(cleanOptional(patch.fileRef)); }
-    const removeTag = db.prepare("DELETE FROM tags WHERE item_id = ? AND tag = ?");
-    for (const tag of normalizeTags(patch.removeTags)) removeTag.run(id, tag);
-    const insertTag = db.prepare("INSERT OR IGNORE INTO tags (item_id, tag) VALUES (?, ?)");
-    for (const tag of normalizeTags(patch.addTags)) insertTag.run(id, tag);
+    const removeTag = db.prepare("DELETE FROM tags WHERE project_id = ? AND item_id = ? AND tag = ?");
+    for (const tag of normalizeTags(patch.removeTags)) removeTag.run(projectId, id, tag);
+    const insertTag = db.prepare("INSERT OR IGNORE INTO tags (project_id, item_id, tag) VALUES (?, ?, ?)");
+    for (const tag of normalizeTags(patch.addTags)) insertTag.run(projectId, id, tag);
     sets.push("updated_at = ?");
     values.push(now());
-    db.prepare(`UPDATE items SET ${sets.join(", ")} WHERE id = ?`).run(...values, id);
+    db.prepare(`UPDATE items SET ${sets.join(", ")} WHERE project_id = ? AND id = ?`).run(...values, projectId, id);
   });
-  return requireItem(db, id);
+  return requireItem(db, key);
 }
 
 /** Moves an item to a new status; `note` is appended to the body with the date and new status. */
-export function setStatus(db: DatabaseSync, id: number, status: Status, note?: string): Item {
+export function setStatus(db: DatabaseSync, key: ItemKey, status: Status, note?: string): Item {
   if (!(STATUSES as readonly string[]).includes(status)) throw new Error(`status must be one of: ${STATUSES.join(", ")}.`);
-  const item = requireItem(db, id);
+  const item = requireItem(db, key);
   const timestamp = now();
   const closed = status === "done" || status === "dropped";
   const trimmedNote = note?.trim();
   const body = trimmedNote ? [item.body, `[${status} ${timestamp.slice(0, 10)}] ${trimmedNote}`].filter(Boolean).join("\n\n") : item.body;
-  db.prepare("UPDATE items SET status = ?, body = ?, closed_at = ?, updated_at = ? WHERE id = ?").run(
-    status, body, closed ? (item.closedAt && item.status === status ? item.closedAt : timestamp) : null, timestamp, id,
+  db.prepare("UPDATE items SET status = ?, body = ?, closed_at = ?, updated_at = ? WHERE project_id = ? AND id = ?").run(
+    status, body, closed ? (item.closedAt && item.status === status ? item.closedAt : timestamp) : null, timestamp, item.projectId, item.id,
   );
-  return requireItem(db, id);
+  return requireItem(db, key);
 }
 
-export function deleteItem(db: DatabaseSync, id: number): Item {
-  const item = requireItem(db, id);
-  db.prepare("DELETE FROM items WHERE id = ?").run(id);
+export function deleteItem(db: DatabaseSync, key: ItemKey): Item {
+  const item = requireItem(db, key);
+  db.prepare("DELETE FROM items WHERE project_id = ? AND id = ?").run(item.projectId, item.id);
   return item;
 }
 
@@ -548,17 +676,17 @@ export function listItems(db: DatabaseSync, filter: ListFilter = {}): Item[] {
   else if (status === "closed") where.push("i.status IN ('done', 'dropped')");
   else if (status !== "all") { where.push("i.status = ?"); values.push(status); }
   for (const tag of normalizeTags(filter.tags)) {
-    where.push("EXISTS (SELECT 1 FROM tags t WHERE t.item_id = i.id AND t.tag = ?)");
+    where.push("EXISTS (SELECT 1 FROM tags t WHERE t.project_id = i.project_id AND t.item_id = i.id AND t.tag = ?)");
     values.push(tag);
   }
   if (filter.minPriority !== undefined) { where.push("i.priority <= ?"); values.push(PRIORITIES.indexOf(requirePriority(filter.minPriority))); }
   const query = filter.query ? ftsQuery(filter.query) : undefined;
   if (filter.query && !query) return [];
-  if (query) { where.push("i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)"); values.push(query); }
+  if (query) { where.push("(i.project_id, i.id) IN (SELECT project_id, item_id FROM items_fts WHERE items_fts MATCH ?)"); values.push(query); }
   const closedFirst = status === "closed" || status === "done" || status === "dropped";
   const order = closedFirst
-    ? "i.closed_at DESC, i.id DESC"
-    : "CASE i.status WHEN 'doing' THEN 0 WHEN 'open' THEN 1 ELSE 2 END, i.priority, i.created_at, i.id";
+    ? "i.closed_at DESC, i.created_at DESC"
+    : "CASE i.status WHEN 'doing' THEN 0 WHEN 'open' THEN 1 ELSE 2 END, i.priority, i.created_at, p.key, i.id";
   const limit = Math.max(1, Math.min(filter.limit ?? 500, 5000));
   const sql = `${ITEM_SELECT}${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY ${order} LIMIT ${limit}`;
   return (db.prepare(sql).all(...values) as ItemRow[]).map(toItem);
@@ -580,7 +708,7 @@ export function countActive(db: DatabaseSync, project: string): ActiveCounts {
 }
 
 export function listTags(db: DatabaseSync, project?: string): { tag: string; count: number }[] {
-  const rows = db.prepare(`SELECT t.tag AS tag, count(*) AS n FROM tags t JOIN items i ON i.id = t.item_id JOIN projects p ON p.id = i.project_id
+  const rows = db.prepare(`SELECT t.tag AS tag, count(*) AS n FROM tags t JOIN items i ON i.project_id = t.project_id AND i.id = t.item_id JOIN projects p ON p.id = i.project_id
     WHERE i.status IN ('open', 'doing')${project !== undefined ? " AND p.key = ?" : ""} GROUP BY t.tag ORDER BY n DESC, t.tag`).all(...(project !== undefined ? [project] : [])) as { tag: string; n: number }[];
   return rows.map((row) => ({ tag: row.tag, count: Number(row.n) }));
 }
@@ -601,13 +729,17 @@ export function formatCounts(counts: ActiveCounts): string {
   return `${counts.total} open${urgentish ? ` (${urgentish})` : ""}`;
 }
 
+/** `#3`, or `widgets#3` when other projects are in view. */
+export function itemRef(item: Item, options: { showProject?: boolean } = {}): string {
+  return options.showProject ? `${nameFromKey(item.project)}#${item.id}` : `#${item.id}`;
+}
+
 export function formatItemLine(item: Item, options: { showProject?: boolean } = {}): string {
-  const parts = [`#${item.id}`, item.priority.padEnd(6)];
+  const parts = [itemRef(item, options), item.priority.padEnd(6)];
   if (item.status !== "open") parts.push(`[${item.status}]`);
   parts.push(item.title);
   if (item.tags.length) parts.push(item.tags.map((tag) => `#${tag}`).join(" "));
   if (item.fileRef) parts.push(`@ ${item.fileRef}`);
-  if (options.showProject) parts.push(`(${item.project})`);
   return parts.join("  ");
 }
 

@@ -85,22 +85,22 @@ test("items can be added, listed, searched, updated, and closed", () => {
   assert.deepEqual(tdo.listItems(db, { query: "env look" }).map((item) => item.id), [b.id]);
   assert.deepEqual(tdo.listItems(db, { query: "\"*" }), []);
 
-  const updated = tdo.updateItem(db, b.id, { title: "Refactor settings loader", priority: "low", addTags: ["Perf"], removeTags: ["cleanup"] });
+  const updated = tdo.updateItem(db, b, { title: "Refactor settings loader", priority: "low", addTags: ["Perf"], removeTags: ["cleanup"] });
   assert.equal(updated.priority, "low");
   assert.deepEqual(updated.tags, ["perf"]);
   assert.deepEqual(tdo.listItems(db, { query: "settings" }).map((item) => item.id), [b.id]);
   assert.deepEqual(tdo.listItems(db, { query: "config" }), []);
 
-  const doing = tdo.setStatus(db, b.id, "doing");
+  const doing = tdo.setStatus(db, b, "doing");
   assert.equal(doing.closedAt, null);
   assert.equal(tdo.listItems(db, { project: project.key })[0].id, b.id, "doing items sort first");
 
-  const done = tdo.setStatus(db, a.id, "done", "fixed by retry");
+  const done = tdo.setStatus(db, a, "done", "fixed by retry");
   assert.ok(done.closedAt);
   assert.match(done.body, /\[done \d{4}-\d{2}-\d{2}\] fixed by retry/);
   assert.deepEqual(tdo.listItems(db, { project: project.key }).map((item) => item.id), [b.id, c.id]);
   assert.deepEqual(tdo.listItems(db, { project: project.key, status: "closed" }).map((item) => item.id), [a.id]);
-  assert.equal(tdo.setStatus(db, a.id, "open").closedAt, null);
+  assert.equal(tdo.setStatus(db, a, "open").closedAt, null);
 
   const counts = tdo.countActive(db, project.key);
   assert.deepEqual(counts, { total: 3, doing: 1, urgent: 1, high: 1, normal: 0, low: 1 });
@@ -108,12 +108,83 @@ test("items can be added, listed, searched, updated, and closed", () => {
   assert.deepEqual(tdo.listTags(db, project.key), [{ tag: "ci", count: 1 }, { tag: "perf", count: 1 }, { tag: "tests", count: 1 }]);
   assert.deepEqual(tdo.listProjects(db).map((row) => [row.key, row.active]), [[project.key, 3], ["github.com/example/gadgets", 1]]);
 
-  tdo.deleteItem(db, c.id);
-  assert.equal(tdo.getItem(db, c.id), undefined);
+  tdo.deleteItem(db, c);
+  assert.equal(tdo.getItem(db, c), undefined);
   assert.deepEqual(tdo.listItems(db, { query: "crash" }), []);
 
   assert.throws(() => tdo.addItem(db, { project, title: "   " }), /title must not be empty/);
-  assert.throws(() => tdo.setStatus(db, 999, "done"), /No tdo item #999/);
+  assert.throws(() => tdo.setStatus(db, { projectId: a.projectId, id: 999 }, "done"), /No tdo item #999/);
+});
+
+test("item numbers are per project and never reused", () => {
+  const db = tdo.openDb(":memory:");
+  const widgets = "github.com/example/widgets";
+  const gadgets = "github.com/example/gadgets";
+  const w1 = tdo.addItem(db, { project: widgets, title: "w1" });
+  const g1 = tdo.addItem(db, { project: gadgets, title: "g1" });
+  const w2 = tdo.addItem(db, { project: widgets, title: "w2" });
+  assert.deepEqual([w1.id, g1.id, w2.id], [1, 1, 2]);
+  assert.equal(w1.projectId, w2.projectId);
+  assert.notEqual(w1.projectId, g1.projectId);
+  assert.match(w1.projectId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  tdo.deleteItem(db, w2);
+  assert.equal(tdo.addItem(db, { project: widgets, title: "w3" }).id, 3);
+
+  assert.equal(tdo.findItem(db, "1", widgets).title, "w1");
+  assert.equal(tdo.findItem(db, "#1", gadgets).title, "g1");
+  assert.equal(tdo.findItem(db, "gadgets#1", widgets).title, "g1");
+  assert.equal(tdo.findItem(db, `${gadgets}#1`, widgets).title, "g1");
+  assert.throws(() => tdo.findItem(db, "2", widgets), /No tdo item #2 in github\.com\/example\/widgets/);
+  assert.throws(() => tdo.findItem(db, "nope#1", widgets), /No tdo project nope/);
+  assert.throws(() => tdo.findItem(db, "abc", widgets), /expected an item id/);
+  assert.equal(tdo.itemRef(g1, { showProject: true }), "gadgets#1");
+});
+
+const V1_SQL = `CREATE TABLE projects (id INTEGER PRIMARY KEY, key TEXT UNIQUE NOT NULL, display_name TEXT, created_at TEXT NOT NULL);
+  CREATE TABLE items (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), title TEXT NOT NULL, body TEXT,
+    priority INTEGER NOT NULL DEFAULT 2, status TEXT NOT NULL DEFAULT 'open', file_ref TEXT, source TEXT, session_id TEXT, host TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, closed_at TEXT);
+  CREATE TABLE tags (item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE, tag TEXT NOT NULL, PRIMARY KEY (item_id, tag));
+  CREATE VIRTUAL TABLE items_fts USING fts5(title, body, content='items', content_rowid='id');
+  CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN
+    INSERT INTO items_fts(rowid, title, body) VALUES (new.id, new.title, coalesce(new.body, ''));
+  END;
+  INSERT INTO projects VALUES (1, 'a', 'a', 'x'), (2, 'b', 'b', 'x');
+  INSERT INTO items (id, project_id, title, body, status, created_at, updated_at, closed_at) VALUES
+    (1, 1, 'a1', 'searchable words', 'open', 'x', 'x', NULL), (2, 2, 'b1', NULL, 'open', 'x', 'x', NULL), (5, 1, 'a2', NULL, 'done', 'x', 'x', 'y');
+  INSERT INTO tags VALUES (1, 'ci'), (5, 'perf'), (2, 'ci');
+  PRAGMA user_version = 1;`;
+
+async function v1Db() {
+  const dbPath = path.join(tempDir(), "v1.db");
+  const { DatabaseSync } = await import("node:sqlite");
+  const raw = new DatabaseSync(dbPath);
+  raw.exec(V1_SQL);
+  raw.close();
+  return dbPath;
+}
+
+test("v1 databases migrate to uuid projects and per-project ids, with a backup", async () => {
+  const dbPath = await v1Db();
+  const preview = tdo.openDb(dbPath, { migrate: false });
+  assert.equal(tdo.schemaVersion(preview), 1);
+  assert.deepEqual(tdo.planMigration(preview).map((row) => [row.project, row.from, row.to]), [["a", 1, 1], ["a", 5, 2], ["b", 2, 1]]);
+  const result = tdo.migrateDb(preview, dbPath);
+  preview.close();
+  assert.deepEqual([result.from, result.to], [1, 2]);
+  assert.ok(fs.existsSync(result.backup), "backup written");
+  const backup = tdo.openDb(result.backup, { migrate: false });
+  assert.equal(tdo.schemaVersion(backup), 1, "backup keeps the old schema");
+  backup.close();
+
+  const db = tdo.openDb(dbPath);
+  const items = tdo.listItems(db, { status: "all" });
+  assert.deepEqual(items.map((item) => [item.project, item.id, item.tags.join(), item.status]).sort(), [["a", 1, "ci", "open"], ["a", 2, "perf", "done"], ["b", 1, "ci", "open"]]);
+  assert.match(items[0].projectId, /^[0-9a-f-]{36}$/);
+  assert.deepEqual(tdo.listItems(db, { query: "searchable" }).map((item) => item.title), ["a1"]);
+  assert.equal(tdo.addItem(db, { project: "a", title: "a3" }).id, 3);
+  assert.deepEqual(tdo.migrateDb(db, dbPath).changes, [], "already current");
+  db.close();
 });
 
 test("openDb creates a file database and reopens it at the same schema", () => {
@@ -129,7 +200,8 @@ test("openDb creates a file database and reopens it at the same schema", () => {
 test("formatters render lines, detail, and markdown", () => {
   const db = tdo.openDb(":memory:");
   const item = tdo.addItem(db, { project: "github.com/example/widgets", title: "Fix it", priority: "high", tags: ["ci"], fileRef: "a.ts:1", body: "why" });
-  assert.equal(tdo.formatItemLine(item), `#${item.id}  high    Fix it  #ci  @ a.ts:1`);
+  assert.equal(tdo.formatItemLine(item), "#1  high    Fix it  #ci  @ a.ts:1");
+  assert.equal(tdo.formatItemLine(item, { showProject: true }), "widgets#1  high    Fix it  #ci  @ a.ts:1");
   assert.match(tdo.formatItemDetail(item), /priority: high[\s\S]*\n\nwhy$/);
   assert.equal(tdo.formatMarkdown([item]), `## github.com/example/widgets\n\n- [ ] #${item.id} Fix it (high #ci \`a.ts:1\`)\n`);
 });
