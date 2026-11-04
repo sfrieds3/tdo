@@ -18,7 +18,7 @@ $ tdo done 1 -m "added retry around token refresh"
 done #1  high    [done]  login test flakes on CI  #ci  @ src/auth/login.test.ts:88
 ```
 
-It ships with an [agent skill](skills/tdo/SKILL.md), so Claude Code, Codex, Pi, or any agent that reads `SKILL.md` files can park the issues it trips over mid-task — after asking you — instead of derailing the work. And it's a [Pi](https://pi.dev) package with a `/tdo` command and a footer count.
+It ships with an [agent skill](skills/tdo/SKILL.md), so Claude Code, Codex, Pi, or any agent that reads `SKILL.md` files can park the issues it trips over mid-task — after asking you — instead of derailing the work. And it's a [Pi](https://pi.dev) package with a `/tdo` picker and a footer that shows the open count and the item you're working on.
 
 ## Features
 
@@ -55,7 +55,7 @@ ln -s ~/code/tdo/skills/tdo ~/.claude/skills/tdo    # Claude Code
 
 ### Pi package
 
-Optional, for the `/tdo` command and footer count; the package bundles the skill too. Add it to `packages` in `~/.pi/agent/settings.json`:
+Optional, for the `/tdo` picker and footer; the package bundles the skill too. Add it to `packages` in `~/.pi/agent/settings.json`:
 
 ```jsonc
 {
@@ -79,9 +79,12 @@ Use `@v0.2.3` to pin an exact release, or a local path (`"~/code/tdo"`) while ha
 | `tdo edit <id> [--title T] [-p PRIO] [-t +add,-remove] [-b BODY] [-f REF]` | Change an item. |
 | `tdo start` / `done` / `drop` / `reopen <id>… [-m NOTE]` | Change status; the note is appended to the body. |
 | `tdo rm <id>` | Delete an item outright. |
+
+Item ids are numbered per project, so every repo's backlog starts at `#1`. `3` or `#3` means item 3 in the current project; reach another project with `NAME#3` (`gadgets#3`, when the name is unambiguous), `KEY#3` (`github.com/example/gadgets#3`), or `--project KEY`. Cross-project listings (`ls -a`) show ids as `NAME#3`. In `--json` output, `id` is the per-project number and `projectId` is the project's UUID; together they identify an item.
 | `tdo count` | One-line summary, e.g. `4 open (1 urgent, 1 high)`. |
 | `tdo tags [-a]` · `tdo projects` · `tdo project` | Tag counts, every project, the resolved project key. |
 | `tdo export [-a] [--md]` | Dump everything as JSON, or as a Markdown checklist. |
+| `tdo migrate [--dry-run]` | Upgrade an older database: back it up, then print which ids changed. |
 
 Global options: `--json` for machine-readable output, `--project KEY` to target another project, `-C DIR` to resolve the project from another directory, `-a` / `--all` to span every project. `add` also takes `--source NAME` (or `TDO_SOURCE`) to record who added the item; it defaults to `cli`.
 
@@ -109,12 +112,24 @@ With the skill installed, ask any agent to "park that" or "add it to tdo" and it
 
 | | |
 |---|---|
-| `/tdo` | Browse open items. Pick one to **work on it now** (marks it `doing` and hands it to the agent), change its priority, or close it. |
+| `/tdo` | Pick from this project's open items. |
+| `/tdo --all` | Pick from every project (`/tdo all` works too). |
 | `/tdo fix the flaky test !high #ci` | Quick-add. |
-| `/tdo done 3 [note]` | Also `start`, `drop`, `reopen`, `show`. |
-| `/tdo all` | Browse every project. |
 
-The footer shows `tdo 4 (2!)` — open items, and how many are urgent or high. It refreshes after each agent run, so items the agent adds through the CLI show up right away.
+In the picker:
+
+| Key | Action |
+|---|---|
+| `enter` | **Work on it**: marks it `doing` and hands it to the agent. |
+| `e` | Edit in the editor: the first line is the title, the rest is the body. |
+| `p` | Change priority. |
+| `x` | Mark done. |
+| `d` | Delete (asks first). |
+| `esc` | Close. |
+
+After `e`, `p`, `x`, or `d` the picker reopens, so you can triage several items in a row.
+
+The footer shows `tdo 4 (2!) ▸ #3 login test flakes on CI` — open items, how many are urgent or high, and the item this session is working on. The focus survives `/reload` and session resume, and clears itself once the item is closed or deleted. It refreshes after each agent run, so items the agent adds or closes through the CLI show up right away.
 
 ## How projects are identified
 
@@ -129,7 +144,20 @@ The result then goes through `aliases` in the [config file](#configuration), so 
 
 ## Storage
 
-The database lives at `$XDG_DATA_HOME/tdo/tdo.db` — `~/.local/share/tdo/tdo.db` by default, on macOS too. Set `db` in the config file or `TDO_DB` to put it elsewhere. It is plain SQLite in WAL mode, so `sqlite3 ~/.local/share/tdo/tdo.db` works for ad-hoc queries, and the schema upgrades itself.
+The database lives at `$XDG_DATA_HOME/tdo/tdo.db` — `~/.local/share/tdo/tdo.db` by default, on macOS too. Set `db` in the config file or `TDO_DB` to put it elsewhere. It is plain SQLite in WAL mode, so `sqlite3 ~/.local/share/tdo/tdo.db` works for ad-hoc queries.
+
+Schema: `projects` has a UUID `id` and the project `key`; `items` is keyed by `(project_id, id)`, where `id` is the per-project number; `tags` references that pair. Full-text search lives in `items_fts`, kept in sync by triggers.
+
+### Upgrading from 0.1.x
+
+0.1.x numbered items globally; now each project counts from `#1`, so existing items get new ids. Any tdo command upgrades the database automatically, but running it by hand first shows what changes:
+
+```sh
+tdo migrate --dry-run   # preview: schema version and every id that changes
+tdo migrate             # back up to tdo.db.v1-backup-<timestamp>, upgrade, print the id changes
+```
+
+Items are renumbered per project in their original order, so the oldest item in each project becomes `#1`. Tags, bodies, statuses, and timestamps carry over. To undo, replace `tdo.db` with the backup (and use a 0.1.x tdo).
 
 **Sharing across machines:** don't sync the database file with Dropbox, Syncthing, or a network mount while more than one machine writes to it — SQLite files corrupt or fork that way. Keep the database on one host instead. A built-in ssh remote mode is planned; until then, `tdo export` is a safe way to move or back up items.
 

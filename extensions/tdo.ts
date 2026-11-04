@@ -1,20 +1,23 @@
 /**
- * Pi front-end for tdo: the `/tdo` command and a footer count.
+ * Pi front-end for tdo: the `/tdo` picker, quick-add, and a footer with the open count and focused item.
  *
  * Agents (Pi, Claude Code, Codex, ...) use the `tdo` CLI through the bundled skill
  * (skills/tdo/SKILL.md), so this extension has no model-facing tool of its own.
  */
 import * as os from "node:os";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Container, SelectList, Text, matchesKey, type KeyId, type SelectItem } from "@earendil-works/pi-tui";
 import {
   PRIORITIES,
   addItem,
   countActive,
+  deleteItem,
   formatItemDetail,
   formatItemLine,
   formatItemList,
   getDbPath,
   getItem,
+  itemRef,
   listItems,
   loadConfig,
   openDb,
@@ -24,20 +27,24 @@ import {
   setStatus,
   updateItem,
   type Item,
+  type ItemKey,
   type Project,
-  type Status,
 } from "../src/core.ts";
 
 const STATUS_KEY = "tdo";
-const STATUS_VERBS: Record<string, Status> = { start: "doing", done: "done", drop: "dropped", reopen: "open" };
-const SUBCOMMANDS = ["all", "show", ...Object.keys(STATUS_VERBS), "help"];
+const FOCUS_ENTRY = "tdo-focus";
+const FOCUS_TITLE_CHARS = 40;
+const ALL_ARGS = new Set(["all", "--all", "-a"]);
 const HELP = [
-  "/tdo — browse open items",
-  "/tdo all — browse every project",
+  "/tdo — pick an item in this project (--all or all: every project)",
+  "  enter work on it · e edit · p priority · x done · d delete · esc close",
   "/tdo <title> [!urgent|!high|!low] [#tag] — add",
-  "/tdo done|start|drop|reopen <id> [note] — change status",
-  "/tdo show <id> — details",
 ].join("\n");
+
+/** Picker keys, beyond enter (work on it) and esc. */
+export const PICKER_KEYS = { e: "edit", p: "priority", x: "done", d: "delete" } as const;
+type PickerAction = "work" | (typeof PICKER_KEYS)[keyof typeof PICKER_KEYS];
+type Picked = { action: PickerAction; item: Item };
 
 type DbHandle = ReturnType<typeof openDb>;
 
@@ -58,8 +65,28 @@ function sessionId(ctx: ExtensionContext): string | undefined {
   return (ctx.sessionManager as { getSessionId?: () => string | undefined }).getSessionId?.() || undefined;
 }
 
+function truncate(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function keyString(key: ItemKey): string {
+  return `${key.projectId}#${key.id}`;
+}
+
+function sameItem(a: ItemKey | undefined, b: ItemKey | undefined): boolean {
+  return a === b || (!!a && !!b && a.projectId === b.projectId && a.id === b.id);
+}
+
+/** Splits editor text into a title (first line) and body (the rest). */
+export function parseEditorText(text: string): { title: string; body: string | null } {
+  const [first = "", ...rest] = text.replace(/\r\n/g, "\n").split("\n");
+  return { title: first.trim(), body: rest.join("\n").trim() || null };
+}
+
 export default function tdoExtension(pi: ExtensionAPI) {
   const projects = new Map<string, Project>();
+  /** The item this session is working on, restored from the session branch. */
+  let focus: ItemKey | undefined;
 
   function project(ctx: ExtensionContext): Project {
     const cwd = ctx.cwd || ctx.sessionManager.getCwd();
@@ -71,12 +98,40 @@ export default function tdoExtension(pi: ExtensionAPI) {
     return resolved;
   }
 
+  function setFocus(key: ItemKey | undefined): void {
+    if (sameItem(focus, key)) return;
+    focus = key ? { projectId: key.projectId, id: key.id } : undefined;
+    pi.appendEntry(FOCUS_ENTRY, focus ?? null);
+  }
+
+  function restoreFocus(ctx: ExtensionContext): void {
+    focus = undefined;
+    const manager = ctx.sessionManager as { getBranch?: () => unknown[] };
+    for (const entry of manager.getBranch?.() ?? []) {
+      const custom = entry as { type?: string; customType?: string; data?: Partial<ItemKey> | null };
+      if (custom.type !== "custom" || custom.customType !== FOCUS_ENTRY) continue;
+      const data = custom.data;
+      focus = typeof data?.projectId === "string" && typeof data.id === "number" ? { projectId: data.projectId, id: data.id } : undefined;
+    }
+  }
+
   function refreshStatus(ctx: ExtensionContext): void {
     if (!ctx.hasUI) return;
     try {
-      const counts = withDb((db) => countActive(db, project(ctx).key));
+      const { counts, focused } = withDb((db) => ({
+        counts: countActive(db, project(ctx).key),
+        focused: focus && getItem(db, focus),
+      }));
+      // Drop the focus once the item is closed (often by the agent through the CLI) or deleted.
+      if (focus && focused?.status !== "doing" && focused?.status !== "open") setFocus(undefined);
+      const parts: string[] = [];
       const urgent = counts.urgent + counts.high;
-      ctx.ui.setStatus(STATUS_KEY, counts.total ? ctx.ui.theme.fg("muted", `tdo ${counts.total}${urgent ? ` (${urgent}!)` : ""}`) : undefined);
+      if (counts.total) parts.push(ctx.ui.theme.fg("muted", `tdo ${counts.total}${urgent ? ` (${urgent}!)` : ""}`));
+      if (focus && focused) {
+        const ref = itemRef(focused, { showProject: focused.project !== project(ctx).key });
+        parts.push(ctx.ui.theme.fg("accent", `▸ ${ref} ${truncate(focused.title, FOCUS_TITLE_CHARS)}`));
+      }
+      ctx.ui.setStatus(STATUS_KEY, parts.length ? parts.join(" ") : undefined);
     } catch {
       ctx.ui.setStatus(STATUS_KEY, undefined);
     }
@@ -84,81 +139,139 @@ export default function tdoExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     projects.clear();
+    restoreFocus(ctx);
     refreshStatus(ctx);
   });
-  // Agents change items through the CLI, so refresh the count after each run.
+  pi.on("session_tree", async (_event, ctx) => {
+    restoreFocus(ctx);
+    refreshStatus(ctx);
+  });
+  // Agents change items through the CLI, so refresh after each run.
   pi.on("agent_end", async (_event, ctx) => refreshStatus(ctx));
   pi.on("session_shutdown", async (_event, ctx) => {
     if (ctx?.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
   });
 
+  async function pick(ctx: ExtensionContext, items: Item[], title: string, showProject: boolean, selected?: ItemKey): Promise<Picked | undefined> {
+    const entries: SelectItem[] = items.map((item) => ({ value: keyString(item), label: formatItemLine(item, { showProject }) }));
+    const byKey = new Map(items.map((item) => [keyString(item), item]));
+    return ctx.ui.custom<Picked | undefined>((tui, theme, _keybindings, done) => {
+      const container = new Container();
+      container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+      container.addChild(new Text(theme.fg("accent", theme.bold(title))));
+      const list = new SelectList(entries, Math.min(entries.length, 12), {
+        selectedPrefix: (text) => theme.fg("accent", text),
+        selectedText: (text) => theme.fg("accent", text),
+        description: (text) => theme.fg("muted", text),
+        scrollInfo: (text) => theme.fg("dim", text),
+        noMatch: (text) => theme.fg("warning", text),
+      });
+      const start = items.findIndex((item) => sameItem(item, selected));
+      if (start > 0) list.setSelectedIndex(start);
+      const finish = (action: PickerAction) => {
+        const item = byKey.get(list.getSelectedItem()?.value ?? "");
+        if (item) done({ action, item });
+      };
+      list.onSelect = () => finish("work");
+      list.onCancel = () => done(undefined);
+      container.addChild(list);
+      container.addChild(new Text(theme.fg("dim", "↑↓ move · enter work on it · e edit · p priority · x done · d delete · esc close")));
+      container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+      return {
+        capturesViewportInput: list.capturesViewportInput,
+        render: (width: number) => container.render(width),
+        invalidate: () => container.invalidate(),
+        handleInput(data: string) {
+          const key = (Object.keys(PICKER_KEYS) as (keyof typeof PICKER_KEYS)[]).find((name) => matchesKey(data, name as KeyId));
+          if (key) return finish(PICKER_KEYS[key]);
+          list.handleInput(data);
+          tui.requestRender();
+        },
+      };
+    }, { blocked: { kind: "question", message: title } });
+  }
+
+  function workOn(ctx: ExtensionContext, item: Item, showProject: boolean): void {
+    const started = withDb((db) => setStatus(db, item, "doing"));
+    setFocus(started);
+    const ref = itemRef(started, { showProject });
+    const close = showProject ? `tdo done ${started.id} --project ${started.project}` : `tdo done ${started.id}`;
+    const message = `Let's work on tdo item ${ref} (marked as doing). When it's fixed, close it with \`${close} -m "<what changed>"\`.\n\n${formatItemDetail(started)}`;
+    if (ctx.isIdle()) pi.sendUserMessage(message);
+    else pi.sendUserMessage(message, { deliverAs: "followUp" });
+  }
+
+  /** Runs a picker action; returns true when the picker should reopen. */
+  async function act(ctx: ExtensionContext, { action, item }: Picked, showProject: boolean): Promise<boolean> {
+    const ref = itemRef(item, { showProject });
+    switch (action) {
+      case "work":
+        workOn(ctx, item, showProject);
+        return false;
+      case "edit": {
+        const text = await ctx.ui.editor(`Edit ${ref} — first line is the title, the rest is the body`, [item.title, item.body ? `\n${item.body}` : ""].join("\n").trimEnd());
+        if (text === undefined) return true;
+        const { title, body } = parseEditorText(text);
+        if (!title) {
+          ctx.ui.notify("tdo: title must not be empty; nothing changed.", "warning");
+          return true;
+        }
+        withDb((db) => updateItem(db, item, { title, body }));
+        return true;
+      }
+      case "priority": {
+        const labels = PRIORITIES.map((priority) => (priority === item.priority ? `${priority} (current)` : priority));
+        const picked = await ctx.ui.select(`Priority for ${ref}`, labels);
+        if (picked) withDb((db) => updateItem(db, item, { priority: requirePriority(picked.replace(/ \(current\)$/, "")) }));
+        return true;
+      }
+      case "done":
+        withDb((db) => setStatus(db, item, "done"));
+        ctx.ui.notify(`tdo: done ${ref} ${item.title}`, "info");
+        return true;
+      case "delete":
+        if (await ctx.ui.confirm(`Delete ${ref}?`, item.title)) {
+          withDb((db) => deleteItem(db, item));
+          ctx.ui.notify(`tdo: deleted ${ref} ${item.title}`, "info");
+        }
+        return true;
+    }
+  }
+
   async function browse(ctx: ExtensionContext, allProjects: boolean): Promise<void> {
     const current = project(ctx);
-    const items = withDb((db) => listItems(db, { project: allProjects ? undefined : current.key, limit: 200 }));
     const header = allProjects ? "all projects" : current.key;
-    if (!items.length) {
-      ctx.ui.notify(`tdo: nothing open for ${header}. Add one with /tdo <title> [!high] [#tag].`, "info");
-      return;
+    let selected: ItemKey | undefined;
+    for (;;) {
+      const items = withDb((db) => listItems(db, { project: allProjects ? undefined : current.key, limit: 200 }));
+      // Show project names whenever other projects are in view.
+      const showProject = allProjects && items.some((item) => item.project !== current.key);
+      if (!items.length) {
+        ctx.ui.notify(`tdo: nothing open for ${header}. Add one with /tdo <title> [!high] [#tag].`, "info");
+        return;
+      }
+      if (!ctx.hasUI) {
+        ctx.ui.notify(formatItemList(items, { showProject }), "info");
+        return;
+      }
+      const picked = await pick(ctx, items, `tdo — ${header} (${items.length})`, showProject, selected);
+      if (!picked) return;
+      selected = picked.item;
+      const again = await act(ctx, picked, showProject);
+      refreshStatus(ctx);
+      if (!again) return;
     }
-    if (!ctx.hasUI) {
-      ctx.ui.notify(formatItemList(items, { showProject: allProjects }), "info");
-      return;
-    }
-    const labels = items.map((item) => formatItemLine(item, { showProject: allProjects }));
-    const picked = await ctx.ui.select(`tdo — ${header} (${items.length})`, labels);
-    const item = picked ? items[labels.indexOf(picked)] : undefined;
-    if (item) await itemMenu(ctx, item);
-  }
-
-  async function itemMenu(ctx: ExtensionContext, item: Item): Promise<void> {
-    const choices: Record<string, () => Promise<void> | void> = {
-      "Work on it now": () => {
-        withDb((db) => setStatus(db, item.id, "doing"));
-        const message = `Let's work on tdo item #${item.id} (marked as doing). When it's fixed, close it with \`tdo done ${item.id} -m "<what changed>"\`.\n\n${formatItemDetail(item)}`;
-        if (ctx.isIdle()) pi.sendUserMessage(message);
-        else pi.sendUserMessage(message, { deliverAs: "followUp" });
-      },
-      "Mark done": () => { withDb((db) => setStatus(db, item.id, "done")); },
-      "Mark doing": () => { withDb((db) => setStatus(db, item.id, "doing")); },
-      "Change priority": async () => {
-        const priority = await ctx.ui.select(`Priority for #${item.id}`, [...PRIORITIES]);
-        if (priority) withDb((db) => updateItem(db, item.id, { priority: requirePriority(priority) }));
-      },
-      "Show details": () => ctx.ui.notify(formatItemDetail(item), "info"),
-      Drop: () => { withDb((db) => setStatus(db, item.id, "dropped")); },
-    };
-    const choice = await ctx.ui.select(`#${item.id} ${item.title}`, Object.keys(choices));
-    if (!choice) return;
-    await choices[choice]!();
-    refreshStatus(ctx);
-  }
-
-  function changeById(ctx: ExtensionContext, verb: string, id: number, note: string | undefined): void {
-    if (verb === "show") {
-      const item = withDb((db) => getItem(db, id));
-      if (!item) throw new Error(`No tdo item #${id}.`);
-      ctx.ui.notify(formatItemDetail(item), "info");
-      return;
-    }
-    const item = withDb((db) => setStatus(db, id, STATUS_VERBS[verb]!, note));
-    ctx.ui.notify(`${item.status}: ${formatItemLine(item)}`, "info");
-    refreshStatus(ctx);
   }
 
   pi.registerCommand("tdo", {
-    description: "Per-project backlog: /tdo to browse, /tdo <title> [!high] [#tag] to add, /tdo done|start|drop|reopen|show <id>, /tdo all",
-    getArgumentCompletions: (prefix) => SUBCOMMANDS.filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value })),
+    description: "Per-project backlog: /tdo to pick an item (--all for every project), /tdo <title> [!high] [#tag] to add",
+    getArgumentCompletions: (prefix) => ["--all", "help"].filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value })),
     handler: async (args, ctx) => {
       const trimmed = args.trim();
       try {
         if (!trimmed) return await browse(ctx, false);
-        if (trimmed === "all") return await browse(ctx, true);
+        if (ALL_ARGS.has(trimmed)) return await browse(ctx, true);
         if (trimmed === "help") return ctx.ui.notify(HELP, "info");
-        const [verb = "", idText, ...rest] = trimmed.split(/\s+/);
-        const id = Number(idText?.replace(/^#/, ""));
-        if ((verb === "show" || verb in STATUS_VERBS) && Number.isInteger(id) && id > 0) {
-          return changeById(ctx, verb, id, rest.join(" ") || undefined);
-        }
         const quick = parseQuickAdd(trimmed);
         if (!quick.title) return ctx.ui.notify("tdo: add needs a title, e.g. /tdo fix flaky test !high #ci", "warning");
         const item = withDb((db) => addItem(db, { project: project(ctx), title: quick.title, priority: quick.priority, tags: quick.tags, source: "user", sessionId: sessionId(ctx), host: hostName() }));
