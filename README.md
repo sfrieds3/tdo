@@ -99,7 +99,7 @@ Global options: `--db TARGET` for a one-off local or SSH database override, `--j
 
 ### Browser
 
-Plain `tdo` opens fzf over the backlog with a preview of the highlighted item. Type to filter; `tab` marks several items for the status and priority keys.
+Plain `tdo` opens fzf over the backlog with a preview of the highlighted item. Type to filter; `ctrl-n` / `ctrl-p` (or the arrow keys) move the cursor; `tab` marks several items for the status and priority keys.
 
 | Key | Action |
 |---|---|
@@ -108,7 +108,7 @@ Plain `tdo` opens fzf over the backlog with a preview of the highlighted item. T
 | `ctrl-s` · `ctrl-d` · `ctrl-x` · `ctrl-r` | Start · done · drop · reopen |
 | `alt-up` · `alt-down` | Raise · lower priority |
 | `alt-d` | Delete (asks first) |
-| `ctrl-n` | Add the typed query as a new item |
+| `alt-n` | Add the typed query as a new item |
 | `ctrl-a` | Toggle all projects |
 | `ctrl-t` | Toggle closed items |
 | `esc` | Quit |

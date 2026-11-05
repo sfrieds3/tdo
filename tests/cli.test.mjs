@@ -198,7 +198,8 @@ test("plain tdo opens the fzf browser with action bindings", () => {
   assert.equal(tdo().code, 0, "esc exits cleanly");
   const { args, env } = calls[0];
   const binds = args.filter((arg) => arg.startsWith("--bind=")).map((arg) => arg.slice(7).split(":")[0]);
-  assert.deepEqual(binds, ["start", "enter", "ctrl-e", "ctrl-s", "ctrl-d", "ctrl-x", "ctrl-r", "alt-up", "alt-down", "alt-d", "ctrl-n", "ctrl-a", "ctrl-t"]);
+  assert.deepEqual(binds, ["start", "ctrl-n", "ctrl-p", "enter", "ctrl-e", "ctrl-s", "ctrl-d", "ctrl-x", "ctrl-r", "alt-up", "alt-down", "alt-d", "alt-n", "ctrl-a", "ctrl-t"]);
+  assert.ok(args.includes("--bind=ctrl-n:down") && args.includes("--bind=ctrl-p:up"));
   assert.ok(args.includes("--multi"));
   assert.match(args.find((arg) => arg.startsWith("--header=")), /tdo · github\.com\/example\/widgets · open/);
   assert.equal(env.FORCE_COLOR, "1");
