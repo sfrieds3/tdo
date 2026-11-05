@@ -6,6 +6,7 @@ import * as path from "node:path";
 import test from "node:test";
 
 const { run } = await import("../src/cli.ts");
+const core = await import("../src/core.ts");
 const SCRIPT = new URL("../src/cli.ts", import.meta.url).pathname;
 const PROJECT = "github.com/example/widgets";
 
@@ -14,8 +15,9 @@ function harness(extra = {}) {
   const env = { TDO_DB: path.join(dir, "tdo.db"), TDO_PROJECT: PROJECT, XDG_CONFIG_HOME: path.join(dir, "config") };
   return (...argv) => {
     const out = [];
-    const code = run(argv, { out: (text) => out.push(text), cwd: dir, env, ...extra });
-    return { code, out: out.join("\n"), json: () => JSON.parse(out.join("\n")) };
+    const err = [];
+    const code = run(argv, { out: (text) => out.push(text), err: (text) => err.push(text), cwd: dir, env, ...extra });
+    return { code, out: out.join("\n"), err: err.join("\n"), json: () => JSON.parse(out.join("\n")) };
   };
 }
 
@@ -117,7 +119,7 @@ test("ls -a groups by project, most urgent first, capped per project", () => {
   assert.equal(widgets[0], "widgets  github.com/example/widgets · 7 items, 1!");
   assert.deepEqual(widgets.slice(1, 3), ["  #3  high    c", "  #2  normal  b"]);
   assert.equal(widgets.length, 1 + 5 + 1, "header, 5 items, and a more line");
-  assert.equal(widgets.at(-1), "  … 2 more (tdo ls --project github.com/example/widgets)");
+  assert.equal(widgets.at(-1), "  … 2 more (tdo ls --project github.com/example/widgets -n 0)");
 
   assert.equal(tdo("ls", "-a", "-n", "2").split("\n\n")[1].split("\n").length, 1 + 2 + 1);
   assert.doesNotMatch(tdo("ls", "-a", "-n", "0"), /more/);
@@ -127,7 +129,95 @@ test("ls -a groups by project, most urgent first, capped per project", () => {
   fs.writeFileSync(path.join(dir, "config", "tdo", "config.json"), JSON.stringify({ perProject: 1 }));
   assert.match(tdo("ls", "-a"), /… 6 more/);
   // In one project, -n is still a plain limit.
-  assert.equal(tdo("ls", "-n", "2").split("\n").length, 2);
+  assert.equal(tdo("ls", "-n", "2").split("\n").length, 3, "two items and a truncation notice");
+});
+
+test("list limits disclose actual truncation without changing JSON output", () => {
+  const tdo = harness({ color: true });
+  tdo("add", "first !high #ci");
+  tdo("add", "second #ci");
+  tdo("add", "third #ci");
+  tdo("add", "closed #ci");
+  tdo("done", "4");
+  tdo("add", "unrelated", "--project", "other/project");
+  const limited = tdo("ls", "-n", "2");
+  assert.equal(limited.out.split("\n").length, 3);
+  assert.match(limited.out, /\x1b\[2m… more items .*use -n 0/);
+  assert.equal(limited.err, "");
+  const json = tdo("ls", "--limit=2", "--json");
+  assert.deepEqual(json.json().map((item) => item.title), ["first", "second"]);
+  assert.match(json.err, /more items/);
+  assert.doesNotMatch(json.out, /…|\x1b/);
+  for (const args of [["-n", "3"], ["-n", "0"], ["-n", "1", "-q", "first"], ["-n", "1", "-p", "high"], ["-n", "1", "-s", "done"], ["-n", "1", "-t", "absent"]]) {
+    const result = tdo("ls", ...args, "--json");
+    assert.equal(result.err, "", `no false truncation notice for ${args.join(" ")}`);
+  }
+  assert.equal(tdo("ls", "-n", "0", "--json").json().length, 3);
+  const grouped = tdo("ls", "-a", "-n", "2", "--json");
+  assert.deepEqual(grouped.json().map((item) => item.project).sort(), [PROJECT, PROJECT, "other/project"].sort());
+  assert.match(grouped.err, /more items/);
+  assert.equal(tdo("ls", "-a", "-n", "0", "--json").err, "");
+  assert.throws(() => tdo("ls", "--limit=9007199254740992"), /non-negative integer/);
+});
+
+test("unlimited lists, exports, and browser candidates include rows beyond 5000", (t) => {
+  let picked = 0;
+  const tdo = harness({ pick: (lines) => { picked = lines.length; return [lines.at(-1).split("\t")[0]]; } });
+  const dbPath = tdo("paths", "--json").json().db;
+  t.after(() => fs.rmSync(path.dirname(dbPath), { recursive: true, force: true }));
+  const db = core.openDb(dbPath);
+  try {
+    for (let i = 1; i <= 5001; i++) core.addItem(db, { project: PROJECT, title: `bulk ${i}` });
+    const closed = core.addItem(db, { project: PROJECT, title: "closed sentinel" });
+    core.setStatus(db, closed, "done");
+    core.addItem(db, { project: "other/project", title: "other sentinel" });
+    assert.equal(core.listItems(db).length, 500, "core keeps its default");
+    assert.equal(core.listItems(db, { limit: 5001 }).length, 5001, "positive limits are not clamped");
+  } finally { db.close(); }
+  const defaultList = tdo("ls", "--json");
+  assert.equal(defaultList.json().length, 500);
+  assert.match(defaultList.err, /more items/);
+  const unlimited = tdo("ls", "-n", "0", "--json");
+  assert.equal(unlimited.json().length, 5001);
+  assert.equal(unlimited.err, "");
+  assert.equal(tdo("ls", "-n", "5001", "--json").err, "");
+  assert.equal(tdo("ls", "-n", "5001", "--json").json().length, 5001);
+  assert.equal(tdo("ls", "-a", "-n", "0", "--json").json().length, 5002);
+  assert.match(tdo("ls", "-a", "-n", "1").out, /5001 items[\s\S]*… 5000 more/);
+  const exported = tdo("export").json();
+  assert.equal(exported.length, 5002);
+  assert.ok(exported.some((item) => item.title === "closed sentinel"));
+  assert.ok(exported.some((item) => item.title === "bulk 5001"));
+  assert.equal(tdo("export", "-a").json().length, 5003);
+  const markdown = tdo("export", "--md").out;
+  assert.equal(markdown.match(/^- \[/gm).length, 5002);
+  assert.match(markdown, /- \[x\] #5002 closed sentinel/);
+  assert.equal(tdo("pick").out, "5001");
+  assert.equal(picked, 5001);
+  const state = path.join(path.dirname(dbPath), "state.json");
+  fs.writeFileSync(state, JSON.stringify({ all: true, status: "all" }));
+  const feed = tdo("_fzf", "feed", state).out;
+  assert.equal(feed.split("\n").length, 5003);
+  assert.match(feed, /bulk 5001/);
+  assert.match(feed, /other sentinel/);
+});
+
+test("JSON truncation diagnostics go to real stderr, not stdout", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tdo-limit-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const env = { ...process.env, TDO_DB: path.join(dir, "tdo.db"), TDO_PROJECT: PROJECT, TDO_CONFIG: path.join(dir, "config.json") };
+  const db = core.openDb(env.TDO_DB);
+  try { for (let i = 0; i < 3; i++) core.addItem(db, { project: PROJECT, title: `item ${i}` }); } finally { db.close(); }
+  for (const all of [[], ["-a"]]) {
+    const limited = spawnSync(process.execPath, [SCRIPT, "ls", ...all, "-n", "2", "--json"], { env, encoding: "utf8" });
+    assert.equal(limited.status, 0, limited.stderr);
+    assert.equal(JSON.parse(limited.stdout).length, 2);
+    assert.match(limited.stderr, /more items/);
+    const full = spawnSync(process.execPath, [SCRIPT, "ls", ...all, "-n", "0", "--json"], { env, encoding: "utf8" });
+    assert.equal(full.status, 0, full.stderr);
+    assert.equal(JSON.parse(full.stdout).length, 3);
+    assert.equal(full.stderr, "");
+  }
 });
 
 test("colors are opt-in and follow NO_COLOR / FORCE_COLOR", async () => {

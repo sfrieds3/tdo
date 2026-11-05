@@ -145,6 +145,18 @@ test("items can be added, listed, searched, updated, and closed", () => {
   assert.throws(() => tdo.setStatus(db, { projectId: a.projectId, id: 999 }, "done"), /No tdo item #999/);
 });
 
+test("listItems accepts zero as unlimited and rejects invalid limits", () => {
+  const db = tdo.openDb(":memory:");
+  try {
+    for (let i = 0; i < 3; i++) tdo.addItem(db, { project: "test", title: `item ${i}` });
+    assert.equal(tdo.listItems(db, { limit: 0 }).length, 3);
+    assert.equal(tdo.listItems(db, { limit: 1 }).length, 1);
+    for (const limit of [-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "0"]) {
+      assert.throws(() => tdo.listItems(db, { limit }), /limit must be a non-negative safe integer/);
+    }
+  } finally { db.close(); }
+});
+
 test("item numbers are per project and never reused", () => {
   const db = tdo.openDb(":memory:");
   const widgets = "github.com/example/widgets";
@@ -445,7 +457,7 @@ test("grouped list renders bold project headers and per-project caps", () => {
   assert.equal(tdo.formatGroupedList(items, { perProject: 1 }), [
     "widgets  github.com/example/widgets · 2 items, 1!",
     "  #2  urgent  w-urgent",
-    "  … 1 more (tdo ls --project github.com/example/widgets)",
+    "  … 1 more (tdo ls --project github.com/example/widgets -n 0)",
     "",
     "gadgets  github.com/example/gadgets · 1 item, 1!",
     "  #1  high    g-high",

@@ -244,6 +244,29 @@ test("/tdo picker keys edit, re-prioritize, close, and delete, then reopen the p
   assert.equal(h.sent.length, 0);
 });
 
+test("Pi picker discloses overflow only when more than 200 items match", async () => {
+  const h = harness();
+  const db = core.openDb(h.dbPath);
+  try {
+    for (let i = 1; i <= 200; i++) core.addItem(db, { project: PROJECT, title: `item ${i}` });
+  } finally { db.close(); }
+  await h.command.handler("", h.ctx);
+  assert.equal(h.notifications.length, 0, "exactly 200 is complete");
+  assert.match(h.pickerTitles.at(-1), /\(200\)/);
+  h.addDirect({ title: "overflow" });
+  await h.command.handler("", h.ctx);
+  assert.equal(h.notifications.at(-1).level, "warning");
+  assert.match(h.notifications.at(-1).message, /first 200 active items.*tdo ls -n 0/);
+  assert.match(h.pickerTitles.at(-1), /\(200\+\)/);
+  await h.command.handler("--all", h.ctx);
+  assert.match(h.notifications.at(-1).message, /tdo ls -a -n 0/);
+  h.ctx.hasUI = false;
+  const before = h.notifications.length;
+  await h.command.handler("", h.ctx);
+  assert.equal(h.notifications[before].level, "warning", "non-UI browsing also discloses truncation");
+  assert.equal(h.notifications.at(-1).message.split("\n").length, 200);
+});
+
 test("/tdo --all browses every project with project-qualified ids", async () => {
   const h = harness({ keys: [[]] });
   h.addDirect({ title: "here" });
