@@ -97,6 +97,88 @@ test("footer count refreshes on session start and after agent runs", async () =>
   assert.equal(h.statuses.get("tdo"), "☑ 2 (1!)");
 });
 
+test("project resolution is nonblocking, awaited, and shared by concurrent extension calls", async (t) => {
+  const saved = { ...process.env };
+  const h = harness();
+  const bin = path.join(h.dir, "bin");
+  const marker = path.join(h.dir, "git-started");
+  const release = path.join(h.dir, "git-release");
+  const calls = path.join(h.dir, "git-calls");
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, "git"), `#!${process.execPath}
+const fs = require('node:fs');
+const args = process.argv.slice(4).join(' ');
+fs.appendFileSync(${JSON.stringify(calls)}, args + '\\n');
+if (args === 'rev-parse --show-toplevel') {
+  fs.writeFileSync(${JSON.stringify(marker)}, 'ready');
+  const timeout = setTimeout(() => process.exit(1), 2000);
+  const poll = setInterval(() => {
+    if (!fs.existsSync(${JSON.stringify(release)})) return;
+    clearInterval(poll); clearTimeout(timeout);
+    console.log(${JSON.stringify(h.dir)});
+  }, 10);
+} else if (args === 'remote') console.log('origin');
+else if (args === 'remote get-url origin') console.log('https://${PROJECT}.git');
+`, { mode: 0o755 });
+  delete process.env.TDO_PROJECT;
+  process.env.PATH = `${bin}:${process.env.PATH}`;
+  t.after(() => {
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+    Object.assign(process.env, saved);
+    fs.rmSync(h.dir, { recursive: true, force: true });
+  });
+  const status = h.emit("session_start");
+  const add = h.command.handler("await project !high", h.ctx);
+  const browse = h.command.handler("", h.ctx);
+  try {
+    for (let i = 0; i < 100 && !fs.existsSync(marker); i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(fs.existsSync(marker), "git has started while the event loop remains responsive");
+    assert.equal(h.statuses.size, 0, "footer waits for resolution");
+    assert.equal(h.notifications.length, 0, "commands wait for resolution");
+    assert.equal(fs.existsSync(h.dbPath), false, "no store operations before resolution");
+    assert.equal(fs.readFileSync(calls, "utf8"), "rev-parse --show-toplevel\n", "concurrent callers share one pending resolution");
+  } finally {
+    fs.writeFileSync(release, "go");
+    await Promise.all([status, add, browse]);
+  }
+  assert.equal(h.byTitle("await project").project, PROJECT);
+  assert.equal(h.statuses.get("tdo"), "tdo 1 (1!)");
+  assert.match(h.notifications.find((entry) => entry.message.includes("added"))?.message, /added #1/);
+  await h.emit("agent_end");
+  assert.equal(fs.readFileSync(calls, "utf8").trim().split("\n").length, 3, "successful resolution stays cached");
+  await h.emit("session_start");
+  assert.equal(fs.readFileSync(calls, "utf8").trim().split("\n").length, 6, "session start clears the cache");
+
+  for (const transition of ["session_shutdown", "session_tree", "session_start"]) {
+    fs.unlinkSync(release);
+    fs.unlinkSync(marker);
+    const refresh = h.emit("session_start");
+    const staleAdd = h.command.handler(`stale ${transition}`, h.ctx);
+    const staleBrowse = h.command.handler("", h.ctx);
+    for (let i = 0; i < 100 && !fs.existsSync(marker); i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(fs.existsSync(marker));
+    const changed = h.emit(transition);
+    fs.writeFileSync(release, "go");
+    await Promise.all([refresh, staleAdd, staleBrowse, changed]);
+    assert.equal(h.byTitle(`stale ${transition}`), undefined, "old commands must not write after a lifecycle change");
+  }
+});
+
+test("failed project resolution is evicted so commands can retry after config repair", async () => {
+  const h = harness();
+  const configDir = path.join(h.dir, "config", "tdo");
+  fs.mkdirSync(configDir, { recursive: true });
+  const config = path.join(configDir, "config.json");
+  fs.writeFileSync(config, "{ nope");
+  await h.command.handler("not saved", h.ctx);
+  assert.equal(h.notifications.at(-1).level, "error");
+  assert.match(h.notifications.at(-1).message, /invalid JSON/);
+  assert.equal(h.items().length, 0);
+  fs.writeFileSync(config, "{}");
+  await h.command.handler("saved after repair", h.ctx);
+  assert.equal(h.byTitle("saved after repair").project, PROJECT);
+});
+
 test("/tdo quick-adds with inline priority and tags", async () => {
   const h = harness();
   await h.command.handler("fix flaky login test !urgent #ci", h.ctx);
