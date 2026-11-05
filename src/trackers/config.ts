@@ -30,9 +30,6 @@ export type EffectiveTracker = {
   sources: Partial<Record<keyof TrackerOverride, "repo" | "user">>;
 };
 
-/** Settings accepted now but only acted on by later versions. */
-export const INACTIVE_SETTINGS: readonly (keyof TrackerOverride)[] = ["mode", "tag"];
-
 export type TrackerResolution =
   | { kind: "none" }
   | { kind: "disabled" }

@@ -7,7 +7,7 @@ import { isIP } from "node:net";
 import * as core from "./core.ts";
 import * as queue from "./link-ops.ts";
 
-export const RPC_VERSION = 3;
+export const RPC_VERSION = 4;
 export const MAX_RPC_BYTES = 8 * 1024 * 1024;
 export const SSH_TIMEOUT_MS = 20_000;
 
@@ -126,13 +126,14 @@ const key: Validator = (v) => !!v && typeof v === "object" && !Array.isArray(v) 
 const priority = oneOf(core.PRIORITIES);
 const newItem = object({ project: (v) => string(v) || project(v), title: string, body: optional(string), priority: optional(priority), tags: optional(strings), fileRef: optional(string), source: optional(string), sessionId: optional(string), host: optional(string), createdByHuman: optional(boolean) });
 const patch = object({ title: optional(string), body: optional(nullable(string)), priority: optional(priority), addTags: optional(strings), removeTags: optional(strings), fileRef: optional(nullable(string)) });
-const filter = object({ project: optional(string), status: optional(oneOf(core.STATUS_FILTERS)), tags: optional(strings), minPriority: optional(priority), query: optional(string), limit: optional(integer), linked: optional(boolean) });
+const autoIntent = object({ provider: oneOf(["github"]), destination: string, tag: string, authorized: boolean });
+const filter = object({ project: optional(string), status: optional(oneOf(core.STATUS_FILTERS)), tags: optional(strings), minPriority: optional(priority), query: optional(string), limit: optional(integer), linked: optional(boolean), awaiting: optional(boolean) });
 const outcome: Validator = (v) => object({ ok: (x) => x === true, externalId: string, url: string, snapshot: optional(object({ title: string, body: nullable(string), fileRef: nullable(string) })) })(v) || object({ ok: (x) => x === false, kind: oneOf(["attention", "retryable", "uncertain"]), message: string })(v);
 const validators: Record<Operation, Validator[]> = {
   leaseLinkOps: [key, string, string, optional(object({ destination: string, externalId: nullable(string), url: nullable(string), createdAt: string }))], nextLinkOp: [key, string, string], ackOp: [key, string, string, integer], failOp: [key, string, string, integer, boolean, string], releaseLinkOps: [key, string, string, optional(object({ destination: string, externalId: nullable(string), url: nullable(string), createdAt: string }))], retryLinkOps: [string],
   listLinkedItems: [string],
-  addItem: [newItem], listItems: [optional(filter)], findItem: [string, string], getItem: [key], getItemByNumber: [string, integer],
-  updateItem: [key, patch], setStatus: [key, oneOf(core.STATUSES), optional(nullable(string)), optional(boolean)], addNote: [key, string], deleteItem: [key], countActive: [string],
+  addItem: [newItem, optional(autoIntent)], listItems: [optional(filter)], findItem: [string, string], getItem: [key], getItemByNumber: [string, integer],
+  updateItem: [key, patch, optional(autoIntent)], setStatus: [key, oneOf(core.STATUSES), optional(nullable(string)), optional(boolean)], addNote: [key, string], deleteItem: [key], countActive: [string],
   getLink: [key, string], claimLinkCreate: [key, string, string, oneOf(["create", "force"])], finishLinkCreate: [key, string, string, outcome, optional(boolean)],
   expireStaleClaims: [string], attachLink: [key, string, string, string, string], detachLink: [key, string], countLinks: [string],
   listTags: [optional(string)], listProjects: [], check: [], migrate: [optional(boolean)],

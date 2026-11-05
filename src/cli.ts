@@ -10,7 +10,8 @@ import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { floatingBackend, launchFloatingBrowser } from "./floating.ts";
 import { createStore, parseTarget, saveDbTarget, serveRpc, type Store } from "./store.ts";
-import { INACTIVE_SETTINGS, isApproved, resolveTracker, setApproval, type EffectiveTracker, type TrackerResolution } from "./trackers/config.ts";
+import { isApproved, resolveTracker, setApproval, type EffectiveTracker, type TrackerResolution } from "./trackers/config.ts";
+import { autoIntent, isHumanCommand } from "./trackers/auto.ts";
 import { summarizeLinks, formatSyncSummary } from "./trackers/status.ts";
 import { drainItems } from "./trackers/drain.ts";
 import { pushItem, syncProject, trackerFor, type PushResult } from "./trackers/sync.ts";
@@ -51,7 +52,7 @@ usage:
                             otherwise the same as tdo ls
   tdo add <title...> [-p PRIO] [-t TAGS] [-b BODY] [-f PATH[:LINE]] [--source NAME]
                             (inline !high and #tag work too)
-  tdo ls [-a] [-s STATUS] [-t TAGS] [-p PRIO] [-q TEXT] [-n N] [--linked]
+  tdo ls [-a] [-s STATUS] [-t TAGS] [-p PRIO] [-q TEXT] [-n N] [--linked] [--awaiting]
                             -a groups by project, N items each (default ${DEFAULT_PER_PROJECT}; 0 = all)
                             ↗#42 filed as an issue, ↗… in progress, ↗! needs attention
   tdo show [id]             ids are per project: 3 or #3 here, NAME#3 or KEY#3 elsewhere
@@ -122,6 +123,7 @@ const OPTIONS = {
   "dry-run": { type: "boolean" },
   source: { type: "string" },
   linked: { type: "boolean" },
+  awaiting: { type: "boolean" },
   attach: { type: "string" },
   force: { type: "boolean" },
   detach: { type: "boolean" },
@@ -162,7 +164,6 @@ export type Io = {
 
 const MULTI_COMMANDS = new Set(["start", "done", "drop", "reopen", "pick", "push"]);
 /** Sources that mean a person typed the command (with a terminal attached). */
-const HUMAN_SOURCES = new Set(["cli", "user"]);
 
 function shellQuote(value: string): string {
   return /^[\w@%+=:,./-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`;
@@ -366,7 +367,13 @@ export function run(argv: string[], io: Io): number {
     if (cached.kind === "invalid" && !["push", "sync"].includes(command)) warn(`tdo: invalid tracker config: ${cached.error}`);
     return cached;
   };
+  const intentFor = (itemProject = project().key) => {
+    if (itemProject !== project().key) return undefined;
+    const resolution = resolved();
+    return autoIntent(resolution.kind === "ok" ? resolution.tracker : undefined, isHumanCommand(!!io.tty, values.source || io.env.TDO_SOURCE || "cli"));
+  };
   const afterMutation = (items: Item[]) => {
+    for (const item of items) if (item.links.some((link) => link.state === "awaiting-approval")) warn(`#${item.id} matches the tracker tag — awaiting approval: run 'tdo push ${item.id}'.`);
     if (values["no-sync"]) return;
     const resolution = resolved();
     if (resolution.kind !== "ok") return;
@@ -375,6 +382,12 @@ export function run(argv: string[], io: Io): number {
       return;
     }
     // This checkout cannot approve another project's repository configuration.
+    for (const item of items.filter((item) => item.project === project().key && item.links.some((link) => link.state === "pending"))) {
+      try {
+        const result = pushItem(db, item, resolution.tracker, { warn, env: io.env, noSync: true });
+        if (result.error) warn(`tdo: ${result.error}`);
+      } catch (error) { warn(`tdo: #${item.id}: filing paused: ${(error as Error).message}; local change saved.`); }
+    }
     drainItems(db, items.filter((item) => item.project === project().key), resolution.tracker, { warn, env: io.env, limit: 5 });
   };
   try {
@@ -393,9 +406,10 @@ export function run(argv: string[], io: Io): number {
           source,
           sessionId: io.env.TDO_SESSION_ID,
           host: os.hostname().split(".")[0],
-          createdByHuman: !!io.tty && HUMAN_SOURCES.has(source),
-        });
+          createdByHuman: isHumanCommand(!!io.tty, source),
+        }, intentFor());
         emit(item, `added ${formatItemLine(item)}`);
+        afterMutation([item]);
         return 0;
       }
       case "ls":
@@ -410,6 +424,7 @@ export function run(argv: string[], io: Io): number {
           minPriority: values.priority ? requirePriority(values.priority) : undefined,
           query: values.query,
           ...(values.linked ? { linked: true } : {}),
+          ...(values.awaiting ? { awaiting: true } : {}),
         };
         if (!all) {
           const items = db.call("listItems", { ...filter, limit: limit || undefined });
@@ -494,7 +509,7 @@ export function run(argv: string[], io: Io): number {
             emit(target, `unchanged ${formatItemLine(target, { color })}`);
             return 0;
           }
-          const item = db.call("updateItem", target, { title, body });
+          const item = db.call("updateItem", target, { title, body }, intentFor(target.project));
           emit(item, `updated ${formatItemLine(item, { color })}`);
           afterMutation([item]);
           return 0;
@@ -507,7 +522,7 @@ export function run(argv: string[], io: Io): number {
           fileRef: values.file,
           addTags: tags.add,
           removeTags: tags.remove,
-        });
+        }, intentFor(target.project));
         emit(item, `updated ${formatItemLine(item)}`);
         afterMutation([item]);
         return 0;
@@ -649,14 +664,12 @@ function trackerCommand(args: string[], ctx: TrackerCommandContext): number {
       links = store.call("countLinks", ctx.project.key);
       sync = summarizeLinks(store.call("listLinkedItems", ctx.project.key), config);
     } catch (error) { linksError = (error as Error).message; } finally { store.close(); }
-    const inactive = INACTIVE_SETTINGS.filter((key) => config.sources[key]);
     ctx.emit({ project: ctx.project.key, tracker: { ...config }, gh: health.ok ? "ok" : health.message, links: links ?? null, sync: sync ?? null, ...(linksError ? { linksError } : {}) }, [
       `${ctx.project.key}: ${config.provider} issues in ${config.destination}`,
       ...describeTracker(config).map((line) => `  ${line}`),
       `approval:    ${APPROVAL_TEXT[config.approval]}`,
       `gh:          ${health.ok ? "ok" : health.message}`,
       ...(sync ? formatSyncSummary(sync) : []),
-      ...(inactive.length ? [`note:        ${inactive.join(", ")} not active until a later version`] : []),
       ...(links ? Object.entries(links).map(([state, ids]) => `${`${state}:`.padEnd(13)}${ids.map((id) => `#${id}`).join(" ")}`) : [`links:       unavailable (${linksError})`]),
     ].join("\n"));
     return 0;

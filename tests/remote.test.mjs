@@ -6,7 +6,7 @@ import * as path from "node:path";
 import test from "node:test";
 import { run } from "../src/cli.ts";
 import { openDb, schemaVersion } from "../src/core.ts";
-import { createStore, createAsyncStore, parseTarget, handleRpc, MAX_RPC_BYTES } from "../src/store.ts";
+import { createStore, createAsyncStore, parseTarget, handleRpc, MAX_RPC_BYTES, RPC_VERSION } from "../src/store.ts";
 
 const script = new URL("../src/cli.ts", import.meta.url).pathname;
 function harness(t) {
@@ -28,7 +28,7 @@ if (process.env.SSH_MODE === 'descendant') {
 if (process.env.SSH_MODE === 'fail') { console.error('offline'); process.exit(255); }
 if (process.env.SSH_MODE === 'bad') { console.log('not json'); process.exit(0); }
 if (process.env.SSH_MODE === 'version') { console.log(JSON.stringify({version:99,ok:true,result:{}})); process.exit(0); }
-if (process.env.SSH_MODE === 'shape') { console.log(JSON.stringify({version:3,ok:true,result:{}})); process.exit(0); }
+if (process.env.SSH_MODE === 'shape') { console.log(JSON.stringify({version:${RPC_VERSION},ok:true,result:{}})); process.exit(0); }
 if (process.env.SSH_MODE === 'large') { process.stdout.write('x'.repeat(9*1024*1024)); return; }
 const input = fs.readFileSync(0);
 const request = JSON.parse(input);
@@ -258,7 +258,7 @@ test("sync and async SSH operations enforce the overall timeout", async (t) => {
 
 test("helper validates closed protocol and args before opening a database", (t) => {
   const h = harness(t);
-  const request = { version: 3, path: h.db, operation: "listItems", args: [] };
+  const request = { version: RPC_VERSION, path: h.db, operation: "listItems", args: [] };
   for (const bad of ["not-json", JSON.stringify({ ...request, version: 1 }), JSON.stringify({ ...request, extra: true }), JSON.stringify({ ...request, path: "ssh://host/db" }), JSON.stringify({ ...request, operation: "exec", args: ["DROP TABLE items"] }), JSON.stringify({ ...request, args: [{ limit: "1; DROP TABLE items" }] }), JSON.stringify({ ...request, operation: "addItem", args: [{ project: {}, title: "bad" }] }), "x".repeat(MAX_RPC_BYTES + 1)]) {
     assert.equal(JSON.parse(handleRpc(bad)).ok, false);
   }
@@ -423,4 +423,20 @@ console.log('https://github.com/example/widgets/issues/42');
   assert.equal(continued[0].ok, false);
   assert.match(continued[0].error, /injected store failure/);
   assert.equal(continued[1].ok, true, "unexpected per-item store failures do not abort later items");
+});
+
+test("auto intent and awaiting SQL filter round-trip over fake SSH without tracker networking", (t) => {
+  const h = harness(t);
+  const store = createStore(h.target, { env: h.env });
+  try {
+    const intent = { provider: "github", destination: "github.com/example/widgets", tag: "issue", authorized: true };
+    const agent = store.call("addItem", { project: "caller/project", title: "agent", tags: ["issue"] }, intent);
+    assert.equal(agent.links[0].state, "awaiting-approval");
+    const human = store.call("addItem", { project: "caller/project", title: "human", createdByHuman: true });
+    const tagged = store.call("updateItem", human, { addTags: ["issue"] }, intent);
+    assert.equal(tagged.links[0].state, "pending");
+    assert.deepEqual(store.call("listItems", { project: "caller/project", awaiting: true }).map((item) => item.id), [agent.id]);
+    assert.equal(store.call("updateItem", agent, { title: "human edit" }, intent).links[0].state, "awaiting-approval");
+    assert.equal(store.call("getItem", tagged).links[0].destination, intent.destination);
+  } finally { store.close(); }
 });

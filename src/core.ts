@@ -4,6 +4,7 @@
  * Shared by the `tdo` CLI (src/cli.ts) and the Pi extension (extensions/tdo.ts); agents use the CLI via skills/tdo.
  * Uses only erasable TypeScript syntax so Node can run it directly with type stripping.
  */
+import type { AutoIntent } from "./trackers/auto.ts";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
@@ -135,6 +136,7 @@ export type ListFilter = {
   limit?: number;
   /** Only items with a tracker link. */
   linked?: boolean;
+  awaiting?: boolean;
 };
 
 const MAX_TITLE_CHARS = 200;
@@ -301,10 +303,10 @@ export function readRepoConfig(root: string): RepoConfig | undefined {
 }
 
 function detectProject(cwd: string, env: NodeJS.ProcessEnv, home: string): Project {
-  if (env.TDO_PROJECT?.trim()) return projectFromKey(env.TDO_PROJECT);
   const top = git(cwd, ["rev-parse", "--show-toplevel"]);
+  const repoProject = top ? readRepoConfig(top)?.project : undefined;
+  if (env.TDO_PROJECT?.trim()) return { ...projectFromKey(env.TDO_PROJECT), root: top ?? path.resolve(cwd) };
   if (!top) return { ...projectFromKey(`local:${homeRelative(path.resolve(cwd), home)}`), root: path.resolve(cwd) };
-  const repoProject = readRepoConfig(top)?.project;
   if (repoProject) return { ...projectFromKey(repoProject), root: top };
   try {
     const override = fs.readFileSync(path.join(top, PROJECT_FILE), "utf8").split("\n")[0]?.trim();
@@ -601,7 +603,7 @@ function requireItem(db: DatabaseSync, key: ItemKey): Item {
   return item;
 }
 
-export function addItem(db: DatabaseSync, input: NewItem): Item {
+export function addItem(db: DatabaseSync, input: NewItem, intent?: AutoIntent): Item {
   const project = typeof input.project === "string" ? projectFromKey(input.project) : input.project;
   const title = cleanTitle(input.title);
   const priority = input.priority ? requirePriority(input.priority) : "normal";
@@ -616,12 +618,14 @@ export function addItem(db: DatabaseSync, input: NewItem): Item {
     );
     const insertTag = db.prepare("INSERT OR IGNORE INTO tags (project_id, item_id, tag) VALUES (?, ?, ?)");
     for (const tag of normalizeTags(input.tags)) insertTag.run(projectId, id, tag);
-    return { projectId, id };
+    const key = { projectId, id };
+    persistAutoIntent(db, key, intent);
+    return key;
   });
   return requireItem(db, key);
 }
 
-export function updateItem(db: DatabaseSync, key: ItemKey, patch: ItemPatch): Item {
+export function updateItem(db: DatabaseSync, key: ItemKey, patch: ItemPatch, intent?: AutoIntent): Item {
   transaction(db, () => {
     // Read under the write lock so a concurrent delete can't slip in between.
     const { projectId, id } = requireItem(db, key);
@@ -639,8 +643,20 @@ export function updateItem(db: DatabaseSync, key: ItemKey, patch: ItemPatch): It
     values.push(now());
     db.prepare(`UPDATE items SET ${sets.join(", ")} WHERE project_id = ? AND id = ?`).run(...values, projectId, id);
     if (patch.title !== undefined || patch.body !== undefined || patch.fileRef !== undefined) enqueueLinked(db, key, "update");
+    persistAutoIntent(db, key, intent);
   });
   return requireItem(db, key);
+}
+
+/** Runs under the item transaction; existing links are never promoted or retargeted. */
+function persistAutoIntent(db: DatabaseSync, key: ItemKey, intent?: AutoIntent): void {
+  if (!intent) return;
+  const item = db.prepare("SELECT created_by_human FROM items WHERE project_id = ? AND id = ?").get(key.projectId, key.id) as { created_by_human: number };
+  const tagged = db.prepare("SELECT 1 FROM tags WHERE project_id = ? AND item_id = ? AND tag = ?").get(key.projectId, key.id, intent.tag);
+  if (!tagged) return;
+  const state = intent.authorized && item.created_by_human === 1 ? "pending" : "awaiting-approval";
+  db.prepare("INSERT OR IGNORE INTO links (project_id, item_id, provider, destination, state, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+    .run(key.projectId, key.id, intent.provider, intent.destination, state, now());
 }
 
 function insertNote(db: DatabaseSync, key: ItemKey, status: Status | null, body: string, timestamp: string): number {
@@ -835,6 +851,7 @@ export function listItems(db: DatabaseSync, filter: ListFilter = {}): Item[] {
   const query = filter.query ? ftsQuery(filter.query) : undefined;
   if (filter.query && !query) return [];
   if (query) { where.push("(i.project_id, i.id) IN (SELECT project_id, item_id FROM items_fts WHERE items_fts MATCH ?)"); values.push(query); }
+  if (filter.awaiting) where.push("EXISTS (SELECT 1 FROM links l WHERE l.project_id = i.project_id AND l.item_id = i.id AND l.state = 'awaiting-approval')");
   if (filter.linked) where.push("EXISTS (SELECT 1 FROM links l WHERE l.project_id = i.project_id AND l.item_id = i.id)");
   const closedFirst = status === "closed" || status === "done" || status === "dropped";
   const order = closedFirst
