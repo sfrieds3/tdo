@@ -27,7 +27,7 @@ It ships with an [agent skill](skills/tdo/SKILL.md), so Claude Code, Codex, Pi, 
 - **Context that survives.** Each item can carry a body (the why, a repro), a `path:line`, and records where it came from: CLI, you in Pi, or the agent, with the session and host.
 - **Search.** Full-text search over titles and bodies, plus filters by tag, priority, and status.
 - **Works with any agent.** One skill teaches agents when to park, how to write an item a future session can act on, and to ask before logging what they found themselves. Every command takes `--json`, and items record which agent added them.
-- **Just SQLite.** One file under `$XDG_DATA_HOME`, built-in `node:sqlite`, zero runtime dependencies.
+- **Just SQLite, local or over SSH.** One file under `$XDG_DATA_HOME`, built-in `node:sqlite`, zero runtime dependencies. Keep it on one host and access it with your existing SSH config and agent.
 
 ## Install
 
@@ -91,7 +91,7 @@ Item ids are numbered per project, so every repo's backlog starts at `#1`. `3` o
 
 Leave the id out of `show`, `edit`, `start`, `done`, `drop`, `reopen`, or `rm` and tdo opens fzf to pick it (`tab` marks several for the status commands; `reopen` offers closed items). Add `-a` to pick across projects. Without fzf or a terminal, the id is required.
 
-Global options: `--json` for machine-readable output, `--project KEY` to target another project, `-C DIR` to resolve the project from another directory, `-a` / `--all` to span every project. `add` also takes `--source NAME` (or `TDO_SOURCE`) to record who added the item; it defaults to `cli`.
+Global options: `--db TARGET` for a one-off local or SSH database override, `--json` for machine-readable output, `--project KEY` to target another project, `-C DIR` to resolve the project from another directory, `-a` / `--all` to span every project. `add` also takes `--source NAME` (or `TDO_SOURCE`) to record who added the item; it defaults to `cli`.
 
 `tdo project` shows the resolved project key and `tdo paths` shows where the database and config live.
 
@@ -202,7 +202,37 @@ tdo migrate             # back up to tdo.db.v1-backup-<timestamp>, upgrade, prin
 
 Items are renumbered per project in their original order, so the oldest item in each project becomes `#1`. Tags, bodies, statuses, and timestamps carry over. To undo, replace `tdo.db` with the backup (and use a 0.1.x tdo).
 
-**Sharing across machines:** don't sync the database file with Dropbox, Syncthing, or a network mount while more than one machine writes to it — SQLite files corrupt or fork that way. Keep the database on one host instead. A built-in ssh remote mode is planned; until then, `tdo export` is a safe way to move or back up items.
+**Sharing across machines:** don't sync the database file with Dropbox, Syncthing, or a network mount while more than one machine writes to it — SQLite files corrupt or fork that way. Keep the database on one host and use SSH remote mode instead. `tdo export` is also a safe way to move or back up items.
+
+### SSH remote database
+
+Install a compatible version of `tdo` and Node 22.18+ on the server. The remote noninteractive shell must find `tdo` on `PATH`; use the same tdo release on both ends. Configure SSH keys/agent, host keys, and any jump hosts with your normal SSH setup first. No daemon, database file synchronization, or network-mounted SQLite file is needed.
+
+```sh
+tdo db use 'ssh://you@backlog-host/home/you/.local/share/tdo/tdo.db'
+tdo db check
+tdo add 'shared across my machines #infra'
+tdo --db /tmp/scratch-tdo.db ls       # one command only
+tdo db use /home/you/.local/share/tdo/tdo.db  # return to a local database
+```
+
+Targets are local file paths or `ssh://[user@]host[:port]/absolute/path` URIs. SSH config host aliases and bracketed IPv6 addresses work. Percent-encode reserved characters in paths (`%20` for a space, `%23` for `#`); paths are decoded exactly once. Passwords, query strings, fragments, malformed hosts/users/ports, and other URI schemes are rejected. Remote `~` expansion is not supported: supply an absolute path.
+
+Selection order is **`--db` > `TDO_DB` > config `db` > the default local path**. `tdo db use <target>` checks the target and schema before atomically saving it to the local config, preserving aliases and unknown keys. An existing `TDO_DB` still overrides that saved choice. `tdo paths` reports the selected target without contacting it; `tdo db check` connects and checks schema compatibility. Fresh databases are initialized automatically. `db use` trims the target, expands local `~/` paths, and saves relative local paths as absolute paths so the checked database stays selected when you change directories. One-off relative paths retain their usual cwd-relative meaning.
+
+Existing remote databases on older schemas require an explicit migration; ordinary commands never silently upgrade them. To preview and upgrade before saving a target:
+
+```sh
+tdo --db 'ssh://backlog-host/absolute/path/tdo.db' migrate --dry-run
+tdo --db 'ssh://backlog-host/absolute/path/tdo.db' migrate
+tdo db use 'ssh://backlog-host/absolute/path/tdo.db'
+```
+
+Migration backups are made next to the database **on the server**, and the returned backup path is a server path. Local databases retain automatic migration behavior. Project identity, aliases, source, session, and host metadata are resolved by the caller, not by the server's checkout or configuration.
+
+**Security and offline behavior:** each operation runs the fixed command `tdo internal-rpc` through system OpenSSH, with a versioned, validated JSON protocol over stdin/stdout. Paths, titles, and other user text are data, never interpolated into the remote shell command. There is no arbitrary SQL endpoint. The helper accepts only explicit absolute local database paths and ignores server-side tdo config and project resolution. It is an internal transport, not an authorization sandbox: an SSH account must be trusted and has its normal filesystem permissions. OpenSSH config, agent, and host-key checks remain in effect; batch mode disables interactive authentication prompts. Connections have an 8-second connect timeout, a 20-second overall operation timeout, and an 8 MiB request/output bound. Shell startup must not write noise to stdout.
+
+When offline or authentication fails, commands fail clearly: there is **no retry, local fallback, offline cache, or queued write**. A disconnected/timed-out write may already have committed; inspect the server before retrying. Every operation uses a new SSH process (normal SSH multiplexing configuration may reuse connections). Bulk CLI commands can issue multiple independent operations, not one cross-operation transaction.
 
 ## Configuration
 
@@ -210,7 +240,7 @@ Everything works without a config file. To change defaults, create `$XDG_CONFIG_
 
 ```json
 {
-  "db": "~/Sync/tdo/tdo.db",
+  "db": "~/.local/share/tdo/tdo.db",
   "perProject": 10,
   "aliases": {
     "github.com/me/widgets": "github.com/example/widgets"
@@ -220,7 +250,7 @@ Everything works without a config file. To change defaults, create `$XDG_CONFIG_
 
 | Key | Meaning |
 |---|---|
-| `db` | Database path (`~` expands). `TDO_DB` wins over it. |
+| `db` | Local database path (`~` expands) or SSH URI. `TDO_DB` and `--db` win over it. |
 | `perProject` | Items per project in `tdo ls -a` (default 5; 0 shows all). |
 | `aliases` | Maps a resolved project key to the key to use instead — e.g. your fork to its upstream, so both share one backlog. |
 
@@ -233,7 +263,7 @@ pnpm install     # dev dependencies (TypeScript, Pi peers for tests)
 just check       # type-check + tests
 ```
 
-Layout: [`src/core.ts`](src/core.ts) holds the schema, queries, paths, config, and project resolution; [`src/cli.ts`](src/cli.ts) and [`extensions/tdo.ts`](extensions/tdo.ts) are thin front-ends over it. The agent skill is [`skills/tdo/SKILL.md`](skills/tdo/SKILL.md), and a test checks that every command it documents exists. Tests live in [`tests/`](tests).
+Layout: [`src/core.ts`](src/core.ts) holds the schema, queries, paths, config, and project resolution; [`src/store.ts`](src/store.ts) provides operation-level local/SSH stores and the internal RPC protocol; [`src/cli.ts`](src/cli.ts) and [`extensions/tdo.ts`](extensions/tdo.ts) are front-ends. `openDb` remains local-only. `createStore(target, { env })` exposes synchronous `call(operation, ...args)` and `close()` for the CLI; `createAsyncStore(target, { env })` has the same typed operations with Promise results and nonblocking SSH for hosts such as Pi. Operations include CRUD/lookups, list/search, counts, tags, projects, schema checking, and migration; exports format `listItems` results. Tests use a fake `ssh` executable invoking the real helper against isolated local files, never live network connections. The agent skill is [`skills/tdo/SKILL.md`](skills/tdo/SKILL.md), and a test checks that every command it documents exists. Tests live in [`tests/`](tests).
 
 Commits and PR titles follow [Conventional Commits](https://www.conventionalcommits.org/). [release-please](https://github.com/googleapis/release-please) turns them into a release PR with a changelog; merging it tags the release, moves the `vMAJOR` / `vMAJOR.MINOR` tags, and attaches an npm tarball.
 

@@ -7,12 +7,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
+import { createStore, parseTarget, saveDbTarget, serveRpc } from "./store.ts";
 import {
   PRIORITIES,
   STATUS_FILTERS,
-  addItem,
-  countActive,
-  deleteItem,
   formatCounts,
   formatItemDetail,
   formatItemLine,
@@ -25,24 +23,13 @@ import {
   parseEditorText,
   getConfigPath,
   getDbPath,
-  findItem,
-  listItems,
-  listProjects,
-  listTags,
   loadConfig,
-  migrateDb,
-  openDb,
-  planMigration,
-  schemaVersion,
-  SCHEMA,
   type IdChange,
   parseQuickAdd,
   parseStatusFilter,
   projectFromKey,
   requirePriority,
   resolveProject,
-  setStatus,
-  updateItem,
   itemRef,
   type Item,
   type Project,
@@ -71,6 +58,8 @@ usage:
   tdo projects              all projects with active counts
   tdo project               show the resolved project key
   tdo paths                 show the database and config file locations
+  tdo db use <target>        validate and save a local path or ssh:// URI
+  tdo db check               check connection and schema
   tdo migrate [--dry-run]   upgrade an older database (backs it up first) and print id changes
   tdo export [-a] [--md]    dump items as JSON (default) or Markdown
 
@@ -80,6 +69,7 @@ browser keys (plain tdo, or tdo browse [-a] [-s all]):
   ctrl-a all projects · ctrl-t include closed · tab marks several · esc quit
 
 options:
+  --db TARGET     one-off database override (then TDO_DB, config db, default)
   --project KEY   use this project instead of resolving from the cwd
   -C DIR          resolve the project from DIR
   --json          machine-readable output (all commands)
@@ -93,6 +83,7 @@ env:        TDO_DB, TDO_CONFIG, TDO_PROJECT, TDO_SOURCE (who is adding: cli, cla
             TDO_FZF_OPTS (extra fzf flags), NO_COLOR / FORCE_COLOR`;
 
 const OPTIONS = {
+  db: { type: "string" },
   project: { type: "string" },
   C: { type: "string", short: "C" },
   json: { type: "boolean" },
@@ -205,6 +196,37 @@ function tagEdits(values: string[] | undefined): { add: string[]; remove: string
   return { add, remove };
 }
 
+type CliIO = { out: (text: string) => void; cwd: string; env: NodeJS.ProcessEnv };
+
+/** Saved local paths must keep pointing at the checked file from any checkout. */
+function savedTarget(value: string, cwd: string): string {
+  const target = value.trim();
+  if (parseTarget(target).kind === "ssh" || target === ":memory:") return target;
+  const expanded = target === "~" ? os.homedir() : target.startsWith("~/") ? path.join(os.homedir(), target.slice(2)) : target;
+  return path.resolve(cwd, expanded);
+}
+
+function dbCommand(args: string[], dbPath: string, io: CliIO, json: boolean): number {
+  const emit = (data: unknown, text: string) => io.out(json ? JSON.stringify(data, null, 2) : text);
+  if (args[0] === "use" && args.length === 2) {
+    const target = savedTarget(args[1], io.cwd);
+    const store = createStore(target, { env: io.env });
+    try { store.call("check"); } finally { store.close(); }
+    saveDbTarget(target, io.env);
+    emit({ db: target }, `database saved: ${target}`);
+    return 0;
+  }
+  if (args[0] === "check" && args.length === 1) {
+    const store = createStore(dbPath, { env: io.env });
+    try {
+      const result = store.call("check");
+      emit({ db: dbPath, ...result }, `${dbPath}: connected, schema v${result.schema}.`);
+    } finally { store.close(); }
+    return 0;
+  }
+  throw new UsageError("usage: tdo db use <target> | tdo db check");
+}
+
 export function run(argv: string[], io: Io): number {
   const { values, positionals } = parseArgs({ args: argv, options: OPTIONS, allowPositionals: true, strict: true });
   const [command = io.interactive && !values.json ? "browse" : "ls", ...args] = positionals;
@@ -217,7 +239,7 @@ export function run(argv: string[], io: Io): number {
   const cwd = values.C ? path.resolve(io.cwd, values.C) : io.cwd;
   const config = loadConfig(io.env);
   const project = (): Project => (values.project ? projectFromKey(values.project) : resolveProject(cwd, { env: io.env, config }));
-  const dbPath = getDbPath(io.env, { config });
+  const dbPath = values.db ?? getDbPath(io.env, { config });
 
   if (command === "project") {
     const resolved = project();
@@ -230,40 +252,25 @@ export function run(argv: string[], io: Io): number {
     return 0;
   }
 
-  if (command === "browse") return browse(io, { all: !!values.all, status: values.status ? parseStatusFilter(values.status) : "active", project: values.project, cwd: values.C ? cwd : undefined });
+  if (command === "browse") return browse(io, { all: !!values.all, status: values.status ? parseStatusFilter(values.status) : "active", project: values.project, cwd: values.C ? cwd : undefined, db: dbPath });
 
+  if (command === "db") return dbCommand(args, dbPath, io, json);
+  const db = createStore(dbPath, { env: io.env });
   if (command === "migrate") {
-    const db = openDb(dbPath, { migrate: false });
     try {
-      const version = schemaVersion(db);
-      const changes = planMigration(db);
-      const lines = (rows: IdChange[]) => rows.filter((row) => row.from !== row.to).map((row) => `  ${row.project}  #${row.from} -> #${row.to}  ${row.title}`);
-      if (version === SCHEMA) {
-        emit({ from: version, to: version, changes: [] }, `${dbPath}: already at schema v${version}.`);
-        return 0;
-      }
-      if (values["dry-run"]) {
-        const renamed = lines(changes);
-        emit({ from: version, to: SCHEMA, dryRun: true, changes }, [`${dbPath}: would upgrade schema v${version} -> v${SCHEMA}.`, renamed.length ? "id changes:" : "no ids change.", ...renamed].join("\n"));
-        return 0;
-      }
-      const result = migrateDb(db, dbPath);
-      const renamed = lines(result.changes);
+      const result = db.call("migrate", !!values["dry-run"]);
+      const renamed = result.changes.filter((row: IdChange) => row.from !== row.to).map((row: IdChange) => `  ${row.project}  #${row.from} -> #${row.to}  ${row.title}`);
       emit(result, [
-        `${dbPath}: upgraded schema v${result.from} -> v${result.to}.`,
+        result.from === result.to ? `${dbPath}: already at schema v${result.to}.` : `${dbPath}: ${values["dry-run"] ? "would upgrade" : "upgraded"} schema v${result.from} -> v${result.to}.`,
         ...(result.backup ? [`backup: ${result.backup}`] : []),
-        renamed.length ? "id changes:" : "no ids changed.",
-        ...renamed,
+        renamed.length ? "id changes:" : "no ids changed.", ...renamed,
       ].join("\n"));
       return 0;
-    } finally {
-      db.close();
-    }
+    } finally { db.close(); }
   }
 
-  const db = openDb(dbPath);
   /** Item ids are per project: `3` / `#3` here, `name#3` or `host/owner/repo#3` elsewhere. */
-  const find = (value: string | undefined) => findItem(db, requireRef(value), project().key);
+  const find = (value: string | undefined) => db.call("findItem", requireRef(value), project().key);
   const color = !json && !!io.color;
   const all = !!values.all;
 
@@ -273,15 +280,15 @@ export function run(argv: string[], io: Io): number {
     const pick = io.pick ?? fzfPick(io.env);
     if (!pick) throw new UsageError(`tdo ${command} needs an item id (or install fzf and run it in a terminal to pick one).`);
     const status = parseStatusFilter(values.status ?? (command === "reopen" ? "closed" : "active"));
-    const items = listItems(db, { project: all ? undefined : project().key, status, limit: 5000 }).sort((a, b) => (all ? a.project.localeCompare(b.project) : 0) || byStatusThenPriority(a, b));
+    const items = db.call("listItems", { project: all ? undefined : project().key, status, limit: 5000 }).sort((a, b) => (all ? a.project.localeCompare(b.project) : 0) || byStatusThenPriority(a, b));
     if (!items.length) throw new Error(`nothing to pick from${all ? "" : ` in ${project().key}`}.`);
-    const self = [process.execPath, ...process.execArgv, process.argv[1] ?? "tdo"].map(shellQuote).join(" ");
+    const self = [process.execPath, ...process.execArgv, process.argv[1] ?? "tdo", "--db", dbPath, "--project", project().key].map(shellQuote).join(" ");
     const lines = items.map((item) => `${item.project}#${item.id}\t${formatItemLine(item, { showProject: all, color: true })}`);
     const multi = MULTI_COMMANDS.has(command);
     const header = `tdo ${command}${all ? " (all projects)" : ` · ${project().key}`}${multi ? " · tab to mark several" : ""}`;
     const picked = pick(lines, { multi, header, preview: `${self} show {1}` });
     if (!picked.length) throw new Cancelled();
-    return picked.map((ref) => findItem(db, ref, project().key));
+    return picked.map((ref) => db.call("findItem", ref, project().key));
   };
   const one = (): Item => {
     const picked = targets();
@@ -293,7 +300,7 @@ export function run(argv: string[], io: Io): number {
       case "add": {
         const quick = parseQuickAdd(args.join(" "));
         if (!quick.title) throw new UsageError("tdo add needs a title.");
-        const item = addItem(db, {
+        const item = db.call("addItem", {
           project: project(),
           title: quick.title,
           priority: values.priority ? requirePriority(values.priority) : quick.priority,
@@ -320,13 +327,13 @@ export function run(argv: string[], io: Io): number {
           query: values.query,
         };
         if (!all) {
-          const items = listItems(db, { ...filter, limit: limit || undefined });
+          const items = db.call("listItems", { ...filter, limit: limit || undefined });
           emit(items, formatItemList(items, { color }));
           return 0;
         }
         // Across projects, -n (or the config's perProject) caps each project's group.
         const perProject = limit ?? config.perProject ?? DEFAULT_PER_PROJECT;
-        const items = listItems(db, { ...filter, limit: 5000 });
+        const items = db.call("listItems", { ...filter, limit: 5000 });
         if (json) {
           const counts = new Map<string, number>();
           emit(items.sort(byPriority).filter((item) => {
@@ -347,7 +354,7 @@ export function run(argv: string[], io: Io): number {
         const scope = state.all ? undefined : project().key;
         switch (action) {
           case "feed": {
-            const items = listItems(db, { project: scope, status: state.status, limit: 5000 }).sort((a, b) => (state.all ? byProjectFirst(a, b, project().key) : 0) || byStatusThenPriority(a, b));
+            const items = db.call("listItems", { project: scope, status: state.status, limit: 5000 }).sort((a, b) => (state.all ? byProjectFirst(a, b, project().key) : 0) || byStatusThenPriority(a, b));
             io.out(items.map((item) => `${item.project}#${item.id}\t${formatItemLine(item, { showProject: state.all, color: true })}`).join("\n"));
             return 0;
           }
@@ -363,16 +370,16 @@ export function run(argv: string[], io: Io): number {
           case "raise":
           case "lower":
             for (const ref of refs) {
-              const item = findItem(db, ref, project().key);
+              const item = db.call("findItem", ref, project().key);
               const index = PRIORITIES.indexOf(item.priority) + (action === "raise" ? -1 : 1);
-              if (index >= 0 && index < PRIORITIES.length) updateItem(db, item, { priority: PRIORITIES[index] });
+              if (index >= 0 && index < PRIORITIES.length) db.call("updateItem", item, { priority: PRIORITIES[index] });
             }
             return 0;
           case "delete": {
-            const items = refs.map((ref) => findItem(db, ref, project().key));
+            const items = refs.map((ref) => db.call("findItem", ref, project().key));
             if (!items.length) return 0;
             const answer = askTty(`delete ${items.length === 1 ? `${itemRef(items[0]!, { showProject: true })} ${items[0]!.title}` : `${items.length} items`}? [y/N] `);
-            if (/^y(es)?$/i.test(answer.trim())) for (const item of items) deleteItem(db, item);
+            if (/^y(es)?$/i.test(answer.trim())) for (const item of items) db.call("deleteItem", item);
             return 0;
           }
           default:
@@ -402,12 +409,12 @@ export function run(argv: string[], io: Io): number {
             emit(target, `unchanged ${formatItemLine(target, { color })}`);
             return 0;
           }
-          const item = updateItem(db, target, { title, body });
+          const item = db.call("updateItem", target, { title, body });
           emit(item, `updated ${formatItemLine(item, { color })}`);
           return 0;
         }
         const tags = tagEdits(values.tags);
-        const item = updateItem(db, target, {
+        const item = db.call("updateItem", target, {
           title: values.title,
           priority: values.priority ? requirePriority(values.priority) : undefined,
           body: values.body,
@@ -422,33 +429,33 @@ export function run(argv: string[], io: Io): number {
       case "done":
       case "drop":
       case "reopen": {
-        const items = targets().map((target) => setStatus(db, target, STATUS_COMMANDS[command], values.message));
+        const items = targets().map((target) => db.call("setStatus", target, STATUS_COMMANDS[command], values.message));
         emit(items.length === 1 ? items[0] : items, items.map((item) => `${item.status} ${formatItemLine(item)}`).join("\n"));
         return 0;
       }
       case "rm": {
-        const item = deleteItem(db, one());
+        const item = db.call("deleteItem", one());
         emit(item, `deleted #${item.id} ${item.title}`);
         return 0;
       }
       case "count": {
         const resolved = project();
-        const counts = countActive(db, resolved.key);
+        const counts = db.call("countActive", resolved.key);
         emit({ project: resolved.key, ...counts }, `${resolved.key}: ${formatCounts(counts)}`);
         return 0;
       }
       case "tags": {
-        const tags = listTags(db, values.all ? undefined : project().key);
+        const tags = db.call("listTags", values.all ? undefined : project().key);
         emit(tags, tags.length ? tags.map((row) => `${String(row.count).padStart(4)}  #${row.tag}`).join("\n") : "(no tags)");
         return 0;
       }
       case "projects": {
-        const projects = listProjects(db);
+        const projects = db.call("listProjects");
         emit(projects, projects.length ? projects.map((row) => `${String(row.active).padStart(4)}  ${row.key}`).join("\n") : "(no projects)");
         return 0;
       }
       case "export": {
-        const items = listItems(db, { project: values.all ? undefined : project().key, status: parseStatusFilter(values.status ?? "all"), limit: 5000 });
+        const items = db.call("listItems", { project: values.all ? undefined : project().key, status: parseStatusFilter(values.status ?? "all"), limit: 5000 });
         io.out(values.md && !json ? formatMarkdown(items).trimEnd() : JSON.stringify(items, null, 2));
         return 0;
       }
@@ -511,7 +518,7 @@ export function browseArgs(tdo: string, stateFile: string, header: string): stri
 }
 
 /** The interactive browser: fzf over the backlog, with bindings for every action. */
-function browse(io: Io, options: { all: boolean; status: StatusFilter; project?: string; cwd?: string }): number {
+function browse(io: Io, options: { all: boolean; status: StatusFilter; project?: string; cwd?: string; db: string }): number {
   const runFzf = io.runFzf ?? (onPath("fzf", io.env) ? (fzfArgs: string[], env: NodeJS.ProcessEnv) => spawnSync("fzf", fzfArgs, { stdio: ["ignore", "inherit", "inherit"], env }).status ?? 1 : undefined);
   if (!runFzf) throw new UsageError("the browser needs fzf on PATH; use `tdo ls` to list.");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tdo-browse-"));
@@ -520,7 +527,7 @@ function browse(io: Io, options: { all: boolean; status: StatusFilter; project?:
     const state: BrowseState = { all: options.all, status: options.status };
     writeState(stateFile, state);
     // Subcommands inherit the browser's project selection.
-    const tdo = [process.execPath, ...process.execArgv, process.argv[1] ?? "tdo", ...(options.project ? ["--project", options.project] : []), ...(options.cwd ? ["-C", options.cwd] : [])].map(shellQuote).join(" ");
+    const tdo = [process.execPath, ...process.execArgv, process.argv[1] ?? "tdo", "--db", options.db, ...(options.project ? ["--project", options.project] : []), ...(options.cwd ? ["-C", options.cwd] : [])].map(shellQuote).join(" ");
     const current = options.project ?? resolveProject(options.cwd ?? io.cwd, { env: io.env }).key;
     const env: NodeJS.ProcessEnv = { ...io.env, FORCE_COLOR: "1", FZF_DEFAULT_OPTS: [io.env.FZF_DEFAULT_OPTS, io.env.TDO_FZF_OPTS].filter(Boolean).join(" ") };
     delete env.NO_COLOR;
@@ -563,8 +570,13 @@ function byStatusThenPriority(a: Item, b: Item): number {
   return STATUS_ORDER[a.status] - STATUS_ORDER[b.status] || byPriority(a, b);
 }
 
-function main(): void {
+async function main(): Promise<void> {
   try {
+    if (process.argv[2] === "internal-rpc") {
+      if (process.argv.length !== 3) throw new UsageError("internal-rpc accepts no arguments.");
+      await serveRpc();
+      return;
+    }
     const tty = !!process.stdin.isTTY && !!process.stdout.isTTY;
     process.exitCode = run(process.argv.slice(2), { out: (text) => console.log(text), cwd: process.cwd(), env: process.env, color: useColor(process.env, process.stdout.isTTY), interactive: tty && onPath("fzf", process.env) });
   } catch (error) {

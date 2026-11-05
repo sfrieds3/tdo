@@ -441,6 +441,7 @@ export type OpenOptions = {
 };
 
 export function openDb(dbPath = getDbPath(), options: OpenOptions = {}): DatabaseSync {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(dbPath) && dbPath !== ":memory:") throw new Error("openDb accepts local paths only; use the operation-level store for remote targets.");
   if (dbPath !== ":memory:") fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
   db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;");
