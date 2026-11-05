@@ -656,3 +656,39 @@ test("TDO_PROJECT retains checkout tracker approval and rejects malformed repo c
   fs.writeFileSync(path.join(h.repo, ".tdo", "config.json"), "{broken");
   assert.match(h.cli("add", "must fail").error.message, /invalid JSON/);
 });
+
+for (const command of ["done", "drop"]) {
+  test(`auto-on-tag reconciles ${command} immediately without backposting old notes`, (t) => {
+    const h = harness(t, { tracker: { provider: "github", mode: "auto-on-tag" } });
+    h.cli("tracker", "approve", "--yes");
+    const item = h.cli("add", "closed later", "--json").json();
+    h.cli("note", String(item.id), "historical note");
+    h.cli(command, String(item.id), "-m", "historical status note");
+    const edited = h.cli("edit", String(item.id), "-t", "issue", "--json");
+    assert.equal(edited.code, 0);
+    assert.equal(edited.json().id, item.id);
+    const saved = h.cli("show", String(item.id), "--json").json();
+    assert.equal(saved.links[0].state, "closed");
+    assert.equal(saved.links[0].queued, 0);
+    const closes = h.calls().filter((call) => call.args[1] === "close");
+    assert.equal(closes.length, 1);
+    assert.ok(closes[0].args.includes(command === "done" ? "completed" : "not planned"));
+    assert.equal(h.calls().filter((call) => call.args[1] === "comment").length, 0);
+    assert.doesNotMatch(h.creates()[0].input, /historical/);
+  });
+}
+
+test("auto pending no-sync then done shares a five-operation drain budget", (t) => {
+  const h = harness(t, { tracker: { provider: "github", mode: "auto-on-tag" } });
+  h.cli("tracker", "approve", "--yes");
+  const ids = Array.from({ length: 6 }, (_, i) => String(h.cli("add", `pending ${i} #issue`, "--no-sync", "--json").json().id));
+  const result = h.cli("done", ...ids, "-m", "pre-create note", "--json");
+  assert.equal(result.code, 0);
+  assert.equal(result.json().length, 6);
+  assert.equal(h.creates().length, 6);
+  assert.equal(h.calls().filter((call) => call.args[1] === "close").length, 5);
+  assert.equal(h.calls().filter((call) => call.args[1] === "comment").length, 0);
+  const links = ids.map((id) => h.cli("show", id, "--json").json().links[0]);
+  assert.equal(links.filter((link) => link.state === "closed").length, 5);
+  assert.equal(links.reduce((n, link) => n + link.queued, 0), 1);
+});

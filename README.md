@@ -288,11 +288,11 @@ The result then goes through `aliases` in the [config file](#configuration), so 
 
 The database lives at `$XDG_DATA_HOME/tdo/tdo.db` — `~/.local/share/tdo/tdo.db` by default, on macOS too. Set `db` in the config file or `TDO_DB` to put it elsewhere. It is plain SQLite in WAL mode, so `sqlite3 ~/.local/share/tdo/tdo.db` works for ad-hoc queries.
 
-Schema: `projects` has a UUID `id` and the project `key`; `items` is keyed by `(project_id, id)`, where `id` is the per-project number; `tags`, `notes`, and `links` reference that pair. Full-text search lives in `items_fts`, kept in sync by triggers and covering notes as well as titles and bodies. Schema v3 also reserves `link_ops` for future lifecycle sync; this version does not enqueue or drain operations.
+Schema: `projects` has a UUID `id` and the project `key`; `items` is keyed by `(project_id, id)`, where `id` is the per-project number; `tags`, `notes`, and `links` reference that pair. Full-text search lives in `items_fts`, kept in sync by triggers and covering notes as well as titles and bodies. Schema v3 also stores durable lifecycle operations in `link_ops`; linked mutations enqueue operations and approved caller-side sync drains them.
 
 ### Upgrading for notes and GitHub issues
 
-**Compatibility break:** this feature uses schema v3 and SSH RPC v2. Update tdo on both the caller and database host to the same release before using an SSH database. Old helpers fail the protocol check; after updating the helper, an existing v2 remote database still requires an explicit `tdo migrate`. Local databases upgrade automatically on open, with a backup; use the commands below to preview first:
+**Compatibility break:** this feature uses schema v3 and SSH RPC v4. Update tdo on both the caller and database host to the same release before using an SSH database. Old helpers fail the protocol check; after updating the helper, an existing v2 remote database still requires an explicit `tdo migrate`. Local databases upgrade automatically on open, with a backup; use the commands below to preview first:
 
 ```sh
 tdo migrate --dry-run

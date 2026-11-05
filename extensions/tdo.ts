@@ -4,7 +4,7 @@
  * Agents (Pi, Claude Code, Codex, ...) use the `tdo` CLI through the bundled skill
  * (skills/tdo/SKILL.md), so this extension has no model-facing tool of its own.
  */
-import { resolveTracker } from "../src/trackers/config.ts";
+import { statusPolicy } from "../src/trackers/config.ts";
 import { autoIntent, isHumanCommand } from "../src/trackers/auto.ts";
 import { createTrackerUi, registerTrackerEvents, trackerForItem, trackerContext } from "./tracker.ts";
 import * as os from "node:os";
@@ -25,7 +25,6 @@ import {
   parseQuickAdd,
   requirePriority,
   resolveProject,
-  projectFromKey,
   type Item,
   type ItemKey,
   type Project,
@@ -91,10 +90,9 @@ function intent(ctx: ExtensionContext, itemProject?: string) {
   if (itemProject && itemProject !== state.project.key) return undefined;
   return autoIntent(state.resolution.kind === "ok" ? state.resolution.tracker : undefined, isHumanCommand(ctx.hasUI && ctx.mode !== "rpc", "user"));
 }
-function closeOnDone(ctx: ExtensionContext, item: Item): boolean {
+function closeOnDone(ctx: ExtensionContext, item: Item, status: "done" | "doing"): boolean {
   const current = trackerContext(ctx);
-  const resolution = item.project === current.project.key ? current.resolution : resolveTracker(projectFromKey(item.project), loadConfig());
-  return resolution.kind === "ok" ? resolution.tracker.closeOnDone : true;
+  return statusPolicy(item, current.project.key, status, current.resolution, loadConfig());
 }
 
 function displayRef(ctx: ExtensionContext, item: Item): string {
@@ -125,7 +123,7 @@ async function changePriority(ctx: ExtensionContext, item: Item, valid: () => bo
 }
 
 async function finishItem(ctx: ExtensionContext, item: Item, valid: () => boolean, trackerUi: TrackerUi): Promise<boolean> {
-  const updated = await callStore("setStatus", item, "done", undefined, closeOnDone(ctx, item));
+  const updated = await callStore("setStatus", item, "done", undefined, closeOnDone(ctx, item, "done"));
   if (!valid()) return false;
   await trackerUi.afterMutation(ctx, updated);
   if (!valid()) return false;
@@ -266,7 +264,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
 
   async function workOn(ctx: ExtensionContext, item: Item, showProject: boolean): Promise<void> {
     const current = lifecycle;
-    const started = await callStore("setStatus", item, "doing", undefined, closeOnDone(ctx, item));
+    const started = await callStore("setStatus", item, "doing", undefined, closeOnDone(ctx, item, "doing"));
     if (stopped || current !== lifecycle) return;
     await trackerUi.afterMutation(ctx, started);
     if (stopped || current !== lifecycle) return;

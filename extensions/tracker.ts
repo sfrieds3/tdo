@@ -90,7 +90,7 @@ export function createTrackerUi(active: () => boolean, epoch: () => number) {
 
 /** Best effort, intentionally not a shell parser; guarded commands show their complete text. */
 export function needsTrackerConsent(command: string): boolean {
-  return /\btdo(?:\.ts)?[\s"'][^\n;&|]*\bpush\b|\btdo(?:\.ts)?[\s"'][^\n;&|]*\btracker\s+approve\b/.test(command);
+  return /\btdo(?:\.ts)?[\s"'][^\n;&|]*\bpush\b|\btdo(?:\.ts)?[\s"'][^\n;&|]*\btracker\b[^\n;&|]*\bapprove\b/.test(command);
 }
 
 /** Only simple same-context mutations may trigger a post-result dialog. Reject overrides and scripts. */

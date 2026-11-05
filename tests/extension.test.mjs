@@ -368,14 +368,17 @@ if (process.argv[3] === 'create') console.log('https://github.com/example/widget
 const bashCall = (id, command) => ({ toolName: "bash", toolCallId: id, input: { command } });
 const bashResult = (id, command, text = "awaiting-approval") => ({ ...bashCall(id, command), content: [{ type: "text", text }], isError: false });
 
-test("Pi guard requires confirmation, fails closed without UI or when confirmation fails", async (t) => {
+test("Pi guard requires confirmation for supported flags and basic quoted subcommands", async (t) => {
   const h = trackerHarness(t, { confirm: false });
-  assert.equal((await h.emit("tool_call", bashCall("1", "tdo push 1"))).block, true);
-  assert.equal((await h.emit("tool_call", bashCall("2", "tdo tracker approve --yes"))).block, true);
-  assert.equal(h.dialogs.length, 2);
+  const commands = ["tdo push 1", "tdo --json push 1", "tdo tracker approve --yes", "tdo tracker --yes approve", "tdo tracker --json approve --yes", `tdo 'tracker' --yes "approve"`, `tdo "push" 1`];
+  for (const command of commands) {
+    assert.equal((await h.emit("tool_call", bashCall(command, command))).block, true, command);
+    assert.equal(h.dialogs.at(-1).message, command);
+  }
+  assert.equal(h.dialogs.length, commands.length);
   h.ctx.hasUI = false;
-  assert.equal((await h.emit("tool_call", bashCall("3", "tdo --json push 1"))).block, true);
-  assert.equal(h.dialogs.length, 2);
+  for (const command of commands) assert.equal((await h.emit("tool_call", bashCall(command, command))).block, true, command);
+  assert.equal(h.dialogs.length, commands.length, "no UI means no prompt or authorization");
   h.ctx.hasUI = true;
   h.ctx.ui.confirm = async () => { throw new Error("UI closed"); };
   assert.equal((await h.emit("tool_call", bashCall("4", "tdo push 1"))).block, true);
@@ -579,4 +582,41 @@ test("Pi worker preserves a relative caller config path when session cwd differs
   await h.command.handler("relative config #issue", h.ctx);
   assert.equal(h.items()[0].links[0].state, "open", JSON.stringify(h.notifications));
   assert.equal(h.calls().filter((args) => args[1] === "create").length, 1);
+});
+
+for (const policy of [true, false, undefined, "approval-only", "invalid"]) {
+  test(`Pi foreign linked done respects user lifecycle policy: ${policy}`, async (t) => {
+    const h = trackerHarness(t, { keys: [["x"], []] });
+    const foreign = "github.com/example/foreign";
+    const item = h.addDirect({ project: foreign, title: "foreign linked" });
+    const db = core.openDb(h.dbPath);
+    core.attachLink(db, item, "github", foreign, "7", "url");
+    db.close();
+    const config = JSON.parse(fs.readFileSync(h.config));
+    if (policy !== undefined) config.projects[foreign] = { tracker: policy === "approval-only" ? { provider: "github", approved: "missing-repo-hash" } : policy === "invalid" ? { provider: "oops" } : { provider: "github", closeOnDone: policy } };
+    fs.writeFileSync(h.config, JSON.stringify(config));
+    await h.command.handler("--all", h.ctx);
+    const saved = h.items()[0];
+    const known = typeof policy === "boolean";
+    assert.equal(saved.status, known ? "done" : "open");
+    assert.equal(saved.links[0].queued, policy === true ? 1 : 0);
+    if (!known) assert.match(h.notifications.at(-1).message, /policy is unknown/);
+    assert.equal(h.calls().length, 0, "foreign links never drain under checkout approval");
+  });
+}
+
+test("Pi unknown foreign policy allows doing and nonlinked done", async (t) => {
+  const h = trackerHarness(t, { keys: [[ENTER], [DOWN, "x"], []] });
+  const foreign = "github.com/example/foreign";
+  const linked = h.addDirect({ project: foreign, title: "linked" });
+  const db = core.openDb(h.dbPath);
+  core.attachLink(db, linked, "github", foreign, "7", "url");
+  db.close();
+  await h.command.handler("--all", h.ctx);
+  assert.equal(h.items()[0].status, "doing");
+  assert.equal(h.items()[0].links[0].queued, 0);
+  const other = h.addDirect({ project: "github.com/example/plain", title: "unlinked", priority: "urgent" });
+  await h.command.handler("--all", h.ctx);
+  assert.equal(h.items().find((item) => item.projectId === other.projectId).status, "done");
+  assert.equal(h.calls().length, 0);
 });

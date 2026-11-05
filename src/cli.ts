@@ -10,7 +10,7 @@ import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { floatingBackend, launchFloatingBrowser } from "./floating.ts";
 import { createStore, parseTarget, saveDbTarget, serveRpc, type Store } from "./store.ts";
-import { isApproved, resolveTracker, setApproval, type EffectiveTracker, type TrackerResolution } from "./trackers/config.ts";
+import { isApproved, resolveTracker, setApproval, statusPolicy, type EffectiveTracker, type TrackerResolution } from "./trackers/config.ts";
 import { autoIntent, isHumanCommand } from "./trackers/auto.ts";
 import { summarizeLinks, formatSyncSummary } from "./trackers/status.ts";
 import { drainItems } from "./trackers/drain.ts";
@@ -382,13 +382,16 @@ export function run(argv: string[], io: Io): number {
       return;
     }
     // This checkout cannot approve another project's repository configuration.
-    for (const item of items.filter((item) => item.project === project().key && item.links.some((link) => link.state === "pending"))) {
+    const refreshed = items.filter((item) => item.project === project().key).flatMap((item) => {
+      if (!item.links.some((link) => link.state === "pending")) return [item];
       try {
         const result = pushItem(db, item, resolution.tracker, { warn, env: io.env, noSync: true });
         if (result.error) warn(`tdo: ${result.error}`);
-      } catch (error) { warn(`tdo: #${item.id}: filing paused: ${(error as Error).message}; local change saved.`); }
-    }
-    drainItems(db, items.filter((item) => item.project === project().key), resolution.tracker, { warn, env: io.env, limit: 5 });
+        const fresh = db.call("getItem", item);
+        return fresh ? [fresh] : [];
+      } catch (error) { warn(`tdo: #${item.id}: filing paused: ${(error as Error).message}; local change saved.`); return []; }
+    });
+    drainItems(db, refreshed, resolution.tracker, { warn, env: io.env, limit: 5 });
   };
   try {
     switch (command) {
@@ -691,16 +694,6 @@ function trackerCommand(args: string[], ctx: TrackerCommandContext): number {
     return 0;
   }
   throw new UsageError("usage: tdo tracker [status|approve|revoke] [--yes]");
-}
-
-/** Foreign links need their own known user policy; approval hashes imply missing repository policy. */
-function statusPolicy(item: Item, current: string, status: Status, resolution: TrackerResolution, config: ReturnType<typeof loadConfig>): boolean {
-  if (item.project === current) return resolution.kind === "ok" ? resolution.tracker.closeOnDone : true;
-  if (status === "doing" || !item.links.some((link) => ["open", "closed"].includes(link.state))) return false;
-  const raw = config.projects?.[item.project]?.tracker;
-  const foreign = resolveTracker(projectFromKey(item.project), config);
-  if (raw && typeof raw === "object" && !("approved" in raw) && foreign.kind === "ok") return foreign.tracker.closeOnDone;
-  throw new Error(`${item.project}#${item.id}: tracker lifecycle policy is unknown; run from its project checkout or configure project tracker in your user config.`);
 }
 
 type PushContext = {

@@ -388,7 +388,7 @@ test("SSH stale detached snapshot cannot consume replacement issue queue", async
   drainLink(store, item, replacement, config, options);
   assert.deepEqual(sent, [["99", "new intent"]]);
   assert.equal(store.call("getLink", item, "github").queued, 0);
-  const invalid = JSON.parse(handleRpc(JSON.stringify({ version: 3, path: h.db, operation: "leaseLinkOps", args: [item, "github", "owner", { destination }] })));
+  const invalid = JSON.parse(handleRpc(JSON.stringify({ version: RPC_VERSION, path: h.db, operation: "leaseLinkOps", args: [item, "github", "owner", { destination }] })));
   assert.equal(invalid.ok, false, "RPC binding expectations must have every validated field");
 });
 
@@ -439,4 +439,23 @@ test("auto intent and awaiting SQL filter round-trip over fake SSH without track
     assert.equal(store.call("updateItem", agent, { title: "human edit" }, intent).links[0].state, "awaiting-approval");
     assert.equal(store.call("getItem", tagged).links[0].destination, intent.destination);
   } finally { store.close(); }
+});
+
+test("SSH auto-create refresh failure warns without failing local JSON success", (t) => {
+  const h = harness(t);
+  fs.writeFileSync(h.env.TDO_CONFIG, JSON.stringify({ projects: { "caller/project": { tracker: { provider: "github", repo: "example/widgets", mode: "auto-on-tag" } } } }));
+  fs.writeFileSync(path.join(h.dir, "bin", "gh"), `#!${process.execPath}
+console.log('https://github.com/example/widgets/issues/42');
+`, { mode: 0o755 });
+  h.env.SSH_FAIL_OP = "getItem";
+  h.env.TDO_SOURCE = "cli";
+  const out = [];
+  const warnings = [];
+  const code = run(["add", "auto #issue", "--json"], { out: (text) => out.push(text), err: (text) => warnings.push(text), cwd: h.dir, env: h.env, tty: true });
+  assert.equal(code, 0);
+  assert.equal(out.length, 1);
+  assert.equal(JSON.parse(out[0]).title, "auto");
+  assert.ok(warnings.some((text) => /injected store failure.*local change saved/.test(text)));
+  delete h.env.SSH_FAIL_OP;
+  assert.equal(h.cli("show", "1", "--json").json().links[0].state, "open");
 });
