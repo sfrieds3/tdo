@@ -11,6 +11,7 @@ import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import type * as Sqlite from "node:sqlite";
+import { migrateDb } from "./migrations/index.ts";
 
 type DatabaseSync = Sqlite.DatabaseSync;
 
@@ -100,93 +101,7 @@ export type ListFilter = {
   limit?: number;
 };
 
-const SCHEMA_VERSION = 2;
 const MAX_TITLE_CHARS = 200;
-
-/**
- * v2 schema. Projects have a UUID id; items are keyed by (project_id, id), where id is the per-project
- * number shown as `#3`. `next_item_id` keeps numbers from being reused after a delete.
- * Full-text search keeps its own copy of title and body, keyed by the same pair.
- */
-const SCHEMA_V2 = `
-CREATE TABLE projects (
-  id TEXT PRIMARY KEY,
-  key TEXT UNIQUE NOT NULL,
-  display_name TEXT,
-  next_item_id INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL
-);
-CREATE TABLE items (
-  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  id INTEGER NOT NULL CHECK (id > 0),
-  title TEXT NOT NULL,
-  body TEXT,
-  priority INTEGER NOT NULL DEFAULT 2 CHECK (priority BETWEEN 0 AND 3),
-  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','doing','done','dropped')),
-  file_ref TEXT,
-  source TEXT,
-  session_id TEXT,
-  host TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  closed_at TEXT,
-  PRIMARY KEY (project_id, id)
-) WITHOUT ROWID;
-CREATE TABLE tags (
-  project_id TEXT NOT NULL,
-  item_id INTEGER NOT NULL,
-  tag TEXT NOT NULL,
-  PRIMARY KEY (project_id, item_id, tag),
-  FOREIGN KEY (project_id, item_id) REFERENCES items(project_id, id) ON DELETE CASCADE
-) WITHOUT ROWID;
-CREATE INDEX items_project_status ON items(project_id, status, priority);
-CREATE INDEX tags_tag ON tags(tag);
-CREATE VIRTUAL TABLE items_fts USING fts5(project_id UNINDEXED, item_id UNINDEXED, title, body);
-CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN
-  INSERT INTO items_fts(project_id, item_id, title, body) VALUES (new.project_id, new.id, new.title, coalesce(new.body, ''));
-END;
-CREATE TRIGGER items_ad AFTER DELETE ON items BEGIN
-  DELETE FROM items_fts WHERE project_id = old.project_id AND item_id = old.id;
-END;
-CREATE TRIGGER items_au AFTER UPDATE OF title, body ON items BEGIN
-  UPDATE items_fts SET title = new.title, body = coalesce(new.body, '') WHERE project_id = old.project_id AND item_id = old.id;
-END;
-`;
-
-/** v1 had integer project ids and one global item id sequence; renumber items per project in creation order. */
-function migrateFromV1(db: DatabaseSync): void {
-  const projects = db.prepare("SELECT id, key, display_name, created_at FROM projects ORDER BY id").all() as { id: number; key: string; display_name: string | null; created_at: string }[];
-  const items = db.prepare("SELECT * FROM items ORDER BY project_id, id").all() as Record<string, string | number | null>[];
-  const tags = db.prepare("SELECT item_id, tag FROM tags").all() as { item_id: number; tag: string }[];
-  db.exec(`DROP TRIGGER IF EXISTS items_ai; DROP TRIGGER IF EXISTS items_ad; DROP TRIGGER IF EXISTS items_au;
-    DROP TABLE IF EXISTS items_fts; DROP TABLE tags; DROP TABLE items; DROP TABLE projects;`);
-  db.exec(SCHEMA_V2);
-  const projectIds = new Map<number, string>();
-  const insertProject = db.prepare("INSERT INTO projects (id, key, display_name, created_at) VALUES (?, ?, ?, ?)");
-  for (const project of projects) {
-    const id = randomUUID();
-    projectIds.set(Number(project.id), id);
-    insertProject.run(id, project.key, project.display_name, project.created_at);
-  }
-  const itemKeys = new Map<number, [string, number]>();
-  const nextIds = new Map<string, number>();
-  const insertItem = db.prepare(`INSERT INTO items (project_id, id, title, body, priority, status, file_ref, source, session_id, host, created_at, updated_at, closed_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-  for (const item of items) {
-    const projectId = projectIds.get(Number(item.project_id))!;
-    const id = nextIds.get(projectId) ?? 1;
-    nextIds.set(projectId, id + 1);
-    itemKeys.set(Number(item.id), [projectId, id]);
-    insertItem.run(projectId, id, item.title, item.body, item.priority, item.status, item.file_ref, item.source, item.session_id, item.host, item.created_at, item.updated_at, item.closed_at);
-  }
-  const insertTag = db.prepare("INSERT OR IGNORE INTO tags (project_id, item_id, tag) VALUES (?, ?, ?)");
-  for (const tag of tags) {
-    const key = itemKeys.get(Number(tag.item_id));
-    if (key) insertTag.run(key[0], key[1], tag.tag);
-  }
-  const setNext = db.prepare("UPDATE projects SET next_item_id = ? WHERE id = ?");
-  for (const [projectId, next] of nextIds) setNext.run(next, projectId);
-}
 
 // ---------------------------------------------------------------------------
 // Parsing helpers
@@ -437,11 +352,8 @@ export function getDbPath(env: NodeJS.ProcessEnv = process.env, options: { home?
   return config.db ?? path.join(getDataDir(env, home), "tdo.db");
 }
 
-export const SCHEMA = SCHEMA_VERSION;
-
-export function schemaVersion(db: DatabaseSync): number {
-  return Number((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
-}
+export { SCHEMA, schemaVersion, planMigration, backupDb, migrateDb } from "./migrations/index.ts";
+export type { IdChange, MigrationResult } from "./migrations/index.ts";
 
 export type OpenOptions = {
   /** Upgrade an older schema (default true). With false, the caller must run `migrateDb`. */
@@ -452,63 +364,15 @@ export function openDb(dbPath = getDbPath(), options: OpenOptions = {}): Databas
   if (/^[a-z][a-z0-9+.-]*:/i.test(dbPath) && dbPath !== ":memory:") throw new Error("openDb accepts local paths only; use the operation-level store for remote targets.");
   if (dbPath !== ":memory:") fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
-  db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;");
-  if (dbPath !== ":memory:") db.exec("PRAGMA journal_mode = WAL;");
-  if (options.migrate !== false) migrateDb(db, dbPath);
-  return db;
-}
-
-/** One row per item whose id changes in a v1 -> v2 upgrade. */
-export type IdChange = { project: string; from: number; to: number; title: string };
-
-/** Previews how a v1 database's global item ids map to per-project ids. Empty for other versions. */
-export function planMigration(db: DatabaseSync): IdChange[] {
-  if (schemaVersion(db) !== 1) return [];
-  const rows = db.prepare("SELECT i.id AS id, i.title AS title, p.key AS project FROM items i JOIN projects p ON p.id = i.project_id ORDER BY i.project_id, i.id").all() as { id: number; title: string; project: string }[];
-  const next = new Map<string, number>();
-  return rows.map((row) => {
-    const to = next.get(row.project) ?? 1;
-    next.set(row.project, to + 1);
-    return { project: row.project, from: Number(row.id), to, title: row.title };
-  });
-}
-
-/** Writes a consistent copy of the database next to it, e.g. `tdo.db.v1-backup-20261104T120000`. */
-export function backupDb(db: DatabaseSync, dbPath: string): string {
-  const stamp = now().replace(/[-:]/g, "").replace(/\..*$/, "");
-  const target = `${dbPath}.v${schemaVersion(db)}-backup-${stamp}`;
-  db.prepare("VACUUM INTO ?").run(target);
-  return target;
-}
-
-export type MigrationResult = { from: number; to: number; backup?: string; changes: IdChange[] };
-
-/**
- * Brings the schema up to date. A file database on an older schema is backed up first
- * (see `backupDb`), since the v2 upgrade renumbers items.
- */
-export function migrateDb(db: DatabaseSync, dbPath?: string): MigrationResult {
-  const version = schemaVersion(db);
-  if (version > SCHEMA_VERSION) throw new Error(`tdo database schema v${version} is newer than this tdo (v${SCHEMA_VERSION}).`);
-  if (version === SCHEMA_VERSION) return { from: version, to: version, changes: [] };
-  const changes = planMigration(db);
-  // VACUUM INTO can't run inside a transaction, so the backup is taken before the write lock.
-  // If another process finished the upgrade meanwhile, our backup is redundant and is removed.
-  let backup = version > 0 && dbPath && dbPath !== ":memory:" ? backupDb(db, dbPath) : undefined;
-  const migrated = transaction(db, () => {
-    // Another process may have upgraded it while we waited for the write lock.
-    const locked = schemaVersion(db);
-    if (locked === SCHEMA_VERSION) return false;
-    if (locked < 1) db.exec(SCHEMA_V2);
-    else if (locked < 2) migrateFromV1(db);
-    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-    return true;
-  });
-  if (!migrated && backup) {
-    fs.rmSync(backup, { force: true });
-    backup = undefined;
+  try {
+    db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;");
+    if (dbPath !== ":memory:") db.exec("PRAGMA journal_mode = WAL;");
+    if (options.migrate !== false) migrateDb(db, dbPath);
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
   }
-  return { from: version, to: SCHEMA_VERSION, backup, changes: migrated ? changes : [] };
 }
 
 function transaction<T>(db: DatabaseSync, fn: () => T): T {

@@ -189,6 +189,159 @@ test("v1 databases migrate to uuid projects and per-project ids, with a backup",
   db.close();
 });
 
+test("fresh and upgraded databases have identical schema objects", async (t) => {
+  const upgraded = tdo.openDb(await v1Db());
+  const fresh = tdo.openDb(":memory:");
+  t.after(() => { upgraded.close(); fresh.close(); });
+  const schema = (db) => db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name").all();
+  assert.deepEqual(schema(upgraded), schema(fresh));
+  assert.deepEqual(upgraded.prepare("PRAGMA foreign_key_check").all(), []);
+});
+
+test("backups made at the same instant have unique names and valid contents", async (t) => {
+  const dbPath = await v1Db();
+  const db = tdo.openDb(dbPath, { migrate: false });
+  t.after(() => db.close());
+  t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-01-01T00:00:00Z") });
+  const first = tdo.backupDb(db, dbPath);
+  const second = tdo.backupDb(db, dbPath);
+  assert.notEqual(first, second);
+  for (const name of [first, second]) {
+    const copy = tdo.openDb(name, { migrate: false });
+    assert.equal(tdo.schemaVersion(copy), 1);
+    assert.equal(copy.prepare("SELECT count(*) AS n FROM items").get().n, 3);
+    copy.close();
+  }
+});
+
+test("failed v1 conversion rolls back DDL, data and user_version and keeps one backup", async (t) => {
+  const dbPath = await v1Db();
+  const db = tdo.openDb(dbPath, { migrate: false });
+  t.after(() => db.close());
+  db.exec("UPDATE items SET priority = 99 WHERE id = 5");
+  const before = db.prepare("SELECT * FROM items ORDER BY id").all();
+  assert.throws(() => tdo.migrateDb(db, dbPath), /CHECK constraint/);
+  assert.equal(tdo.schemaVersion(db), 1);
+  assert.deepEqual(db.prepare("SELECT * FROM items ORDER BY id").all(), before);
+  const backups = fs.readdirSync(path.dirname(dbPath)).filter((name) => name.includes("-backup-"));
+  assert.equal(backups.length, 1);
+  const copy = tdo.openDb(path.join(path.dirname(dbPath), backups[0]), { migrate: false });
+  assert.deepEqual(copy.prepare("SELECT * FROM items ORDER BY id").all(), before);
+  copy.close();
+});
+
+test("future chains advance each step and roll the whole chain back on failure", async (t) => {
+  const { runMigrations } = await import("../src/migrations/index.ts");
+  const { SCHEMA_V2, migrateFromV1 } = await import("../src/migrations/v2.ts");
+  const fresh = tdo.openDb(":memory:", { migrate: false });
+  const upgradedPath = await v1Db();
+  const upgraded = tdo.openDb(upgradedPath, { migrate: false });
+  t.after(() => { fresh.close(); upgraded.close(); });
+  const calls = [];
+  const steps = [
+    { from: 0, to: 2, apply: (db) => { calls.push(tdo.schemaVersion(db)); db.exec(SCHEMA_V2); } },
+    { from: 1, to: 2, apply: migrateFromV1, preview: tdo.planMigration },
+    { from: 2, to: 3, apply: (db) => {
+      calls.push(tdo.schemaVersion(db));
+      db.exec("ALTER TABLE projects ADD COLUMN future TEXT");
+      throw new Error("future failure");
+    } },
+  ];
+  const before = upgraded.prepare("SELECT * FROM items ORDER BY id").all();
+  assert.throws(() => runMigrations(fresh, undefined, steps, 3), /future failure/);
+  assert.throws(() => runMigrations(upgraded, upgradedPath, steps, 3), /future failure/);
+  assert.equal(fs.readdirSync(path.dirname(upgradedPath)).filter((name) => name.includes("-backup-")).length, 1, "one backup for the whole failed chain");
+  assert.equal(tdo.schemaVersion(fresh), 0);
+  assert.deepEqual(fresh.prepare("SELECT name FROM sqlite_schema").all(), []);
+  assert.equal(tdo.schemaVersion(upgraded), 1);
+  assert.deepEqual(upgraded.prepare("SELECT * FROM items ORDER BY id").all(), before);
+  assert.deepEqual(calls, [0, 2, 2]);
+  steps[2].apply = (db) => {
+    assert.equal(tdo.schemaVersion(db), 2);
+    db.exec("ALTER TABLE projects ADD COLUMN future TEXT");
+  };
+  const preview = tdo.planMigration(upgraded);
+  runMigrations(fresh, undefined, steps, 3);
+  assert.deepEqual(runMigrations(upgraded, undefined, steps, 3).changes, preview);
+  assert.equal(tdo.schemaVersion(upgraded), 3);
+  assert.equal(tdo.schemaVersion(fresh), 3);
+  const schema = (db) => db.prepare("SELECT type, name, sql FROM sqlite_schema ORDER BY type, name").all();
+  assert.deepEqual(schema(fresh), schema(upgraded));
+  assert.equal(tdo.SCHEMA, 2, "test registry does not bump production schema");
+});
+
+test("missing registry steps roll back earlier steps", async (t) => {
+  const { runMigrations } = await import("../src/migrations/index.ts");
+  const db = tdo.openDb(":memory:", { migrate: false });
+  t.after(() => db.close());
+  assert.throws(() => runMigrations(db, undefined, [
+    { from: 0, to: 1, apply: (db) => db.exec("CREATE TABLE partial (id)") },
+  ], 3), /No migration from schema v1/);
+  assert.equal(tdo.schemaVersion(db), 0);
+  assert.deepEqual(db.prepare("SELECT name FROM sqlite_schema").all(), []);
+});
+
+// Inject a second connection's commit at the lock boundary, deterministically simulating a writer
+// that commits after the initial version/backup but before BEGIN IMMEDIATE acquires its lock.
+function beforeMigrationLock(db, fn) {
+  const exec = db.exec.bind(db);
+  db.exec = (sql) => {
+    if (sql === "BEGIN IMMEDIATE") {
+      db.exec = exec;
+      fn();
+    }
+    return exec(sql);
+  };
+}
+
+test("migration rechecks a newer schema under lock instead of downgrading it", async (t) => {
+  const dbPath = await v1Db();
+  const db = tdo.openDb(dbPath, { migrate: false });
+  const other = tdo.openDb(dbPath, { migrate: false });
+  t.after(() => { db.close(); other.close(); });
+  beforeMigrationLock(db, () => other.exec("PRAGMA user_version = 3"));
+  assert.throws(() => tdo.migrateDb(db, dbPath), /schema v3 is newer/);
+  assert.equal(tdo.schemaVersion(db), 3);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM items").get().n, 3);
+});
+
+test("migration cleans up its redundant backup when another writer finishes first", async (t) => {
+  const dbPath = await v1Db();
+  const db = tdo.openDb(dbPath, { migrate: false });
+  const other = tdo.openDb(dbPath, { migrate: false });
+  t.after(() => { db.close(); other.close(); });
+  beforeMigrationLock(db, () => tdo.migrateDb(other));
+  const result = tdo.migrateDb(db, dbPath);
+  assert.deepEqual(result, { from: 2, to: 2, backup: undefined, changes: [] });
+  assert.deepEqual(fs.readdirSync(path.dirname(dbPath)).filter((name) => name.includes("-backup-")), []);
+});
+
+test("migration computes id changes from data read under the write lock", async (t) => {
+  const dbPath = await v1Db();
+  const db = tdo.openDb(dbPath, { migrate: false });
+  const other = tdo.openDb(dbPath, { migrate: false });
+  t.after(() => { db.close(); other.close(); });
+  const preview = tdo.planMigration(db);
+  beforeMigrationLock(db, () => other.exec("INSERT INTO items (id, project_id, title, created_at, updated_at) VALUES (9, 1, 'concurrent', 'x', 'x')"));
+  const result = tdo.migrateDb(db, dbPath);
+  assert.equal(result.changes.length, preview.length + 1);
+  assert.deepEqual(result.changes.find((row) => row.from === 9), { project: "a", from: 9, to: 3, title: "concurrent" });
+  assert.equal(tdo.getItemByNumber(db, "a", 3).title, "concurrent");
+});
+
+test("newer databases are rejected without a backup and failed openDb closes its handle", async (t) => {
+  const dbPath = path.join(tempDir(), "newer.db");
+  const db = tdo.openDb(dbPath, { migrate: false });
+  db.exec("PRAGMA user_version = 3");
+  assert.throws(() => tdo.migrateDb(db, dbPath), /schema v3 is newer/);
+  db.close();
+  const { DatabaseSync } = await import("node:sqlite");
+  const close = t.mock.method(DatabaseSync.prototype, "close");
+  assert.throws(() => tdo.openDb(dbPath), /schema v3 is newer/);
+  assert.equal(close.mock.callCount(), 1);
+  assert.deepEqual(fs.readdirSync(path.dirname(dbPath)).filter((name) => name.includes("-backup-")), []);
+});
+
 test("openDb creates a file database and reopens it at the same schema", () => {
   const dbPath = path.join(tempDir(), "nested", "tdo.db");
   const db = tdo.openDb(dbPath);
