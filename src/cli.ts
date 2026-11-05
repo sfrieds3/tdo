@@ -360,7 +360,6 @@ export function run(argv: string[], io: Io): number {
   };
   const resolution = tracker();
   if (resolution.kind === "invalid" && !["push", "sync"].includes(command)) warn(`tdo: invalid tracker config: ${resolution.error}`);
-  const closeOnDone = resolution.kind === "ok" ? resolution.tracker.closeOnDone : true;
   const afterMutation = (items: Item[]) => {
     if (values["no-sync"] || resolution.kind !== "ok") return;
     if (!isApproved(resolution.tracker)) {
@@ -509,7 +508,10 @@ export function run(argv: string[], io: Io): number {
       case "done":
       case "drop":
       case "reopen": {
-        const items = targets().map((target) => db.call("setStatus", target, STATUS_COMMANDS[command], values.message, closeOnDone));
+        const selected = targets();
+        // Resolve every policy before the first write: a later foreign target may be unsafe.
+        const policies = selected.map((target) => statusPolicy(target, project().key, STATUS_COMMANDS[command], resolution, config));
+        const items = selected.map((target, i) => db.call("setStatus", target, STATUS_COMMANDS[command], values.message, policies[i]));
         emit(items.length === 1 ? items[0] : items, items.map((item) => `${item.status} ${formatItemLine(item)}`).join("\n"));
         afterMutation(items);
         return 0;
@@ -669,6 +671,16 @@ function trackerCommand(args: string[], ctx: TrackerCommandContext): number {
   throw new UsageError("usage: tdo tracker [status|approve|revoke] [--yes]");
 }
 
+/** Foreign links need their own known user policy; approval hashes imply missing repository policy. */
+function statusPolicy(item: Item, current: string, status: Status, resolution: TrackerResolution, config: ReturnType<typeof loadConfig>): boolean {
+  if (item.project === current) return resolution.kind === "ok" ? resolution.tracker.closeOnDone : true;
+  if (status === "doing" || !item.links.some((link) => ["open", "closed"].includes(link.state))) return false;
+  const raw = config.projects?.[item.project]?.tracker;
+  const foreign = resolveTracker(projectFromKey(item.project), config);
+  if (raw && typeof raw === "object" && !("approved" in raw) && foreign.kind === "ok") return foreign.tracker.closeOnDone;
+  throw new Error(`${item.project}#${item.id}: tracker lifecycle policy is unknown; run from its project checkout or configure project tracker in your user config.`);
+}
+
 type PushContext = {
   targets: () => Item[];
   find: (ref: string) => Item;
@@ -722,7 +734,11 @@ function pushCommand(db: Store, ctx: PushContext): number {
       continue;
     }
     // Re-read so the link reflects stale-claim expiry and concurrent pushes.
-    results.push(pushItem(db, db.call("findItem", `${item.project}#${item.id}`, ctx.projectKey), config, { force: values.force, noSync: values["no-sync"], env: ctx.io.env, warn: ctx.warn }));
+    try {
+      results.push(pushItem(db, db.call("findItem", `${item.project}#${item.id}`, ctx.projectKey), config, { force: values.force, noSync: values["no-sync"], env: ctx.io.env, warn: ctx.warn }));
+    } catch (error) {
+      results.push({ id: item.id, state: "skipped", error: `#${item.id}: ${(error as Error).message}`, ok: false });
+    }
   }
   ctx.emit(results, results.map((row) => (row.ok ? `#${row.id}: ${row.url}` : row.error ?? `#${row.id}: ${row.state}`)).join("\n"));
   return results.every((row) => row.ok) ? 0 : 1;

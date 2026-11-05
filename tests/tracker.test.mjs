@@ -300,7 +300,10 @@ test("pushItem warns with the URL when a finished create can't be recorded", (t)
   const config = { provider: "github", destination: KEY, labels: [], approval: "user-only", closeOnDone: true };
   const fakeTracker = () => ({ provider: "github", check: () => ({ ok: true }), parseIssueUrl: () => undefined, create: () => ({ ok: true, value: { id: "7", url: "https://github.com/example/widgets/issues/7" } }) });
   const failing = { call: (op, ...args) => { if (op === "finishLinkCreate") throw new Error("database is locked"); return store.call(op, ...args); }, close() {} };
-  assert.throws(() => pushItem(failing, item, config, { warn: (text) => warnings.push(text), tracker: fakeTracker }), /locked/);
+  const result = pushItem(failing, item, config, { warn: (text) => warnings.push(text), tracker: fakeTracker });
+  assert.equal(result.ok, false);
+  assert.equal(result.url, "https://github.com/example/widgets/issues/7");
+  assert.match(result.error, /locked/);
   assert.match(warnings[0], /filed https:\/\/github\.com\/example\/widgets\/issues\/7 but couldn't record it.*--attach/);
   assert.equal(store.call("getLink", item, "github").state, "creating", "left for stale detection");
   assert.deepEqual(renderIssue({ ...item, body: null, fileRef: null }, ["x"]), { title: "orphan", body: "", labels: ["x"] });
@@ -513,8 +516,55 @@ test("cross-project mutation never borrows the current checkout's approval to dr
   const item = store.call("findItem", "1", "github.com/example/other");
   store.call("attachLink", item, "github", "github.com/example/other", "7", "https://github.com/example/other/issues/7");
   store.close();
+  core.updateConfig((raw) => ({ ...raw, projects: { ...raw.projects, "github.com/example/other": { tracker: { provider: "github", closeOnDone: true } } } }), h.env);
   const before = h.calls().length;
   assert.equal(h.cli("done", "other#1", "--json").code, 0);
   assert.equal(h.calls().length, before);
   assert.equal(h.cli("show", "other#1", "--json").json().links[0].queued, 1);
+});
+
+
+test("foreign linked status uses its user policy, not the checkout policy", (t) => {
+  const h = harness(t, { tracker: { provider: "github", closeOnDone: true } });
+  h.cli("add", "local");
+  for (const [name, closeOnDone] of [["yes", true], ["no", false]]) {
+    const key = `github.com/example/${name}`;
+    h.cli("add", name, "--project", key);
+    const store = createStore(h.env.TDO_DB);
+    const item = store.call("findItem", "1", key);
+    store.call("attachLink", item, "github", key, "7", `https://${key}/issues/7`);
+    store.close();
+    core.updateConfig((raw) => ({ ...raw, projects: { ...raw.projects, [key]: { tracker: { provider: "github", closeOnDone } } } }), h.env);
+  }
+  assert.equal(h.cli("done", "yes#1", "no#1", "--no-sync").code, 0);
+  assert.equal(h.cli("show", "yes#1", "--json").json().links[0].queued, 1);
+  assert.equal(h.cli("show", "no#1", "--json").json().links[0].queued, 0);
+  // Reverse the checkout policy too: neither direction may override the foreign policy.
+  fs.writeFileSync(path.join(h.repo, ".tdo", "config.json"), JSON.stringify({ tracker: { provider: "github", closeOnDone: false } }));
+  assert.equal(h.cli("reopen", "yes#1", "no#1", "--no-sync").code, 0);
+  assert.equal(h.cli("show", "yes#1", "--json").json().links[0].queued, 2);
+  assert.equal(h.cli("show", "no#1", "--json").json().links[0].queued, 0);
+});
+
+test("unknown foreign linked lifecycle policy refuses the entire selection before writes", (t) => {
+  const h = harness(t);
+  h.cli("add", "local");
+  h.cli("add", "foreign", "--project", "github.com/example/other");
+  const store = createStore(h.env.TDO_DB);
+  const foreign = store.call("findItem", "1", "github.com/example/other");
+  store.call("attachLink", foreign, "github", foreign.project, "7", "url");
+  store.close();
+  for (const command of ["done", "drop", "reopen"]) {
+    const result = h.cli(command, "1", "other#1", "-m", "must not write", "--no-sync");
+    assert.equal(result.code, 1);
+    assert.match(result.error.message, /run from its project checkout or configure project tracker/);
+    assert.equal(h.cli("show", "1", "--json").json().status, "open");
+    assert.deepEqual(h.cli("show", "1", "--json").json().notes, []);
+    assert.deepEqual(h.cli("show", "other#1", "--json").json().notes, []);
+  }
+  assert.equal(h.cli("start", "other#1").code, 0, "start has no close/reopen intent");
+  h.cli("add", "unlinked", "--project", "github.com/example/plain");
+  assert.equal(h.cli("done", "plain#1").code, 0, "unlinked foreign items need no tracker policy");
+  core.updateConfig((raw) => ({ ...raw, projects: { ...raw.projects, [foreign.project]: { tracker: { provider: "github", approved: "repo-hash" } } } }), h.env);
+  assert.match(h.cli("done", "other#1").error.message, /policy is unknown/, "a repo approval cannot reconstruct missing repository policy");
 });

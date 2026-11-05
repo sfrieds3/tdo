@@ -34,7 +34,7 @@ export function drainLink(store: Store, item: Item, link: Link, config: Effectiv
   const owner = randomUUID();
   let leased = false;
   try {
-    leased = store.call("leaseLinkOps", item, link.provider, owner);
+    leased = store.call("leaseLinkOps", item, link.provider, owner, { destination: link.destination, externalId: link.externalId, url: link.url, createdAt: link.createdAt });
     if (!leased) return result;
     const tracker = (options.tracker ?? ((destination) => githubTracker({ destination, env: options.env })))(link.destination);
     while (result.attempted < (options.limit ?? Infinity)) {

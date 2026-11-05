@@ -269,3 +269,33 @@ test("an attention update is never erased by a newer update or silently reset by
   drainLink(store, item, link, config, { tracker: recording(calls), warn() {} });
   assert.deepEqual(calls, []);
 });
+
+
+test("stale detached binding cannot lease or consume replacement intent", (t) => {
+  const { store, item, link } = fixture(t);
+  store.call("detachLink", item, "github");
+  const replacement = store.call("attachLink", item, "github", PROJECT, "99", `https://${PROJECT}/issues/99`);
+  store.call("addNote", item, "for replacement only");
+  const calls = [];
+  drainLink(store, item, link, config, { tracker: recording(calls), warn() {} });
+  assert.deepEqual(calls, []);
+  assert.equal(store.call("getLink", item, "github").queued, 1);
+  drainLink(store, item, replacement, config, { tracker: recording(calls), warn() {} });
+  assert.deepEqual(calls, [["comment", "99", "for replacement only"]]);
+  assert.equal(store.call("getLink", item, "github").queued, 0);
+});
+
+test("successful create survives optional refresh transport failure with URL and warning", (t) => {
+  const store = createStore(":memory:");
+  t.after(() => store.close());
+  const item = store.call("addItem", { project: PROJECT, title: "refresh" });
+  const flaky = { call: (op, ...args) => {
+    if (op === "getLink") throw new Error("SSH refresh unavailable");
+    return store.call(op, ...args);
+  } };
+  const warnings = [];
+  const result = pushItem(flaky, item, config, { tracker: () => ({ create: () => ({ ok: true, value: { id: "42", url: "known-url" } }) }), warn: (s) => warnings.push(s) });
+  assert.deepEqual(result, { id: item.id, state: "open", url: "known-url", ok: true });
+  assert.match(warnings[0], /known-url.*refresh.*SSH refresh unavailable/);
+  assert.equal(store.call("getLink", item, "github").url, "known-url");
+});

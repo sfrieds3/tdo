@@ -66,7 +66,7 @@ export function pushItem(store: Store, item: Item, config: EffectiveTracker, opt
   } catch (error) {
     // The issue exists but we couldn't record it; leave a trail so --attach can recover it.
     if (result.ok) options.warn(`#${item.id}: filed ${result.value.url} but couldn't record it (${(error as Error).message}); run \`tdo push ${item.id} --attach ${result.value.url}\` later.`);
-    throw error;
+    return { id: item.id, state: "unknown", url: result.ok ? result.value.url : undefined, error: `#${item.id}: could not record tracker outcome: ${(error as Error).message}`, ok: false };
   }
   if (!link) {
     if (result.ok) options.warn(`#${item.id}: filed ${result.value.url}, but this attempt was superseded; close it or \`tdo push ${item.id} --attach ${result.value.url}\`.`);
@@ -74,7 +74,9 @@ export function pushItem(store: Store, item: Item, config: EffectiveTracker, opt
   }
   if (result.ok) {
     if (!options.noSync) drainLink(store, item, link, config, { ...options, limit: 5 });
-    return { id: item.id, state: store.call("getLink", item, provider)?.state ?? link.state, url: link.url ?? undefined, ok: true };
+    try { link = store.call("getLink", item, provider) ?? link; }
+    catch (error) { options.warn(`#${item.id}: filed ${result.value.url}, but could not refresh link state (${(error as Error).message}); showing the saved result.`); }
+    return { id: item.id, state: link.state, url: result.value.url, ok: true };
   }
   const hint = result.kind === "uncertain" ? ` (${RECOVER.replaceAll("ID", String(item.id))})` : "";
   return { id: item.id, state: link.state, error: `#${item.id}: ${result.message}${hint}`, ok: false };

@@ -129,7 +129,7 @@ const patch = object({ title: optional(string), body: optional(nullable(string))
 const filter = object({ project: optional(string), status: optional(oneOf(core.STATUS_FILTERS)), tags: optional(strings), minPriority: optional(priority), query: optional(string), limit: optional(integer), linked: optional(boolean) });
 const outcome: Validator = (v) => object({ ok: (x) => x === true, externalId: string, url: string, snapshot: optional(object({ title: string, body: nullable(string), fileRef: nullable(string) })) })(v) || object({ ok: (x) => x === false, kind: oneOf(["attention", "retryable", "uncertain"]), message: string })(v);
 const validators: Record<Operation, Validator[]> = {
-  leaseLinkOps: [key, string, string], nextLinkOp: [key, string, string], ackOp: [key, string, string, integer], failOp: [key, string, string, integer, boolean, string], releaseLinkOps: [key, string, string], retryLinkOps: [string],
+  leaseLinkOps: [key, string, string, optional(object({ destination: string, externalId: nullable(string), url: nullable(string), createdAt: string }))], nextLinkOp: [key, string, string], ackOp: [key, string, string, integer], failOp: [key, string, string, integer, boolean, string], releaseLinkOps: [key, string, string, optional(object({ destination: string, externalId: nullable(string), url: nullable(string), createdAt: string }))], retryLinkOps: [string],
   listLinkedItems: [string],
   addItem: [newItem], listItems: [optional(filter)], findItem: [string, string], getItem: [key], getItemByNumber: [string, integer],
   updateItem: [key, patch], setStatus: [key, oneOf(core.STATUSES), optional(nullable(string)), optional(boolean)], addNote: [key, string], deleteItem: [key], countActive: [string],

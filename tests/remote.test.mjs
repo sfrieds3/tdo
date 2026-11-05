@@ -31,6 +31,8 @@ if (process.env.SSH_MODE === 'version') { console.log(JSON.stringify({version:99
 if (process.env.SSH_MODE === 'shape') { console.log(JSON.stringify({version:3,ok:true,result:{}})); process.exit(0); }
 if (process.env.SSH_MODE === 'large') { process.stdout.write('x'.repeat(9*1024*1024)); return; }
 const input = fs.readFileSync(0);
+const request = JSON.parse(input);
+if (process.env.SSH_FAIL_OP === request.operation && (!process.env.SSH_FAIL_ID || String(request.args[0]?.id) === process.env.SSH_FAIL_ID)) { console.error('injected store failure'); process.exit(255); }
 const result = spawnSync(process.execPath, [process.env.TDO_HELPER, 'internal-rpc'], {input, encoding:'utf8', env:{...process.env,TDO_CONFIG:'/does-not-exist',TDO_DB:'/not-the-requested-db',TDO_PROJECT:'server-project',TDO_REMOTE_HELPER:'1'}});
 process.stdout.write(result.stdout || ''); process.stderr.write(result.stderr || ''); process.exit(result.status ?? 1);
 `, { mode: 0o755 });
@@ -363,4 +365,62 @@ process.exit(0);
   assert.deepEqual(calls.map((call) => call.args[1]), ["comment", "close"]);
   assert.ok(calls.every((call) => call.remote === null));
   assert.equal(h.cli("show", "1", "--json").json().links[0].state, "closed");
+});
+
+
+test("SSH stale detached snapshot cannot consume replacement issue queue", async (t) => {
+  const { drainLink } = await import("../src/trackers/drain.ts");
+  const h = harness(t);
+  const store = createStore(h.target, { env: h.env });
+  t.after(() => store.close());
+  const destination = "github.com/example/widgets";
+  const item = store.call("addItem", { project: "caller/project", title: "binding" });
+  const old = store.call("attachLink", item, "github", destination, "42", "old-url");
+  store.call("detachLink", item, "github");
+  const replacement = store.call("attachLink", item, "github", destination, "99", "new-url");
+  store.call("addNote", item, "new intent");
+  const sent = [];
+  const config = { provider: "github", approval: "user-only", closeOnDone: true };
+  const options = { warn() {}, tracker: () => ({ comment: (id, body) => { sent.push([id, body]); return { ok: true }; } }) };
+  drainLink(store, item, old, config, options);
+  assert.deepEqual(sent, []);
+  assert.equal(store.call("getLink", item, "github").queued, 1);
+  drainLink(store, item, replacement, config, options);
+  assert.deepEqual(sent, [["99", "new intent"]]);
+  assert.equal(store.call("getLink", item, "github").queued, 0);
+  const invalid = JSON.parse(handleRpc(JSON.stringify({ version: 3, path: h.db, operation: "leaseLinkOps", args: [item, "github", "owner", { destination }] })));
+  assert.equal(invalid.ok, false, "RPC binding expectations must have every validated field");
+});
+
+test("SSH multi-push keeps one JSON array and known URLs across store failures", (t) => {
+  const h = harness(t);
+  fs.writeFileSync(h.env.TDO_CONFIG, JSON.stringify({ projects: { "caller/project": { tracker: { provider: "github", repo: "example/widgets" } } } }));
+  fs.writeFileSync(path.join(h.dir, "bin", "gh"), `#!${process.execPath}
+console.log('https://github.com/example/widgets/issues/42');
+`, { mode: 0o755 });
+  for (const title of ["one", "two", "three", "four", "five"]) h.cli("add", title);
+  h.env.SSH_FAIL_OP = "getLink";
+  const warnings = [];
+  const out = [];
+  assert.equal(run(["push", "1", "2", "--json", "--no-sync"], { out: (s) => out.push(s), err: (s) => warnings.push(s), cwd: h.dir, env: h.env }), 0);
+  assert.equal(out.length, 1);
+  assert.deepEqual(JSON.parse(out[0]).map((row) => [row.id, row.ok, row.url]), [[1, true, "https://github.com/example/widgets/issues/42"], [2, true, "https://github.com/example/widgets/issues/42"]]);
+  assert.equal(warnings.length, 2);
+  h.env.SSH_FAIL_OP = "finishLinkCreate";
+  h.env.SSH_FAIL_ID = "3";
+  out.length = 0;
+  assert.equal(run(["push", "3", "1", "--json", "--no-sync"], { out: (s) => out.push(s), err: (s) => warnings.push(s), cwd: h.dir, env: h.env }), 1);
+  const rows = JSON.parse(out[0]);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].ok, false);
+  assert.equal(rows[0].url, "https://github.com/example/widgets/issues/42");
+  assert.equal(rows[1].ok, true);
+  h.env.SSH_FAIL_OP = "claimLinkCreate";
+  h.env.SSH_FAIL_ID = "4";
+  out.length = 0;
+  assert.equal(run(["push", "4", "5", "--json", "--no-sync"], { out: (s) => out.push(s), err: (s) => warnings.push(s), cwd: h.dir, env: h.env }), 1);
+  const continued = JSON.parse(out[0]);
+  assert.equal(continued[0].ok, false);
+  assert.match(continued[0].error, /injected store failure/);
+  assert.equal(continued[1].ok, true, "unexpected per-item store failures do not abort later items");
 });

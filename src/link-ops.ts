@@ -1,6 +1,6 @@
 /** Durable lifecycle intent. Enqueue helpers run inside the caller's item transaction; network IO never does. */
 import type { DatabaseSync } from "node:sqlite";
-import type { ItemKey } from "./core.ts";
+import type { ItemKey, Link } from "./core.ts";
 import { transaction } from "./transaction.ts";
 
 export type LinkOp = { seq: number; op: "update" | "close" | "reopen" | "comment"; reason: string | null; noteSeq: number | null; status: "queued" | "attention"; attempts: number; lastError: string | null };
@@ -28,10 +28,10 @@ export function enqueueLinked(db: DatabaseSync, key: ItemKey, op: LinkOp["op"], 
   for (const link of links) enqueueOp(db, key, link.provider, op, reason, noteSeq);
 }
 
-export function leaseLinkOps(db: DatabaseSync, key: ItemKey, provider: string, owner: string): boolean {
+export function leaseLinkOps(db: DatabaseSync, key: ItemKey, provider: string, owner: string, expected?: Pick<Link, "destination" | "externalId" | "url" | "createdAt">): boolean {
   const now = new Date().toISOString();
-  return !!db.prepare(`UPDATE links SET drain_owner = ?, drain_until = ? WHERE ${WHERE} AND state IN ('open','closed') AND (drain_owner IS NULL OR drain_until < ?)`)
-    .run(owner, new Date(Date.now() + LEASE_MS).toISOString(), ...args(key, provider), now).changes;
+  return !!db.prepare(`UPDATE links SET drain_owner = ?, drain_until = ? WHERE ${WHERE} AND state IN ('open','closed') AND (drain_owner IS NULL OR drain_until < ?)${expected ? " AND destination = ? AND external_id IS ? AND url IS ? AND created_at = ?" : ""}`)
+    .run(owner, new Date(Date.now() + LEASE_MS).toISOString(), ...args(key, provider), now, ...(expected ? [expected.destination, expected.externalId, expected.url, expected.createdAt] : [])).changes;
 }
 
 /** Renew before every operation, then fetch only the ordered head. Expired/stolen owners cannot renew. */
