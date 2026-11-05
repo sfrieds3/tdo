@@ -115,6 +115,14 @@ Plain `tdo` opens fzf over the backlog with a preview of the highlighted item. T
 
 `tdo browse -a -s all` starts with every project and closed items showing. `TDO_FZF_OPTS` adds fzf flags (e.g. `--height=100%`) on top of `FZF_DEFAULT_OPTS`.
 
+#### Floating browser (tmux and Rex)
+
+Set `"floating": true` in the [config file](#configuration) to open the CLI browser in an 80%-sized tmux popup or [Rex](https://www.superlogical.com/rex) floating pane. This is **off by default**. It applies to plain `tdo` in an interactive terminal and explicit `tdo browse`, not list output, id pickers, or the Pi `/tdo` picker. Inside tmux (including tmux running inside Rex), tdo uses `tmux display-popup`; otherwise, with `REX_SESSION` and `REX_BLOCK`, it uses Rex's floating-layer API in the caller's window. Outside either environment, the browser stays inline.
+
+Requires tmux with `display-popup` and multi-argument command support (tmux 3.3+), or a Rex CLI/server with `session.new_layer` and the terminal shell block flavor. The browser runs on the same host with the caller's working directory, database, project, filters, and browser/editor/SSH settings. Rex launches asynchronously and closes the pane when the browser exits; quick startup failures remain visible for diagnosis. tmux waits for the popup to close. Launcher failures are reported rather than silently falling back (a Rex launch may already have succeeded if the response times out).
+
+Use `tdo --no-float` or `tdo browse --no-float` for an inline browser without changing your config.
+
 ### All projects
 
 `tdo ls -a` groups items under a bold project header, most urgent first, and shows the projects with the most urgent work at the top:
@@ -242,6 +250,7 @@ Everything works without a config file. To change defaults, create `$XDG_CONFIG_
 {
   "db": "~/.local/share/tdo/tdo.db",
   "perProject": 10,
+  "floating": true,
   "aliases": {
     "github.com/me/widgets": "github.com/example/widgets"
   }
@@ -252,6 +261,7 @@ Everything works without a config file. To change defaults, create `$XDG_CONFIG_
 |---|---|
 | `db` | Local database path (`~` expands) or SSH URI. `TDO_DB` and `--db` win over it. |
 | `perProject` | Items per project in `tdo ls -a` (default 5; 0 shows all). |
+| `floating` | Open the CLI browser in a tmux popup or Rex floating pane when available (default `false`). `--no-float` overrides it. |
 | `aliases` | Maps a resolved project key to the key to use instead — e.g. your fork to its upstream, so both share one backlog. |
 
 Environment variables: `TDO_DB`, `TDO_CONFIG`, `TDO_PROJECT` (force a project key), `TDO_SOURCE` (default `--source`), `TDO_FZF_OPTS` (extra fzf flags), `NO_COLOR` / `FORCE_COLOR`.

@@ -7,6 +7,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
+import { fileURLToPath } from "node:url";
+import { floatingBackend, launchFloatingBrowser } from "./floating.ts";
 import { createStore, parseTarget, saveDbTarget, serveRpc } from "./store.ts";
 import {
   PRIORITIES,
@@ -73,12 +75,13 @@ options:
   --project KEY   use this project instead of resolving from the cwd
   -C DIR          resolve the project from DIR
   --json          machine-readable output (all commands)
+  --no-float      keep the browser inline even with config floating: true
   -a, --all       across all projects
 
 priorities: ${PRIORITIES.join(", ")} (prefixes and 0-3 accepted)
 statuses:   ${STATUS_FILTERS.join(", ")} (ls default: active = open + doing)
 files:      database $XDG_DATA_HOME/tdo/tdo.db (default ~/.local/share/tdo/tdo.db)
-            config   $XDG_CONFIG_HOME/tdo/config.json (optional; keys: db, aliases, perProject)
+            config   $XDG_CONFIG_HOME/tdo/config.json (optional; keys: db, aliases, perProject, floating)
 env:        TDO_DB, TDO_CONFIG, TDO_PROJECT, TDO_SOURCE (who is adding: cli, claude, codex, ...),
             TDO_FZF_OPTS (extra fzf flags), NO_COLOR / FORCE_COLOR`;
 
@@ -87,6 +90,7 @@ const OPTIONS = {
   project: { type: "string" },
   C: { type: "string", short: "C" },
   json: { type: "boolean" },
+  "no-float": { type: "boolean" },
   all: { type: "boolean", short: "a" },
   priority: { type: "string", short: "p" },
   tags: { type: "string", short: "t", multiple: true },
@@ -124,6 +128,8 @@ export type Io = {
   interactive?: boolean;
   /** Runs fzf for the browser; injectable for tests. Returns fzf's exit status. */
   runFzf?: (args: string[], env: NodeJS.ProcessEnv) => number;
+  /** Launches the browser in a separate terminal; injectable for tests. */
+  runFloat?: typeof launchFloatingBrowser;
 } & Interactive;
 
 const PICK_COMMANDS = new Set(["show", "edit", "start", "done", "drop", "reopen", "rm", "pick"]);
@@ -252,7 +258,17 @@ export function run(argv: string[], io: Io): number {
     return 0;
   }
 
-  if (command === "browse") return browse(io, { all: !!values.all, status: values.status ? parseStatusFilter(values.status) : "active", project: values.project, cwd: values.C ? cwd : undefined, db: dbPath });
+  if (command === "browse") {
+    const status = values.status ? parseStatusFilter(values.status) : "active";
+    const backend = config.floating && !values["no-float"] && !json ? floatingBackend(io.env) : undefined;
+    if (backend) {
+      const child = [process.execPath, ...process.execArgv, fileURLToPath(import.meta.url), "browse", "--no-float",
+        "--db", savedTarget(dbPath, io.cwd), "--project", project().key, "-C", cwd, "-s", status,
+        ...(values.all ? ["-a"] : [])];
+      return (io.runFloat ?? launchFloatingBrowser)({ backend, command: child, cwd: io.cwd, env: io.env });
+    }
+    return browse(io, { all: !!values.all, status, project: values.project, cwd: values.C ? cwd : undefined, db: dbPath });
+  }
 
   if (command === "db") return dbCommand(args, dbPath, io, json);
   const db = createStore(dbPath, { env: io.env });
@@ -506,10 +522,10 @@ function browseHeader(state: BrowseState, current: string): string {
   return [`tdo · ${scope} · ${shown} · tab marks several · esc quit`, keys.slice(0, 6).join(" · "), keys.slice(6, 9).join(" · "), keys.slice(9).join(" · ")].join("\n");
 }
 
-export function browseArgs(tdo: string, stateFile: string, header: string): string[] {
+export function browseArgs(tdo: string, stateFile: string, header: string, floating = false): string[] {
   const expand = (action: string) => action.replaceAll("$T", tdo).replaceAll("$S", shellQuote(stateFile));
   return [
-    "--ansi", "--multi", "--delimiter=\t", "--with-nth=2..", "--no-sort", "--layout=reverse", "--height=90%",
+    "--ansi", "--multi", "--delimiter=\t", "--with-nth=2..", "--no-sort", "--layout=reverse", floating ? "--height=100%" : "--height=90%",
     "--prompt=tdo> ", `--header=${header}`, "--header-first",
     `--preview=${tdo} show {1}`, "--preview-window=right,50%,wrap",
     `--bind=start:reload(${expand("$T _fzf feed $S")})`,
@@ -531,7 +547,7 @@ function browse(io: Io, options: { all: boolean; status: StatusFilter; project?:
     const current = options.project ?? resolveProject(options.cwd ?? io.cwd, { env: io.env }).key;
     const env: NodeJS.ProcessEnv = { ...io.env, FORCE_COLOR: "1", FZF_DEFAULT_OPTS: [io.env.FZF_DEFAULT_OPTS, io.env.TDO_FZF_OPTS].filter(Boolean).join(" ") };
     delete env.NO_COLOR;
-    const status = runFzf(browseArgs(tdo, stateFile, browseHeader(state, current)), env);
+    const status = runFzf(browseArgs(tdo, stateFile, browseHeader(state, current), io.env.TDO_FLOATING_BROWSER === "1"), env);
     // 1 = no match, 130 = esc: both are a normal exit from the browser.
     return status === 1 || status === 130 ? 0 : status;
   } finally {
