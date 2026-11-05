@@ -28,6 +28,7 @@
     "tdo": "./src/cli.ts"
   },
   "files": [
+    "assets",
     "src",
     "extensions",
     "skills",

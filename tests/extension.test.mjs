@@ -94,7 +94,7 @@ test("footer count refreshes on session start and after agent runs", async () =>
   h.addDirect({ title: "Handle empty config", priority: "high" });
   h.addDirect({ title: "Tidy logging", priority: "low" });
   await h.emit("agent_end");
-  assert.equal(h.statuses.get("tdo"), "tdo 2 (1!)");
+  assert.equal(h.statuses.get("tdo"), "☑ 2 (1!)");
 });
 
 test("/tdo quick-adds with inline priority and tags", async () => {
@@ -107,7 +107,7 @@ test("/tdo quick-adds with inline priority and tags", async () => {
   assert.equal(item.source, "user");
   assert.equal(item.sessionId, "session-1");
   assert.match(h.notifications.at(-1).message, /^tdo: added #1/);
-  assert.equal(h.statuses.get("tdo"), "tdo 1 (1!)");
+  assert.equal(h.statuses.get("tdo"), "☑ 1 (1!)");
   // Old status verbs are gone from the command; they are just titles now.
   await h.command.handler("done later", h.ctx);
   assert.equal(h.byTitle("done later")?.status, "open");
@@ -127,18 +127,18 @@ test("/tdo picker: enter works on an item and shows it in the footer until it cl
   assert.match(h.sent[0].text, /Let's work on tdo item #1/);
   assert.match(h.sent[0].text, /tdo done 1 -m/);
   assert.doesNotMatch(h.sent[0].text, /worktree/);
-  assert.equal(h.statuses.get("tdo"), "tdo 2 (1!) ▸ #1 rename helpers");
+  assert.equal(h.statuses.get("tdo"), "☑ 2 (1!) ▸ #1 rename helpers");
 
   // A reload restores the focus from the session branch.
   await h.emit("session_start");
-  assert.equal(h.statuses.get("tdo"), "tdo 2 (1!) ▸ #1 rename helpers");
+  assert.equal(h.statuses.get("tdo"), "☑ 2 (1!) ▸ #1 rename helpers");
 
   // The agent closes it through the CLI; the footer drops the focus after the run.
   const db = core.openDb(process.env.TDO_DB);
   core.setStatus(db, h.byTitle("rename helpers"), "done");
   db.close();
   await h.emit("agent_end");
-  assert.equal(h.statuses.get("tdo"), "tdo 1 (1!)");
+  assert.equal(h.statuses.get("tdo"), "☑ 1 (1!)");
   assert.deepEqual(h.entries.at(-1), { type: "custom", customType: "tdo-focus", data: null });
 });
 
@@ -221,12 +221,12 @@ test("SSH extension quick-add, footer, and work instructions await writes withou
   delete process.env.TDO_TEST_DELAY;
   assert.equal(h.byTitle("remote fix").priority, "high");
   assert.deepEqual(h.byTitle("remote fix").tags, ["ci"]);
-  assert.equal(h.statuses.get("tdo"), "tdo 1 (1!)");
+  assert.equal(h.statuses.get("tdo"), "☑ 1 (1!)");
   assert.match(h.notifications.at(-1).message, /added #1/);
   await h.command.handler("", h.ctx);
   assert.equal(h.byTitle("remote fix").status, "doing");
   assert.match(h.sent[0].text, /marked as doing/);
-  assert.equal(h.statuses.get("tdo"), "tdo 1 (1!) ▸ #1 remote fix");
+  assert.equal(h.statuses.get("tdo"), "☑ 1 (1!) ▸ #1 remote fix");
 });
 
 test("SSH picker edits, changes priority, closes and deletes through internal-rpc", async (t) => {
@@ -244,7 +244,7 @@ test("SSH picker edits, changes priority, closes and deletes through internal-rp
   assert.equal(edited.priority, "urgent");
   assert.equal(h.byTitle("close me").status, "done");
   assert.equal(h.byTitle("delete me"), undefined);
-  assert.equal(h.statuses.get("tdo"), "tdo 1 (1!)");
+  assert.equal(h.statuses.get("tdo"), "☑ 1 (1!)");
 });
 
 test("SSH failures preserve saved focus and recover; only a successful absent lookup clears it", async (t) => {
@@ -254,7 +254,7 @@ test("SSH failures preserve saved focus and recover; only a successful absent lo
   const entryCount = h.entries.length;
   process.env.TDO_TEST_FAIL = "1";
   await h.emit("agent_end");
-  assert.equal(h.statuses.get("tdo"), "tdo unavailable");
+  assert.equal(h.statuses.get("tdo"), "☑ unavailable");
   assert.equal(h.entries.length, entryCount);
   assert.equal(h.notifications.length, 0, "background refresh errors stay quiet");
   await h.command.handler("not saved", h.ctx);
@@ -264,7 +264,7 @@ test("SSH failures preserve saved focus and recover; only a successful absent lo
   assert.equal(h.entries.length, entryCount);
   process.env.TDO_TEST_FAIL = "getItem";
   await h.emit("agent_end");
-  assert.equal(h.statuses.get("tdo"), "tdo unavailable", "failed focus lookup is not an absent item");
+  assert.equal(h.statuses.get("tdo"), "☑ unavailable", "failed focus lookup is not an absent item");
   assert.equal(h.entries.length, entryCount);
   delete process.env.TDO_TEST_FAIL;
   await h.emit("agent_end");
@@ -314,9 +314,9 @@ test("older SSH refreshes cannot overwrite newer results or repopulate status af
   delete process.env.TDO_TEST_DELAY;
   h.addDirect({ title: "two" });
   await h.emit("agent_end");
-  assert.equal(h.statuses.get("tdo"), "tdo 2");
+  assert.equal(h.statuses.get("tdo"), "☑ 2");
   await old;
-  assert.equal(h.statuses.get("tdo"), "tdo 2");
+  assert.equal(h.statuses.get("tdo"), "☑ 2");
   process.env.TDO_TEST_DELAY = "150";
   const shutdownPending = h.emit("agent_end");
   await h.waitForResponse();

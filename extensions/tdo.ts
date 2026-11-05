@@ -29,6 +29,8 @@ import {
 import { createAsyncStore, type Operation, type StoreOperations } from "../src/store.ts";
 
 const STATUS_KEY = "tdo";
+/** Text counterpart of assets/tdo.svg (U+2611); no Nerd Font or image protocol needed. */
+const TDO_ICON = "☑";
 const FOCUS_ENTRY = "tdo-focus";
 const FOCUS_TITLE_CHARS = 40;
 /** Added to the hand-off when config `worktree` is true; the agent picks the names. */
@@ -138,14 +140,14 @@ export default function tdoExtension(pi: ExtensionAPI) {
       if (key && focused?.status !== "doing" && focused?.status !== "open") setFocus(undefined);
       const parts: string[] = [];
       const urgent = counts.urgent + counts.high;
-      if (counts.total) parts.push(ctx.ui.theme.fg("muted", `tdo ${counts.total}${urgent ? ` (${urgent}!)` : ""}`));
+      if (counts.total) parts.push(ctx.ui.theme.fg("muted", `${TDO_ICON} ${counts.total}${urgent ? ` (${urgent}!)` : ""}`));
       if (focus && focused) {
         const ref = itemRef(focused, { showProject: focused.project !== projectKey });
         parts.push(ctx.ui.theme.fg("accent", `▸ ${ref} ${truncate(focused.title, FOCUS_TITLE_CHARS)}`));
       }
       ctx.ui.setStatus(STATUS_KEY, parts.length ? parts.join(" ") : undefined);
     } catch {
-      if (current === generation && !stopped) ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("muted", "tdo unavailable"));
+      if (current === generation && !stopped) ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("muted", `${TDO_ICON} unavailable`));
     }
   }
 
