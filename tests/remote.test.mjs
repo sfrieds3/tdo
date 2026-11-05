@@ -390,6 +390,9 @@ test("SSH stale detached snapshot cannot consume replacement issue queue", async
   assert.equal(store.call("getLink", item, "github").queued, 0);
   const invalid = JSON.parse(handleRpc(JSON.stringify({ version: RPC_VERSION, path: h.db, operation: "leaseLinkOps", args: [item, "github", "owner", { destination }] })));
   assert.equal(invalid.ok, false, "RPC binding expectations must have every validated field");
+  assert.match(invalid.error, /invalid arguments/, "the current protocol must reach binding validation");
+  const oldClient = JSON.parse(handleRpc(JSON.stringify({ version: RPC_VERSION - 1, path: h.db, operation: "leaseLinkOps", args: [item, "github", "owner"] })));
+  assert.match(oldClient.error, /incompatible RPC protocol/, "old clients cannot bypass expected binding validation");
 });
 
 test("SSH multi-push keeps one JSON array and known URLs across store failures", (t) => {

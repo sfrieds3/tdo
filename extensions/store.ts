@@ -9,4 +9,3 @@ export async function callStore<K extends Operation>(operation: K, ...args: Stor
     store.close();
   }
 }
-
