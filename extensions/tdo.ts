@@ -34,7 +34,7 @@ const TDO_ICON = "☑";
 const FOCUS_ENTRY = "tdo-focus";
 const FOCUS_TITLE_CHARS = 40;
 /** Added to the hand-off when config `worktree` is true; the agent picks the names. */
-export const WORKTREE_INSTRUCTION = "Do the work in a new git worktree on a new branch (create it with `git worktree add -b <branch> <path>`, choosing a short descriptive branch name and a sibling directory of the repo), not in the current checkout.";
+export const WORKTREE_INSTRUCTION = "Do the work in a new git worktree on a new branch (create it with `git worktree add -b <branch> <main-checkout>/.worktrees/<name>`, choosing a short descriptive branch and directory name; never put it next to the repo), not in the current checkout.";
 const ALL_ARGS = new Set(["all", "--all", "-a"]);
 const HELP = [
   "/tdo — pick an item in this project (--all or all: every project)",
