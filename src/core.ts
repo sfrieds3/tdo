@@ -661,8 +661,10 @@ export function setStatus(db: DatabaseSync, key: ItemKey, status: Status, note?:
       status, closed ? (item.closedAt && item.status === status ? item.closedAt : timestamp) : null, timestamp, item.projectId, item.id,
     );
     if (trimmedNote) enqueueLinked(db, key, "comment", null, insertNote(db, item, status, trimmedNote, timestamp));
-    if (closeOnDone && closed) enqueueLinked(db, key, "close", status === "done" ? "completed" : "not planned");
-    if (closeOnDone && status === "open") enqueueLinked(db, key, "reopen");
+    // Sync the transition, not the target: done -> doing reopens, doing -> open does nothing.
+    const wasClosed = item.status === "done" || item.status === "dropped";
+    if (closeOnDone && closed && item.status !== status) enqueueLinked(db, key, "close", status === "done" ? "completed" : "not planned");
+    if (closeOnDone && wasClosed && !closed) enqueueLinked(db, key, "reopen");
   });
   return requireItem(db, key);
 }

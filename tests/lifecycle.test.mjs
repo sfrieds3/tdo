@@ -112,6 +112,23 @@ test("offline close then reopen preserves comments and finishes open", (t) => {
   assert.equal(store.call("getLink", item, "github").queued, 0);
 });
 
+test("lifecycle ops follow status transitions, not target statuses", (t) => {
+  const db = core.openDb(":memory:");
+  t.after(() => db.close());
+  const item = core.addItem(db, { project: PROJECT, title: "transitions" });
+  core.attachLink(db, item, "github", PROJECT, "42", "url");
+  core.setStatus(db, item, "doing");
+  core.setStatus(db, item, "open");
+  assert.deepEqual(ops(db), [], "active -> active never touches the issue");
+  core.setStatus(db, item, "done");
+  core.setStatus(db, item, "done");
+  core.setStatus(db, item, "doing");
+  assert.deepEqual(ops(db).map((op) => op.op), ["close", "reopen"], "done -> doing reopens; repeating done does not re-close");
+  core.setStatus(db, item, "dropped");
+  core.setStatus(db, item, "done");
+  assert.deepEqual(ops(db).map((op) => op.op), ["close", "reopen", "close", "close"], "dropped -> done updates the close reason");
+});
+
 test("five retries become attention, block later ops, and require an explicit current-project reset", (t) => {
   const { store, item, link } = fixture(t);
   store.call("addNote", item, "retry this comment");

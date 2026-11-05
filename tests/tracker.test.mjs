@@ -115,6 +115,18 @@ test("force claims are a superset of create claims; attach matches destinations 
   db.close();
 });
 
+test("only syncing commands resolve the tracker; invalid config warns instead of failing", (t) => {
+  const h = harness(t);
+  const warnings = () => h.errors.filter((e) => /invalid tracker config/.test(e)).length;
+  assert.equal(h.cli("add", "still works").code, 0);
+  fs.writeFileSync(path.join(h.repo, ".tdo", "config.json"), JSON.stringify({ tracker: { labels: [] } }));
+  assert.equal(h.cli("ls").code, 0);
+  assert.equal(h.cli("show", "1").code, 0);
+  assert.equal(warnings(), 0, "ls/show never resolve the tracker");
+  assert.equal(h.cli("done", "1").code, 0);
+  assert.equal(warnings(), 1, "a syncing mutation warns once and still succeeds");
+});
+
 test("approval hash ignores spelling and unknown keys but pins the destination", (t) => {
   const h = harness(t);
   const base = approvalHash({ provider: "github" }, project(h.repo));

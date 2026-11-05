@@ -358,10 +358,18 @@ export function run(argv: string[], io: Io): number {
     if (picked.length > 1) throw new UsageError(`tdo ${command} takes one item.`);
     return picked[0]!;
   };
-  const resolution = tracker();
-  if (resolution.kind === "invalid" && !["push", "sync"].includes(command)) warn(`tdo: invalid tracker config: ${resolution.error}`);
+  // Resolved lazily, inside the command's error handling, and only by commands that need it.
+  let cached: TrackerResolution | undefined;
+  const resolved = (): TrackerResolution => {
+    if (cached) return cached;
+    cached = tracker();
+    if (cached.kind === "invalid" && !["push", "sync"].includes(command)) warn(`tdo: invalid tracker config: ${cached.error}`);
+    return cached;
+  };
   const afterMutation = (items: Item[]) => {
-    if (values["no-sync"] || resolution.kind !== "ok") return;
+    if (values["no-sync"]) return;
+    const resolution = resolved();
+    if (resolution.kind !== "ok") return;
     if (!isApproved(resolution.tracker)) {
       if (items.some((item) => item.links.length)) warn(`tdo: tracker ${resolution.tracker.approval}; operations remain queued; run tdo tracker approve.`);
       return;
@@ -510,7 +518,7 @@ export function run(argv: string[], io: Io): number {
       case "reopen": {
         const selected = targets();
         // Resolve every policy before the first write: a later foreign target may be unsafe.
-        const policies = selected.map((target) => statusPolicy(target, project().key, STATUS_COMMANDS[command], resolution, config));
+        const policies = selected.map((target) => statusPolicy(target, project().key, STATUS_COMMANDS[command], resolved(), config));
         const items = selected.map((target, i) => db.call("setStatus", target, STATUS_COMMANDS[command], values.message, policies[i]));
         emit(items.length === 1 ? items[0] : items, items.map((item) => `${item.status} ${formatItemLine(item)}`).join("\n"));
         afterMutation(items);
@@ -529,6 +537,7 @@ export function run(argv: string[], io: Io): number {
       }
       case "sync": {
         if (args.length || all) throw new UsageError("usage: tdo sync [--retry] (current project only)");
+        const resolution = resolved();
         if (resolution.kind !== "ok") throw new Error(resolution.kind === "invalid" ? resolution.error : "no tracker configured");
         if (!isApproved(resolution.tracker)) throw new Error("tracker is not approved; run tdo tracker approve");
         if (values["no-sync"]) throw new UsageError("sync cannot be combined with --no-sync");
