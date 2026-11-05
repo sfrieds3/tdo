@@ -142,7 +142,7 @@ else if (args === 'remote get-url origin') console.log('https://${PROJECT}.git')
     await Promise.all([status, add, browse]);
   }
   assert.equal(h.byTitle("await project").project, PROJECT);
-  assert.equal(h.statuses.get("tdo"), "tdo 1 (1!)");
+  assert.equal(h.statuses.get("tdo"), "☑ 1 (1!)");
   assert.match(h.notifications.find((entry) => entry.message.includes("added"))?.message, /added #1/);
   await h.emit("agent_end");
   assert.equal(fs.readFileSync(calls, "utf8").trim().split("\n").length, 3, "successful resolution stays cached");
