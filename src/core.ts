@@ -488,16 +488,23 @@ export function migrateDb(db: DatabaseSync, dbPath?: string): MigrationResult {
   if (version > SCHEMA_VERSION) throw new Error(`tdo database schema v${version} is newer than this tdo (v${SCHEMA_VERSION}).`);
   if (version === SCHEMA_VERSION) return { from: version, to: version, changes: [] };
   const changes = planMigration(db);
-  const backup = version > 0 && dbPath && dbPath !== ":memory:" ? backupDb(db, dbPath) : undefined;
-  transaction(db, () => {
+  // VACUUM INTO can't run inside a transaction, so the backup is taken before the write lock.
+  // If another process finished the upgrade meanwhile, our backup is redundant and is removed.
+  let backup = version > 0 && dbPath && dbPath !== ":memory:" ? backupDb(db, dbPath) : undefined;
+  const migrated = transaction(db, () => {
     // Another process may have upgraded it while we waited for the write lock.
     const locked = schemaVersion(db);
-    if (locked === SCHEMA_VERSION) return;
+    if (locked === SCHEMA_VERSION) return false;
     if (locked < 1) db.exec(SCHEMA_V2);
     else if (locked < 2) migrateFromV1(db);
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    return true;
   });
-  return { from: version, to: SCHEMA_VERSION, backup, changes };
+  if (!migrated && backup) {
+    fs.rmSync(backup, { force: true });
+    backup = undefined;
+  }
+  return { from: version, to: SCHEMA_VERSION, backup, changes: migrated ? changes : [] };
 }
 
 function transaction<T>(db: DatabaseSync, fn: () => T): T {
@@ -636,8 +643,9 @@ export function addItem(db: DatabaseSync, input: NewItem): Item {
 }
 
 export function updateItem(db: DatabaseSync, key: ItemKey, patch: ItemPatch): Item {
-  const { projectId, id } = requireItem(db, key);
   transaction(db, () => {
+    // Read under the write lock so a concurrent delete can't slip in between.
+    const { projectId, id } = requireItem(db, key);
     const sets: string[] = [];
     const values: (string | number | null)[] = [];
     if (patch.title !== undefined) { sets.push("title = ?"); values.push(cleanTitle(patch.title)); }
@@ -658,21 +666,26 @@ export function updateItem(db: DatabaseSync, key: ItemKey, patch: ItemPatch): It
 /** Moves an item to a new status; `note` is appended to the body with the date and new status. */
 export function setStatus(db: DatabaseSync, key: ItemKey, status: Status, note?: string): Item {
   if (!(STATUSES as readonly string[]).includes(status)) throw new Error(`status must be one of: ${STATUSES.join(", ")}.`);
-  const item = requireItem(db, key);
-  const timestamp = now();
-  const closed = status === "done" || status === "dropped";
   const trimmedNote = note?.trim();
-  const body = trimmedNote ? [item.body, `[${status} ${timestamp.slice(0, 10)}] ${trimmedNote}`].filter(Boolean).join("\n\n") : item.body;
-  db.prepare("UPDATE items SET status = ?, body = ?, closed_at = ?, updated_at = ? WHERE project_id = ? AND id = ?").run(
-    status, body, closed ? (item.closedAt && item.status === status ? item.closedAt : timestamp) : null, timestamp, item.projectId, item.id,
-  );
+  const closed = status === "done" || status === "dropped";
+  // BEGIN IMMEDIATE takes the write lock before the read, so concurrent notes can't overwrite each other.
+  transaction(db, () => {
+    const item = requireItem(db, key);
+    const timestamp = now();
+    const body = trimmedNote ? [item.body, `[${status} ${timestamp.slice(0, 10)}] ${trimmedNote}`].filter(Boolean).join("\n\n") : item.body;
+    db.prepare("UPDATE items SET status = ?, body = ?, closed_at = ?, updated_at = ? WHERE project_id = ? AND id = ?").run(
+      status, body, closed ? (item.closedAt && item.status === status ? item.closedAt : timestamp) : null, timestamp, item.projectId, item.id,
+    );
+  });
   return requireItem(db, key);
 }
 
 export function deleteItem(db: DatabaseSync, key: ItemKey): Item {
-  const item = requireItem(db, key);
-  db.prepare("DELETE FROM items WHERE project_id = ? AND id = ?").run(item.projectId, item.id);
-  return item;
+  return transaction(db, () => {
+    const item = requireItem(db, key);
+    db.prepare("DELETE FROM items WHERE project_id = ? AND id = ?").run(item.projectId, item.id);
+    return item;
+  });
 }
 
 /** Turns free text into a safe FTS5 prefix query: every word must match. */

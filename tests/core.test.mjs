@@ -199,6 +199,54 @@ test("openDb creates a file database and reopens it at the same schema", () => {
   reopened.close();
 });
 
+test("status notes from two handles on one file both survive", () => {
+  const dbPath = path.join(tempDir(), "tdo.db");
+  const a = tdo.openDb(dbPath);
+  const b = tdo.openDb(dbPath);
+  const item = tdo.addItem(a, { project: "local:~/code/widgets", title: "Shared" });
+  tdo.setStatus(a, item, "done", "note A");
+  tdo.setStatus(b, item, "done", "note B");
+  const body = tdo.getItem(a, item).body;
+  assert.match(body, /\[done \S+\] note A/);
+  assert.match(body, /\[done \S+\] note B/);
+  a.close();
+  b.close();
+});
+
+test("writes take the write lock before reading the item", () => {
+  const dbPath = path.join(tempDir(), "tdo.db");
+  const db = tdo.openDb(dbPath);
+  const holder = tdo.openDb(dbPath);
+  const item = tdo.addItem(db, { project: "local:~/code/widgets", title: "Locked" });
+
+  const statements = [];
+  const exec = db.exec.bind(db);
+  db.exec = (sql) => { statements.push(sql); return exec(sql); };
+  tdo.setStatus(db, item, "doing", "started");
+  tdo.updateItem(db, item, { title: "Locked still" });
+  assert.deepEqual(statements, ["BEGIN IMMEDIATE", "COMMIT", "BEGIN IMMEDIATE", "COMMIT"]);
+  delete db.exec;
+
+  db.exec("PRAGMA busy_timeout = 0");
+  holder.exec("BEGIN IMMEDIATE");
+  assert.throws(() => tdo.setStatus(db, item, "done", "blocked"), /locked|busy/i);
+  assert.throws(() => tdo.updateItem(db, item, { title: "blocked" }), /locked|busy/i);
+  assert.throws(() => tdo.deleteItem(db, item), /locked|busy/i);
+  holder.exec("ROLLBACK");
+  const after = tdo.getItem(db, item);
+  assert.equal(after.status, "doing");
+  assert.equal(after.title, "Locked still");
+  assert.doesNotMatch(after.body, /blocked/);
+
+  const removed = tdo.deleteItem(db, item);
+  assert.equal(removed.title, "Locked still");
+  assert.equal(tdo.getItem(db, item), undefined);
+  assert.throws(() => tdo.updateItem(db, item, { title: "gone" }), /No tdo item/);
+  assert.throws(() => tdo.deleteItem(db, item), /No tdo item/);
+  db.close();
+  holder.close();
+});
+
 test("formatters render lines, detail, and markdown", () => {
   const db = tdo.openDb(":memory:");
   const item = tdo.addItem(db, { project: "github.com/example/widgets", title: "Fix it", priority: "high", tags: ["ci"], fileRef: "a.ts:1", body: "why" });
