@@ -295,7 +295,13 @@ export default function tdoExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("tdo", {
     description: "Per-project backlog: /tdo to pick an item (--all for every project), /tdo <title> [!high] [#tag] to add",
-    getArgumentCompletions: (prefix) => ["--all", "help"].filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value })),
+    // No suggestions for an empty prefix: pi-tui's Enter accepts the highlighted completion before
+    // submitting, so offering `--all` there would turn `/tdo ` + Enter into `/tdo --all`.
+    getArgumentCompletions: (prefix) => {
+      if (!prefix.trim()) return null;
+      const matches = ["--all", "help"].filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value }));
+      return matches.length > 0 ? matches : null;
+    },
     handler: async (args, ctx) => {
       const trimmed = args.trim();
       try {

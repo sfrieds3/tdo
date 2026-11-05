@@ -77,6 +77,15 @@ test("registers no model-facing tool; agents use the CLI through the skill", () 
   assert.deepEqual(harness().tools, []);
 });
 
+test("argument completions stay empty for a bare `/tdo ` so Enter opens the project picker", () => {
+  const { command } = harness();
+  assert.equal(command.getArgumentCompletions(""), null);
+  assert.equal(command.getArgumentCompletions("  "), null);
+  assert.deepEqual(command.getArgumentCompletions("--").map((item) => item.value), ["--all"]);
+  assert.deepEqual(command.getArgumentCompletions("he").map((item) => item.value), ["help"]);
+  assert.equal(command.getArgumentCompletions("fix"), null);
+});
+
 test("footer count refreshes on session start and after agent runs", async () => {
   const h = harness();
   await h.emit("session_start");
