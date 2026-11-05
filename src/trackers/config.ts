@@ -116,7 +116,9 @@ function userEntry(config: Config, project: Project, where: string): UserEntry {
   if (raw === false) return { disabled: true };
   const approved = (raw as { approved?: unknown })?.approved;
   if (approved !== undefined && typeof approved !== "string") throw new Error(`${where}: tracker.approved must be a string.`);
-  return { override: parseOverride(raw, where), approved: approved as string | undefined, disabled: false };
+  const override = parseOverride(raw, where);
+  // An approval-only entry (from `tdo tracker approve`) is not an override.
+  return { override: Object.keys(override).length ? override : undefined, approved: approved as string | undefined, disabled: false };
 }
 
 /** Merges repo and user tracker config for a project. Never throws; problems come back as `invalid`. */
@@ -142,7 +144,7 @@ export function resolveTracker(project: Project, config: Config, options: { conf
         tag: merged.tag ?? DEFAULTS.tag,
         labels: merged.labels ?? DEFAULTS.labels,
         closeOnDone: merged.closeOnDone ?? DEFAULTS.closeOnDone,
-        origin: repo && user.override && Object.keys(user.override).length ? "both" : repo ? "repo" : "user",
+        origin: repo && user.override ? "both" : repo ? "repo" : "user",
         approval,
         hash,
         sources,

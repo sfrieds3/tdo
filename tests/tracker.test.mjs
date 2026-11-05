@@ -91,6 +91,29 @@ test("tracker config: destinations, validation, merge, and defaults", (t) => {
   assert.match(resolveTracker(project(h.repo), { aliases: {} }).error, /provider is required/);
 });
 
+test("an approval-only user entry is not an override once the repo tracker is removed", (t) => {
+  const h = harness(t);
+  const config = { aliases: {}, projects: { [KEY]: { tracker: { approved: approvalHash({ provider: "github" }, project(h.repo)) } } } };
+  const resolved = resolveTracker(project(h.repo), config);
+  assert.equal(resolved.tracker.approval, "approved");
+  assert.equal(resolved.tracker.origin, "repo");
+  fs.rmSync(path.join(h.repo, ".tdo", "config.json"));
+  assert.equal(resolveTracker(project(h.repo), config).kind, "none");
+});
+
+test("force claims are a superset of create claims; attach matches destinations case-insensitively", () => {
+  const db = core.openDb(":memory:");
+  const item = core.addItem(db, { project: KEY, title: "forced retry" });
+  const claim = core.claimLinkCreate(db, item, "github", KEY, "create");
+  core.finishLinkCreate(db, item, "github", claim.token, { ok: false, kind: "attention", message: "no auth" });
+  assert.ok(core.claimLinkCreate(db, item, "github", KEY, "force").token, "force can retry an error link");
+  db.prepare("UPDATE links SET claimed_at = '2000-01-01T00:00:00.000Z'").run();
+  const attached = core.attachLink(db, item, "github", KEY.toUpperCase().replace("GITHUB.COM", "github.com"), "7", "u7");
+  assert.equal(attached.destination, KEY);
+  assert.throws(() => core.attachLink(db, item, "github", "github.com/example/other", "8", "u8"), /is bound to/);
+  db.close();
+});
+
 test("approval hash ignores spelling and unknown keys but pins the destination", (t) => {
   const h = harness(t);
   const base = approvalHash({ provider: "github" }, project(h.repo));
@@ -347,8 +370,9 @@ test("v3: fresh and v2-upgraded databases match, and a failing v2 -> v3 conversi
   assert.equal(db.prepare("SELECT body FROM items").get().body, "[done 2026-01-01] n");
 });
 
-test("v2 databases migrate to v3, moving trailing status notes out of bodies", async () => {
+test("v2 databases migrate to v3, moving trailing status notes out of bodies", async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tdo-v2-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const dbPath = path.join(dir, "tdo.db");
   const { DatabaseSync } = await import("node:sqlite");
   const raw = new DatabaseSync(dbPath);

@@ -697,7 +697,8 @@ export type ClaimMode = "create" | "force";
 export type Claim = { token?: string; link: Link };
 
 /** States a plain create may claim from; `force` also takes over unknown and stale attempts. */
-const CLAIMABLE: Record<ClaimMode, readonly LinkState[]> = { create: ["awaiting-approval", "pending", "error"], force: ["unknown", "creating"] };
+const CREATABLE: readonly LinkState[] = ["awaiting-approval", "pending", "error"];
+const CLAIMABLE: Record<ClaimMode, readonly LinkState[]> = { create: CREATABLE, force: [...CREATABLE, "unknown", "creating"] };
 
 /**
  * Atomically claims the right to create an issue for an item. Returns a token only to the one
@@ -763,7 +764,7 @@ export function attachLink(db: DatabaseSync, key: ItemKey, provider: string, des
         .run(key.projectId, key.id, provider, destination, externalId, url, timestamp, timestamp);
       return getLink(db, key, provider)!;
     }
-    if (existing.destination !== destination) throw new Error(`#${key.id} is bound to ${existing.destination}; the URL points at ${destination}.`);
+    if (existing.destination.toLowerCase() !== destination.toLowerCase()) throw new Error(`#${key.id} is bound to ${existing.destination}; the URL points at ${destination}.`);
     if (!ATTACHABLE.includes(existing.state) && !isStaleClaim(existing)) throw new Error(`#${key.id} is ${existing.state}${existing.url ? ` (${existing.url})` : ""}; nothing to attach.`);
     db.prepare("UPDATE links SET state = 'open', external_id = ?, url = ?, error = NULL, error_kind = NULL, attempt = NULL, synced_at = ? WHERE project_id = ? AND item_id = ? AND provider = ?")
       .run(externalId, url, timestamp, key.projectId, key.id, provider);
