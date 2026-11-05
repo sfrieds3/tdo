@@ -171,7 +171,7 @@ In the picker:
 
 | Key | Action |
 |---|---|
-| `enter` | **Work on it**: marks it `doing` and hands it to the agent. |
+| `enter` | **Work on it**: marks it `doing` and hands it to the agent. With `"worktree": true` in the [config file](#configuration), the agent is asked to do the work in a new git worktree and branch it names itself. |
 | `e` | Edit in the editor: the first line is the title, the rest is the body. |
 | `p` | Change priority. |
 | `x` | Mark done. |
@@ -251,6 +251,7 @@ Everything works without a config file. To change defaults, create `$XDG_CONFIG_
   "db": "~/.local/share/tdo/tdo.db",
   "perProject": 10,
   "floating": true,
+  "worktree": true,
   "aliases": {
     "github.com/me/widgets": "github.com/example/widgets"
   }
@@ -262,6 +263,7 @@ Everything works without a config file. To change defaults, create `$XDG_CONFIG_
 | `db` | Local database path (`~` expands) or SSH URI. `TDO_DB` and `--db` win over it. |
 | `perProject` | Items per project in `tdo ls -a` (default 5; 0 shows all). |
 | `floating` | Open the CLI browser in a tmux popup or Rex floating pane when available (default `false`). `--no-float` overrides it. |
+| `worktree` | Pi `/tdo` "work on it" asks the agent to work in a new git worktree and branch, which it names (default `false`). |
 | `aliases` | Maps a resolved project key to the key to use instead — e.g. your fork to its upstream, so both share one backlog. |
 
 Environment variables: `TDO_DB`, `TDO_CONFIG`, `TDO_PROJECT` (force a project key), `TDO_SOURCE` (default `--source`), `TDO_FZF_OPTS` (extra fzf flags), `NO_COLOR` / `FORCE_COLOR`.
