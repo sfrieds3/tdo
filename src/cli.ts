@@ -49,7 +49,8 @@ usage:
   tdo ls [-a] [-s STATUS] [-t TAGS] [-p PRIO] [-q TEXT] [-n N]
                             -a groups by project, N items each (default ${DEFAULT_PER_PROJECT}; 0 = all)
   tdo show [id]             ids are per project: 3 or #3 here, NAME#3 or KEY#3 elsewhere
-  tdo edit [id] [--title T] [-p PRIO] [-t +tag,-tag] [-b BODY] [-f REF]
+  tdo edit [id] [--title T] [-p PRIO] [-t +tag,~tag] [-b BODY] [-f REF]
+                            ~tag removes a tag (quote a leading ~: -t '~tag')
                             no flags: edit title and body in $EDITOR
   tdo start|done|drop|reopen [id...] [-m NOTE]
   tdo rm [id]
@@ -190,13 +191,16 @@ function requireRef(value: string | undefined): string {
   return value!.trim();
 }
 
-/** Splits `-t +a,-b,c` style edits into tags to add and remove. */
+/**
+ * Splits `-t +a,~b,c` style edits into tags to add and remove. `~` or `-` removes; `+` or no prefix adds.
+ * A leading `=` (from `-t=~b`, which short options don't support) is dropped.
+ */
 function tagEdits(values: string[] | undefined): { add: string[]; remove: string[] } {
   const add: string[] = [];
   const remove: string[] = [];
-  for (const part of (values ?? []).flatMap((value) => value.split(","))) {
+  for (const part of (values ?? []).flatMap((value) => value.replace(/^=/, "").split(","))) {
     const text = part.trim();
-    if (text.startsWith("-")) remove.push(text.slice(1));
+    if (/^[~-]/.test(text)) remove.push(text.slice(1));
     else if (text) add.push(text.replace(/^\+/, ""));
   }
   return { add, remove };

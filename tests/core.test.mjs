@@ -61,6 +61,8 @@ test("priority, tag, and quick-add parsing", () => {
   assert.equal(tdo.parsePriority("bogus"), undefined);
   assert.throws(() => tdo.requirePriority("bogus"), /priority must be one of/);
   assert.deepEqual(tdo.normalizeTags(["#CI", "perf, ui", " ", "ci"]), ["ci", "perf", "ui"]);
+  assert.equal(tdo.normalizeTag("=foo"), "foo");
+  assert.equal(tdo.normalizeTag("="), undefined);
   assert.deepEqual(tdo.parseQuickAdd("fix flaky test !high #ci #Tests"), { title: "fix flaky test", priority: "high", tags: ["ci", "tests"] });
   assert.deepEqual(tdo.parseQuickAdd("handle issue #42 !wow"), { title: "handle issue #42 !wow", priority: undefined, tags: [] });
 });

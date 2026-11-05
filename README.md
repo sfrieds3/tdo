@@ -77,7 +77,7 @@ Use `@v0.2.3` to pin an exact release, or a local path (`"~/code/tdo"`) while ha
 | `tdo` | In a terminal with [fzf](https://github.com/junegunn/fzf): [browse and act on items](#browser). Otherwise the same as `tdo ls`. |
 | `tdo ls [-a] [-s STATUS] [-t TAGS] [-p PRIO] [-q TEXT] [-n N]` | List items. Defaults to active (`open` + `doing`) in this project. `-a` [groups by project](#all-projects). |
 | `tdo show [id]` | Full details, including the body. |
-| `tdo edit [id] [--title T] [-p PRIO] [-t +add,-remove] [-b BODY] [-f REF]` | Change an item. With no flags, opens the title and body in `$VISUAL` / `$EDITOR`. |
+| `tdo edit [id] [--title T] [-p PRIO] [-t +add,~remove] [-b BODY] [-f REF]` | Change an item. `~tag` removes a tag (quote it when it comes first: `-t '~old'`; `--tags=-old` also works). With no flags, opens the title and body in `$VISUAL` / `$EDITOR`. |
 | `tdo start` / `done` / `drop` / `reopen [id…] [-m NOTE]` | Change status; the note is appended to the body. |
 | `tdo rm [id]` | Delete an item outright. |
 | `tdo pick [-a] [-s STATUS]` | Pick items with fzf and print their refs, for scripting: `tdo done $(tdo pick)`. |

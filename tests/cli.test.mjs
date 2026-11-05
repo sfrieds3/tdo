@@ -49,6 +49,18 @@ test("add, list, edit, close, and export round-trip", () => {
   assert.equal(tdo("add", "from an agent", "--source", "claude", "--json").json().source, "claude");
 });
 
+test("edit removes tags with ~tag and handles -t=… without creating '=' tags", () => {
+  const tdo = harness();
+  tdo("add", "tagged", "-t", "foo,bar");
+  assert.deepEqual(tdo("edit", "1", "-t", "~foo", "--json").json().tags, ["bar"]);
+  assert.deepEqual(tdo("edit", "1", "-t", "+foo,~bar", "--json").json().tags, ["foo"]);
+  assert.deepEqual(tdo("edit", "1", "--tags=-foo", "--json").json().tags, []);
+  tdo("edit", "1", "-t", "foo");
+  assert.deepEqual(tdo("edit", "1", "-t=-foo", "--json").json().tags, []);
+  assert.deepEqual(tdo("edit", "1", "-t=baz", "--json").json().tags, ["baz"]);
+  assert.deepEqual(tdo("add", "eq", "-t=qux", "--json").json().tags, ["qux"]);
+});
+
 test("ids are per project; other projects are reached by name or key", () => {
   const tdo = harness();
   tdo("add", "here one");
