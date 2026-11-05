@@ -2,12 +2,14 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import { SCHEMA_V2, migrateFromV1 } from "./v2.ts";
+import { migrateToV3, planNoteExtraction as countBodyNotes } from "./v3.ts";
 
-export const SCHEMA = 2;
+export const SCHEMA = 3;
 
 /** One row per item in a v1 -> v2 id mapping (including unchanged numbers). */
 export type IdChange = { project: string; from: number; to: number; title: string };
-export type MigrationResult = { from: number; to: number; backup?: string; changes: IdChange[] };
+/** `notesMoved`: status notes the v2 -> v3 step moves (or would move) out of item bodies; omitted when that step doesn't run. */
+export type MigrationResult = { from: number; to: number; backup?: string; changes: IdChange[]; notesMoved?: number };
 
 export function schemaVersion(db: DatabaseSync): number {
   return Number((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
@@ -25,6 +27,12 @@ export function planMigration(db: DatabaseSync): IdChange[] {
   });
 }
 
+/** How many status notes an upgrade would move out of item bodies; 0 unless the database is v1 or v2. */
+export function planNoteExtraction(db: DatabaseSync): number {
+  const version = schemaVersion(db);
+  return version === 1 || version === 2 ? countBodyNotes(db) : 0;
+}
+
 /** Writes a consistent sibling copy, with a UUID suffix to avoid collisions between attempts. */
 export function backupDb(db: DatabaseSync, dbPath: string): string {
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*$/, "");
@@ -39,11 +47,14 @@ export type MigrationStep = {
   to: number;
   apply: (db: DatabaseSync) => void;
   preview?: (db: DatabaseSync) => IdChange[];
+  /** Counts status notes the step moves; read before `apply` runs. */
+  notes?: (db: DatabaseSync) => number;
 };
 
 const migrations: readonly MigrationStep[] = [
   { from: 0, to: 2, apply: (db) => db.exec(SCHEMA_V2) },
   { from: 1, to: 2, apply: migrateFromV1, preview: planMigration },
+  { from: 2, to: 3, apply: migrateToV3, notes: countBodyNotes },
 ];
 
 function rejectNewer(version: number, target: number): void {
@@ -60,6 +71,7 @@ export function runMigrations(db: DatabaseSync, dbPath: string | undefined, step
   db.exec("BEGIN IMMEDIATE");
   let from: number;
   const changes: IdChange[] = [];
+  let notesMoved: number | undefined;
   try {
     from = schemaVersion(db);
     rejectNewer(from, target);
@@ -68,6 +80,8 @@ export function runMigrations(db: DatabaseSync, dbPath: string | undefined, step
       const step = steps.find((candidate) => candidate.from === current);
       if (!step || !Number.isInteger(step.to) || step.to <= current || step.to > target) throw new Error(`No migration from schema v${current} to v${target}.`);
       changes.push(...(step.preview?.(db) ?? []));
+      // A fresh database has no notes to move; only report the count for real upgrades.
+      if (step.notes && from > 0) notesMoved = (notesMoved ?? 0) + step.notes(db);
       step.apply(db);
       db.exec(`PRAGMA user_version = ${step.to}`);
       current = step.to;
@@ -82,7 +96,7 @@ export function runMigrations(db: DatabaseSync, dbPath: string | undefined, step
     fs.rmSync(backup, { force: true });
     backup = undefined;
   }
-  return { from, to: target, backup, changes };
+  return { from, to: target, backup, changes, ...(notesMoved !== undefined ? { notesMoved } : {}) };
 }
 
 /** Upgrade atomically, backing up an existing file database once before taking the write lock. */

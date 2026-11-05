@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { isIP } from "node:net";
 import * as core from "./core.ts";
 
-export const RPC_VERSION = 1;
+export const RPC_VERSION = 2;
 export const MAX_RPC_BYTES = 8 * 1024 * 1024;
 export const SSH_TIMEOUT_MS = 20_000;
 
@@ -18,7 +18,15 @@ const operations = {
   getItemByNumber: core.getItemByNumber,
   updateItem: core.updateItem,
   setStatus: core.setStatus,
+  addNote: core.addNote,
   deleteItem: core.deleteItem,
+  getLink: core.getLink,
+  claimLinkCreate: core.claimLinkCreate,
+  finishLinkCreate: core.finishLinkCreate,
+  expireStaleClaims: core.expireStaleClaims,
+  attachLink: core.attachLink,
+  detachLink: core.detachLink,
+  countLinks: core.countLinks,
   countActive: core.countActive,
   listTags: core.listTags,
   listProjects: core.listProjects,
@@ -62,18 +70,7 @@ export function parseTarget(value: string): Target {
 /** Atomic replacement preserves aliases and forward-compatible config keys. */
 export function saveDbTarget(target: string, env: NodeJS.ProcessEnv = process.env): void {
   parseTarget(target);
-  core.loadConfig(env); // Validate existing config before touching it.
-  const file = core.getConfigPath(env);
-  let config: Record<string, unknown> = {};
-  if (fs.existsSync(file)) config = JSON.parse(fs.readFileSync(file, "utf8"));
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const temporary = `${file}.${randomUUID()}.tmp`;
-  try {
-    fs.writeFileSync(temporary, JSON.stringify({ ...config, db: target }, null, 2) + "\n", { mode: 0o600, flag: "wx" });
-    fs.renameSync(temporary, file);
-  } finally {
-    if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
-  }
+  core.updateConfig((config) => ({ ...config, db: target }), env);
 }
 
 function localCall<K extends Operation>(dbPath: string, explicitMigration: boolean, operation: K, args: StoreOperations[K]["args"], sharedDb?: ReturnType<typeof core.openDb>): StoreOperations[K]["result"] {
@@ -82,7 +79,7 @@ function localCall<K extends Operation>(dbPath: string, explicitMigration: boole
     const version = core.schemaVersion(db);
     if (version > core.SCHEMA) throw new Error(`tdo database schema v${version} is newer than this tdo (v${core.SCHEMA}).`);
     if (operation === "migrate") {
-      if (args[0]) return { from: version, to: core.SCHEMA, changes: core.planMigration(db), dryRun: true } as StoreOperations[K]["result"];
+      if (args[0]) return { from: version, to: core.SCHEMA, changes: core.planMigration(db), notesMoved: core.planNoteExtraction(db), dryRun: true } as StoreOperations[K]["result"];
       return core.migrateDb(db, dbPath) as StoreOperations[K]["result"];
     }
     if (version > 0 && version < core.SCHEMA && explicitMigration) throw new Error(`remote database schema v${version} requires explicit migration; run tdo migrate.`);
@@ -119,12 +116,15 @@ function object(fields: Record<string, Validator>): Validator {
 const project = object({ key: string, name: string, root: optional(string) });
 const key: Validator = (v) => !!v && typeof v === "object" && !Array.isArray(v) && string((v as core.ItemKey).projectId) && integer((v as core.ItemKey).id);
 const priority = oneOf(core.PRIORITIES);
-const newItem = object({ project: (v) => string(v) || project(v), title: string, body: optional(string), priority: optional(priority), tags: optional(strings), fileRef: optional(string), source: optional(string), sessionId: optional(string), host: optional(string) });
+const newItem = object({ project: (v) => string(v) || project(v), title: string, body: optional(string), priority: optional(priority), tags: optional(strings), fileRef: optional(string), source: optional(string), sessionId: optional(string), host: optional(string), createdByHuman: optional(boolean) });
 const patch = object({ title: optional(string), body: optional(nullable(string)), priority: optional(priority), addTags: optional(strings), removeTags: optional(strings), fileRef: optional(nullable(string)) });
-const filter = object({ project: optional(string), status: optional(oneOf(core.STATUS_FILTERS)), tags: optional(strings), minPriority: optional(priority), query: optional(string), limit: optional(integer) });
+const filter = object({ project: optional(string), status: optional(oneOf(core.STATUS_FILTERS)), tags: optional(strings), minPriority: optional(priority), query: optional(string), limit: optional(integer), linked: optional(boolean) });
+const outcome: Validator = (v) => object({ ok: (x) => x === true, externalId: string, url: string })(v) || object({ ok: (x) => x === false, kind: oneOf(["attention", "retryable", "uncertain"]), message: string })(v);
 const validators: Record<Operation, Validator[]> = {
   addItem: [newItem], listItems: [optional(filter)], findItem: [string, string], getItem: [key], getItemByNumber: [string, integer],
-  updateItem: [key, patch], setStatus: [key, oneOf(core.STATUSES), optional(string)], deleteItem: [key], countActive: [string],
+  updateItem: [key, patch], setStatus: [key, oneOf(core.STATUSES), optional(string)], addNote: [key, string], deleteItem: [key], countActive: [string],
+  getLink: [key, string], claimLinkCreate: [key, string, string, oneOf(["create", "force"])], finishLinkCreate: [key, string, string, outcome],
+  expireStaleClaims: [string], attachLink: [key, string, string, string, string], detachLink: [key, string], countLinks: [string],
   listTags: [optional(string)], listProjects: [], check: [], migrate: [optional(boolean)],
 };
 function validateCall(operation: unknown, args: unknown): asserts operation is Operation {
@@ -154,14 +154,19 @@ export function handleRpc(input: string): string {
 
 const number: Validator = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
 const array = (test: Validator): Validator => (v) => Array.isArray(v) && v.every(test);
-const item = object({ id: integer, projectId: string, project: string, title: string, body: nullable(string), priority, status: oneOf(core.STATUSES), tags: strings, fileRef: nullable(string), source: nullable(string), sessionId: nullable(string), host: nullable(string), createdAt: string, updatedAt: string, closedAt: nullable(string) });
+const note = object({ seq: integer, status: nullable(oneOf(core.STATUSES)), body: string, createdAt: string });
+const link = object({ provider: string, destination: string, state: oneOf(core.LINK_STATES), externalId: nullable(string), url: nullable(string), error: nullable(string), claimedAt: nullable(string), createdAt: string, syncedAt: nullable(string) });
+const item = object({ id: integer, projectId: string, project: string, title: string, body: nullable(string), priority, status: oneOf(core.STATUSES), tags: strings, fileRef: nullable(string), source: nullable(string), sessionId: nullable(string), host: nullable(string), createdAt: string, updatedAt: string, closedAt: nullable(string), notes: array(note), links: array(link) });
+const linkCounts: Validator = (v) => !!v && typeof v === "object" && !Array.isArray(v) && Object.entries(v).every(([state, ids]) => (core.LINK_STATES as readonly string[]).includes(state) && array(integer)(ids));
 const resultValidators: Record<Operation, Validator> = {
-  addItem: item, listItems: array(item), findItem: item, getItem: nullable(item), getItemByNumber: nullable(item), updateItem: item, setStatus: item, deleteItem: item,
+  addItem: item, listItems: array(item), findItem: item, getItem: nullable(item), getItemByNumber: nullable(item), updateItem: item, setStatus: item, addNote: item, deleteItem: item,
+  getLink: nullable(link), claimLinkCreate: object({ token: optional(string), link }), finishLinkCreate: nullable(link), expireStaleClaims: (v) => typeof v === "number",
+  attachLink: link, detachLink: nullable(link), countLinks: linkCounts,
   countActive: object({ total: number, doing: number, urgent: number, high: number, normal: number, low: number }),
   listTags: array(object({ tag: string, count: number })),
   listProjects: array(object({ key: string, name: string, active: number, total: number })),
   check: object({ schema: number, compatible: boolean }),
-  migrate: object({ from: number, to: number, backup: optional(string), dryRun: optional(boolean), changes: array(object({ project: string, from: integer, to: integer, title: string })) }),
+  migrate: object({ from: number, to: number, backup: optional(string), dryRun: optional(boolean), notesMoved: optional(number), changes: array(object({ project: string, from: integer, to: integer, title: string })) }),
 };
 
 function sshArgs(target: Extract<Target, { kind: "ssh" }>): string[] {
@@ -182,8 +187,9 @@ function response<K extends Operation>(stdout: string, operation: K): StoreOpera
   if (!reply.ok) throw new Error(`remote tdo: ${typeof reply.error === "string" ? reply.error : "invalid error response"}`);
   if (!Object.hasOwn(reply, "result") || !resultValidators[operation](reply.result)) throw new Error(`invalid SSH RPC result for ${operation}.`);
   // JSON has no undefined; optional lookups use null on the wire.
-  return (reply.result === null && (operation === "getItem" || operation === "getItemByNumber") ? undefined : reply.result) as StoreOperations[K]["result"];
+  return (reply.result === null && NULLABLE.has(operation) ? undefined : reply.result) as StoreOperations[K]["result"];
 }
+const NULLABLE = new Set<Operation>(["getItem", "getItemByNumber", "getLink", "finishLinkCreate", "detachLink"]);
 function transportError(error: unknown, stderr: string): Error {
   return new Error(`SSH database operation failed (no local fallback; writes may have completed): ${error instanceof Error ? error.message : String(error)}${stderr.trim() ? `: ${stderr.trim()}` : ""}`);
 }
