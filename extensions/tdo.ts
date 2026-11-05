@@ -20,7 +20,7 @@ import {
   parseEditorText,
   parseQuickAdd,
   requirePriority,
-  resolveProject,
+  resolveProjectAsync,
   type Item,
   type ItemKey,
   type Project,
@@ -90,18 +90,22 @@ function sameItem(a: ItemKey | undefined, b: ItemKey | undefined): boolean {
 }
 
 export default function tdoExtension(pi: ExtensionAPI) {
-  const projects = new Map<string, Project>();
+  const projects = new Map<string, Promise<Project>>();
   /** The item this session is working on, restored from the session branch. */
   let focus: ItemKey | undefined;
   let generation = 0;
   let lifecycle = 0;
   let stopped = false;
 
-  function project(ctx: ExtensionContext): Project {
+  function project(ctx: ExtensionContext): Promise<Project> {
     const cwd = ctx.cwd || ctx.sessionManager.getCwd();
     let resolved = projects.get(cwd);
     if (!resolved) {
-      resolved = resolveProject(cwd, { config: loadConfig() });
+      resolved = resolveProjectAsync(cwd);
+      const pending = resolved;
+      void pending.catch(() => {
+        if (projects.get(cwd) === pending) projects.delete(cwd);
+      });
       projects.set(cwd, resolved);
     }
     return resolved;
@@ -130,7 +134,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
     const current = ++generation;
     const key = focus;
     try {
-      const projectKey = project(ctx).key;
+      const projectKey = (await project(ctx)).key;
       const counts = await callStore("countActive", projectKey);
       const focused = key ? await callStore("getItem", key) : undefined;
       if (current !== generation || stopped) return;
@@ -267,7 +271,8 @@ export default function tdoExtension(pi: ExtensionAPI) {
 
   async function browse(ctx: ExtensionContext, allProjects: boolean): Promise<void> {
     const epoch = lifecycle;
-    const current = project(ctx);
+    const current = await project(ctx);
+    if (stopped || epoch !== lifecycle) return;
     const header = allProjects ? "all projects" : current.key;
     let selected: ItemKey | undefined;
     for (;;) {
@@ -310,8 +315,14 @@ export default function tdoExtension(pi: ExtensionAPI) {
         if (trimmed === "help") return ctx.ui.notify(HELP, "info");
         const quick = parseQuickAdd(trimmed);
         if (!quick.title) return ctx.ui.notify("tdo: add needs a title, e.g. /tdo fix flaky test !high #ci", "warning");
-        const item = await callStore("addItem", { project: project(ctx), title: quick.title, priority: quick.priority, tags: quick.tags, source: "user", sessionId: sessionId(ctx), host: hostName() });
+        const epoch = lifecycle;
+        const session = sessionId(ctx);
+        const current = await project(ctx);
+        if (stopped || epoch !== lifecycle) return;
+        const item = await callStore("addItem", { project: current, title: quick.title, priority: quick.priority, tags: quick.tags, source: "user", sessionId: session, host: hostName() });
+        if (stopped || epoch !== lifecycle) return;
         await refreshStatus(ctx);
+        if (stopped || epoch !== lifecycle) return;
         ctx.ui.notify(`tdo: added ${formatItemLine(item)}`, "info");
       } catch (error) {
         ctx.ui.notify(`tdo: ${error instanceof Error ? error.message : String(error)}`, "error");
