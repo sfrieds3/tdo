@@ -388,6 +388,8 @@ export type Config = {
   aliases: Record<string, string>;
   /** Items shown per project by `tdo ls -a`; 0 shows all. */
   perProject?: number;
+  /** Open the CLI browser in a tmux popup or Rex floating pane when available. */
+  floating?: boolean;
 };
 
 export const DEFAULT_PER_PROJECT = 5;
@@ -408,7 +410,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, home = os.homed
     throw new Error(`invalid JSON in ${file}: ${(error as Error).message}`);
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${file} must contain a JSON object.`);
-  const { db, aliases, perProject } = parsed as { db?: unknown; aliases?: unknown; perProject?: unknown };
+  const { db, aliases, perProject, floating } = parsed as { db?: unknown; aliases?: unknown; perProject?: unknown; floating?: unknown };
+  if (floating !== undefined && typeof floating !== "boolean") throw new Error(`${file}: "floating" must be a boolean.`);
   if (perProject !== undefined && !(Number.isInteger(perProject) && (perProject as number) >= 0)) throw new Error(`${file}: "perProject" must be a non-negative integer.`);
   if (db !== undefined && typeof db !== "string") throw new Error(`${file}: "db" must be a string.`);
   if (aliases !== undefined && (!aliases || typeof aliases !== "object" || Array.isArray(aliases) || Object.values(aliases).some((value) => typeof value !== "string" || !value.trim()))) {
@@ -418,6 +421,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, home = os.homed
     db: db?.trim() ? expandHome(db.trim(), home) : undefined,
     aliases: { ...(aliases as Record<string, string> | undefined) },
     ...(perProject !== undefined ? { perProject: perProject as number } : {}),
+    ...(floating !== undefined ? { floating: floating as boolean } : {}),
   };
 }
 

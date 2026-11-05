@@ -253,6 +253,14 @@ test("config file sets the database path and project aliases", () => {
 
   fs.writeFileSync(file, "{ nope");
   assert.throws(() => tdo.loadConfig(env, home), /invalid JSON/);
+  for (const floating of [true, false]) {
+    fs.writeFileSync(file, JSON.stringify({ floating }));
+    assert.equal(tdo.loadConfig(env, home).floating, floating);
+  }
+  for (const floating of ["true", 1, null, {}]) {
+    fs.writeFileSync(file, JSON.stringify({ floating }));
+    assert.throws(() => tdo.loadConfig(env, home), /"floating" must be a boolean/);
+  }
   fs.writeFileSync(file, JSON.stringify({ perProject: 3 }));
   assert.equal(tdo.loadConfig(env, home).perProject, 3);
   fs.writeFileSync(file, JSON.stringify({ perProject: -1 }));
