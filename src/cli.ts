@@ -21,6 +21,8 @@ import {
   formatItemList,
   formatMarkdown,
   DEFAULT_PER_PROJECT,
+  DEFAULT_LIST_LIMIT,
+  LIST_TRUNCATED,
   editorText,
   parseEditorText,
   getConfigPath,
@@ -47,7 +49,9 @@ usage:
   tdo add <title...> [-p PRIO] [-t TAGS] [-b BODY] [-f PATH[:LINE]] [--source NAME]
                             (inline !high and #tag work too)
   tdo ls [-a] [-s STATUS] [-t TAGS] [-p PRIO] [-q TEXT] [-n N]
+                            N items (default ${DEFAULT_LIST_LIMIT}; 0 = all, no row cap)
                             -a groups by project, N items each (default ${DEFAULT_PER_PROJECT}; 0 = all)
+                            truncated results show a notice (stderr with --json)
   tdo show [id]             ids are per project: 3 or #3 here, NAME#3 or KEY#3 elsewhere
   tdo edit [id] [--title T] [-p PRIO] [-t +tag,~tag] [-b BODY] [-f REF]
                             ~tag removes a tag (quote a leading ~: -t '~tag')
@@ -64,7 +68,7 @@ usage:
   tdo db use <target>        validate and save a local path or ssh:// URI
   tdo db check               check connection and schema
   tdo migrate [--dry-run]   upgrade an older database (backs it up first) and print id changes
-  tdo export [-a] [--md]    dump items as JSON (default) or Markdown
+  tdo export [-a] [--md]    dump all matching items as JSON (default) or Markdown; no row cap
 
 browser keys (plain tdo, or tdo browse [-a] [-s all]):
   enter view · ctrl-e edit · ctrl-s start · ctrl-d done · ctrl-x drop · ctrl-r reopen
@@ -122,6 +126,8 @@ export type Interactive = {
 
 export type Io = {
   out: (text: string) => void;
+  /** Diagnostics such as truncated JSON results; defaults to stderr. */
+  err?: (text: string) => void;
   cwd: string;
   env: NodeJS.ProcessEnv;
   color?: boolean;
@@ -304,7 +310,7 @@ export function run(argv: string[], io: Io): number {
     const pick = io.pick ?? fzfPick(io.env);
     if (!pick) throw new UsageError(`tdo ${command} needs an item id (or install fzf and run it in a terminal to pick one).`);
     const status = parseStatusFilter(values.status ?? (command === "reopen" ? "closed" : "active"));
-    const items = db.call("listItems", { project: all ? undefined : project().key, status, limit: 5000 }).sort((a, b) => (all ? a.project.localeCompare(b.project) : 0) || byStatusThenPriority(a, b));
+    const items = db.call("listItems", { project: all ? undefined : project().key, status, limit: 0 }).sort((a, b) => (all ? a.project.localeCompare(b.project) : 0) || byStatusThenPriority(a, b));
     if (!items.length) throw new Error(`nothing to pick from${all ? "" : ` in ${project().key}`}.`);
     const self = [process.execPath, ...process.execArgv, process.argv[1] ?? "tdo", "--db", dbPath, "--project", project().key].map(shellQuote).join(" ");
     const lines = items.map((item) => `${item.project}#${item.id}\t${formatItemLine(item, { showProject: all, color: true })}`);
@@ -342,7 +348,7 @@ export function run(argv: string[], io: Io): number {
       case "list": {
         if (args.length) throw new UsageError(`unexpected argument: ${args[0]}`);
         const limit = values.limit === undefined ? undefined : Number(values.limit);
-        if (limit !== undefined && !(Number.isInteger(limit) && limit >= 0)) throw new UsageError(`-n must be a non-negative integer, got ${JSON.stringify(values.limit)}.`);
+        if (limit !== undefined && !(Number.isSafeInteger(limit) && limit >= 0)) throw new UsageError(`-n must be a non-negative integer within the safe range, got ${JSON.stringify(values.limit)}.`);
         const filter = {
           project: all ? undefined : project().key,
           status: parseStatusFilter(values.status),
@@ -351,20 +357,26 @@ export function run(argv: string[], io: Io): number {
           query: values.query,
         };
         if (!all) {
-          const items = db.call("listItems", { ...filter, limit: limit || undefined });
-          emit(items, formatItemList(items, { color }));
+          const cap = limit ?? DEFAULT_LIST_LIMIT;
+          const found = db.call("listItems", { ...filter, limit: cap === 0 ? 0 : Math.min(cap + 1, Number.MAX_SAFE_INTEGER) });
+          const truncated = cap > 0 && found.length > cap;
+          const items = truncated ? found.slice(0, cap) : found;
+          emit(items, formatItemList(items, { color, truncated }));
+          if (json && truncated) (io.err ?? console.error)(`tdo: ${LIST_TRUNCATED}`);
           return 0;
         }
         // Across projects, -n (or the config's perProject) caps each project's group.
         const perProject = limit ?? config.perProject ?? DEFAULT_PER_PROJECT;
-        const items = db.call("listItems", { ...filter, limit: 5000 });
+        const items = db.call("listItems", { ...filter, limit: 0 });
         if (json) {
           const counts = new Map<string, number>();
-          emit(items.sort(byPriority).filter((item) => {
+          const shown = items.sort(byPriority).filter((item) => {
             const seen = (counts.get(item.project) ?? 0) + 1;
             counts.set(item.project, seen);
             return perProject === 0 || seen <= perProject;
-          }), "");
+          });
+          emit(shown, "");
+          if (shown.length < items.length) (io.err ?? console.error)(`tdo: ${LIST_TRUNCATED}`);
           return 0;
         }
         emit(items, formatGroupedList(items, { perProject, color }));
@@ -378,7 +390,7 @@ export function run(argv: string[], io: Io): number {
         const scope = state.all ? undefined : project().key;
         switch (action) {
           case "feed": {
-            const items = db.call("listItems", { project: scope, status: state.status, limit: 5000 }).sort((a, b) => (state.all ? byProjectFirst(a, b, project().key) : 0) || byStatusThenPriority(a, b));
+            const items = db.call("listItems", { project: scope, status: state.status, limit: 0 }).sort((a, b) => (state.all ? byProjectFirst(a, b, project().key) : 0) || byStatusThenPriority(a, b));
             io.out(items.map((item) => `${item.project}#${item.id}\t${formatItemLine(item, { showProject: state.all, color: true })}`).join("\n"));
             return 0;
           }
@@ -479,7 +491,7 @@ export function run(argv: string[], io: Io): number {
         return 0;
       }
       case "export": {
-        const items = db.call("listItems", { project: values.all ? undefined : project().key, status: parseStatusFilter(values.status ?? "all"), limit: 5000 });
+        const items = db.call("listItems", { project: values.all ? undefined : project().key, status: parseStatusFilter(values.status ?? "all"), limit: 0 });
         io.out(values.md && !json ? formatMarkdown(items).trimEnd() : JSON.stringify(items, null, 2));
         return 0;
       }

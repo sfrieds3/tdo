@@ -33,6 +33,7 @@ const STATUS_KEY = "tdo";
 const TDO_ICON = "☑";
 const FOCUS_ENTRY = "tdo-focus";
 const FOCUS_TITLE_CHARS = 40;
+const PICKER_LIMIT = 200;
 /** Added to the hand-off when config `worktree` is true; the agent picks the names. */
 export const WORKTREE_INSTRUCTION = "Do the work in a new git worktree on a new branch (create it with `git worktree add -b <branch> <main-checkout>/.worktrees/<name>`, choosing a short descriptive branch and directory name; never put it next to the repo), not in the current checkout.";
 const ALL_ARGS = new Set(["all", "--all", "-a"]);
@@ -277,9 +278,16 @@ export default function tdoExtension(pi: ExtensionAPI) {
     if (stopped || epoch !== lifecycle) return;
     const header = allProjects ? "all projects" : current.key;
     let selected: ItemKey | undefined;
+    let warned = false;
     for (;;) {
-      const items = await callStore("listItems", { project: allProjects ? undefined : current.key, limit: 200 });
+      const found = await callStore("listItems", { project: allProjects ? undefined : current.key, limit: PICKER_LIMIT + 1 });
       if (stopped || epoch !== lifecycle) return;
+      const truncated = found.length > PICKER_LIMIT;
+      const items = found.slice(0, PICKER_LIMIT);
+      if (truncated && !warned) {
+        ctx.ui.notify(`tdo: showing only the first ${PICKER_LIMIT} active items. Use tdo ls${allProjects ? " -a" : ""} -n 0 to show all, or the CLI browser to search everything.`, "warning");
+        warned = true;
+      }
       // Show project names whenever other projects are in view.
       const showProject = allProjects && items.some((item) => item.project !== current.key);
       if (!items.length) {
@@ -290,7 +298,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
         ctx.ui.notify(formatItemList(items, { showProject }), "info");
         return;
       }
-      const picked = await pick(ctx, items, `tdo — ${header} (${items.length})`, showProject, selected);
+      const picked = await pick(ctx, items, `tdo — ${header} (${items.length}${truncated ? "+" : ""})`, showProject, selected);
       if (!picked || stopped || epoch !== lifecycle) return;
       selected = picked.item;
       const again = await act(ctx, picked, showProject);

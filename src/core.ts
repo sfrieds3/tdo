@@ -99,8 +99,12 @@ export type ListFilter = {
   /** Include this priority and anything more urgent. */
   minPriority?: Priority;
   query?: string;
+  /** Maximum rows (default 500); 0 returns all matching rows. */
   limit?: number;
 };
+
+export const DEFAULT_LIST_LIMIT = 500;
+export const LIST_TRUNCATED = "… more items (use -n 0 to show all, or -s / -q to narrow)";
 
 const MAX_TITLE_CHARS = 200;
 
@@ -631,6 +635,8 @@ export function ftsQuery(text: string): string | undefined {
 }
 
 export function listItems(db: DatabaseSync, filter: ListFilter = {}): Item[] {
+  const limit = filter.limit ?? DEFAULT_LIST_LIMIT;
+  if (!Number.isSafeInteger(limit) || limit < 0) throw new Error("limit must be a non-negative safe integer.");
   const where: string[] = [];
   const values: (string | number)[] = [];
   if (filter.project !== undefined) { where.push("p.key = ?"); values.push(filter.project); }
@@ -650,9 +656,8 @@ export function listItems(db: DatabaseSync, filter: ListFilter = {}): Item[] {
   const order = closedFirst
     ? "i.closed_at DESC, i.created_at DESC"
     : "CASE i.status WHEN 'doing' THEN 0 WHEN 'open' THEN 1 ELSE 2 END, i.priority, i.created_at, p.key, i.id";
-  const limit = Math.max(1, Math.min(filter.limit ?? 500, 5000));
-  const sql = `${ITEM_SELECT}${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY ${order} LIMIT ${limit}`;
-  return (db.prepare(sql).all(...values) as ItemRow[]).map(toItem);
+  const sql = `${ITEM_SELECT}${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY ${order} LIMIT ?`;
+  return (db.prepare(sql).all(...values, limit === 0 ? -1 : limit) as ItemRow[]).map(toItem);
 }
 
 export type ActiveCounts = { total: number; doing: number } & Record<Priority, number>;
@@ -723,8 +728,9 @@ export function formatItemLine(item: Item, options: FormatOptions = {}): string 
   return parts.join("  ");
 }
 
-export function formatItemList(items: Item[], options: FormatOptions & { empty?: string } = {}): string {
-  return items.length ? items.map((item) => formatItemLine(item, options)).join("\n") : (options.empty ?? "(nothing here)");
+export function formatItemList(items: Item[], options: FormatOptions & { empty?: string; truncated?: boolean } = {}): string {
+  const text = items.length ? items.map((item) => formatItemLine(item, options)).join("\n") : (options.empty ?? "(nothing here)");
+  return options.truncated ? `${text}\n${paint(LIST_TRUNCATED, options.color, "dim")}` : text;
 }
 
 const STATUS_RANK: Record<Status, number> = { doing: 0, open: 1, done: 2, dropped: 3 };
@@ -756,7 +762,7 @@ export function formatGroupedList(items: Item[], options: { perProject?: number;
     const shown = perProject > 0 ? group.slice(0, perProject) : group;
     const lines = shown.map((item) => `  ${formatItemLine(item, { color })}`);
     const hidden = group.length - shown.length;
-    if (hidden > 0) lines.push(paint(`  … ${hidden} more (tdo ls --project ${key})`, color, "dim"));
+    if (hidden > 0) lines.push(paint(`  … ${hidden} more (tdo ls --project ${key} -n 0)`, color, "dim"));
     return [header, ...lines].join("\n");
   }).join("\n\n");
 }

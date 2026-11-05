@@ -97,6 +97,10 @@ Global options: `--db TARGET` for a one-off local or SSH database override, `--j
 
 `tdo project` shows the resolved project key and `tdo paths` shows where the database and config live.
 
+**List limits:** `tdo ls` shows at most 500 matching items by default. `-n N` (or `--limit N`) changes the limit; `-n 0` shows all matching items, with or without `-a`, and there is no hidden 5,000-row ceiling. `ls -a` applies its limit per project (default 5), not globally. When results are omitted, text output includes a dim `… more` notice; `--json` keeps the same array shape and writes a truncation warning to stderr. Exactly filling a limit does not produce a warning unless another matching item exists. Use `-n 0` for a complete list, increase `-n`, or narrow with `-s` / `-q` / `-t`.
+
+`tdo export` always includes every matching item in the current project (all statuses by default); `-a` spans all projects and `-s` selects statuses. Exports, the CLI browser, and CLI fzf pickers have no row limit. Large SSH results can still exceed the transport byte/time bounds described below; that fails explicitly rather than returning a partial export.
+
 `-p` on `ls` means "this priority or more urgent", so `tdo ls -p high` shows urgent and high items. Priorities accept prefixes (`-p u`).
 
 ### Browser
@@ -137,7 +141,7 @@ widgets  github.com/example/widgets · 7 items, 3!
   #6  high    speed up build
   #4  normal  tidy logs
   #5  normal  doc the api
-  … 2 more (tdo ls --project github.com/example/widgets)
+  … 2 more (tdo ls --project github.com/example/widgets -n 0)
 
 gadgets  github.com/example/gadgets · 1 item
   #1  normal  bump deps
@@ -182,6 +186,8 @@ In the picker:
 
 After `e`, `p`, `x`, or `d` the picker reopens, so you can triage several items in a row.
 
+The Pi picker shows at most 200 active items. If more match, its title shows `200+` and a warning points to `tdo ls -n 0` (or `tdo ls -a -n 0` across projects) and the CLI browser for the complete backlog.
+
 The footer shows `☑ 4 (2!) ▸ #3 login test flakes on CI` — open items, how many are urgent or high, and the item this session is working on. The checkbox is the terminal counterpart of the [tdo icon](assets/tdo.svg): a plain Unicode glyph (U+2611), with no Nerd Font or terminal image support required. The focus survives `/reload` and session resume, and clears itself once the item is closed or deleted. It refreshes after each agent run, so items the agent adds or closes through the CLI show up right away. An empty backlog hides the status; a store error shows `☑ unavailable` instead of a stale count.
 
 ## How projects are identified
@@ -216,7 +222,7 @@ Items are renumbered per project in their original order, so the oldest item in 
 
 ### SSH remote database
 
-Install a compatible version of `tdo` and Node 22.18+ on the server. The remote noninteractive shell must find `tdo` on `PATH`; use the same tdo release on both ends. Configure SSH keys/agent, host keys, and any jump hosts with your normal SSH setup first. No daemon, database file synchronization, or network-mounted SQLite file is needed.
+Install a compatible version of `tdo` and Node 22.18+ on the server. The remote noninteractive shell must find `tdo` on `PATH`; use the same tdo release on both ends. Unlimited list/export support uses RPC protocol v2: upgrade both ends together. Older helpers are rejected rather than allowed to silently apply the old row ceiling. Configure SSH keys/agent, host keys, and any jump hosts with your normal SSH setup first. No daemon, database file synchronization, or network-mounted SQLite file is needed.
 
 ```sh
 tdo db use 'ssh://you@backlog-host/home/you/.local/share/tdo/tdo.db'
