@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.0](https://github.com/sfrieds3/tdo/compare/v0.3.0...v0.4.0) (2026-11-05)
+
+
+### Features
+
+* add config-gated Rex and tmux floating browsers ([#8](https://github.com/sfrieds3/tdo/issues/8)) ([4a3c126](https://github.com/sfrieds3/tdo/commit/4a3c1266f046af4ab424f46f92cd8a3bd3c9e465))
+* config worktree asks the Pi agent to work in a new worktree/branch ([#13](https://github.com/sfrieds3/tdo/issues/13)) ([3886e28](https://github.com/sfrieds3/tdo/commit/3886e28562f037ef06bf589c23978d1b78cc6363))
+
+
+### Bug Fixes
+
+* accept ~tag for tag removal and ignore '=' from -t=… ([#10](https://github.com/sfrieds3/tdo/issues/10)) ([970abf3](https://github.com/sfrieds3/tdo/commit/970abf35b33beb91a57f87e1529ecd3bc42da3ca))
+* bare /tdo&lt;space&gt; opens the project picker instead of --all ([#14](https://github.com/sfrieds3/tdo/issues/14)) ([8de4dfd](https://github.com/sfrieds3/tdo/commit/8de4dfd0af6dd28566160d31700d7c6a32025edb))
+* ctrl-n/ctrl-p move the cursor in fzf ([#12](https://github.com/sfrieds3/tdo/issues/12)) ([5845d35](https://github.com/sfrieds3/tdo/commit/5845d35b678f33671ef4046866271369c267c6e8))
+* read items under the write lock in setStatus, updateItem, and deleteItem ([#11](https://github.com/sfrieds3/tdo/issues/11)) ([871b489](https://github.com/sfrieds3/tdo/commit/871b4897c0bbf528b978ffc2e61e9a922d946c49))
+
 ## [0.3.0](https://github.com/sfrieds3/tdo/compare/v0.2.0...v0.3.0) (2026-11-05)
 
 
