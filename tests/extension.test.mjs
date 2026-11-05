@@ -117,6 +117,7 @@ test("/tdo picker: enter works on an item and shows it in the footer until it cl
   assert.equal(h.sent.length, 1);
   assert.match(h.sent[0].text, /Let's work on tdo item #1/);
   assert.match(h.sent[0].text, /tdo done 1 -m/);
+  assert.doesNotMatch(h.sent[0].text, /worktree/);
   assert.equal(h.statuses.get("tdo"), "tdo 2 (1!) ▸ #1 rename helpers");
 
   // A reload restores the focus from the session branch.
@@ -313,4 +314,15 @@ test("older SSH refreshes cannot overwrite newer results or repopulate status af
   await h.emit("session_shutdown");
   await shutdownPending;
   assert.equal(h.statuses.get("tdo"), undefined);
+});
+
+test("/tdo picker: config worktree asks the agent to work in a new worktree and branch", async () => {
+  const h = harness({ keys: [[ENTER]] });
+  fs.mkdirSync(path.join(h.dir, "config", "tdo"), { recursive: true });
+  fs.writeFileSync(path.join(h.dir, "config", "tdo", "config.json"), JSON.stringify({ worktree: true }));
+  await h.command.handler("split the parser", h.ctx);
+  await h.command.handler("", h.ctx);
+  assert.equal(h.sent.length, 1);
+  assert.ok(h.sent[0].text.includes(extension.WORKTREE_INSTRUCTION));
+  assert.match(h.sent[0].text, /tdo done 1 -m/);
 });

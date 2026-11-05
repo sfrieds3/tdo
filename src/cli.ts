@@ -82,7 +82,7 @@ options:
 priorities: ${PRIORITIES.join(", ")} (prefixes and 0-3 accepted)
 statuses:   ${STATUS_FILTERS.join(", ")} (ls default: active = open + doing)
 files:      database $XDG_DATA_HOME/tdo/tdo.db (default ~/.local/share/tdo/tdo.db)
-            config   $XDG_CONFIG_HOME/tdo/config.json (optional; keys: db, aliases, perProject, floating)
+            config   $XDG_CONFIG_HOME/tdo/config.json (optional; keys: db, aliases, perProject, floating, worktree)
 env:        TDO_DB, TDO_CONFIG, TDO_PROJECT, TDO_SOURCE (who is adding: cli, claude, codex, ...),
             TDO_FZF_OPTS (extra fzf flags), NO_COLOR / FORCE_COLOR`;
 

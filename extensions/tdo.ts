@@ -31,6 +31,8 @@ import { createAsyncStore, type Operation, type StoreOperations } from "../src/s
 const STATUS_KEY = "tdo";
 const FOCUS_ENTRY = "tdo-focus";
 const FOCUS_TITLE_CHARS = 40;
+/** Added to the hand-off when config `worktree` is true; the agent picks the names. */
+export const WORKTREE_INSTRUCTION = "Do the work in a new git worktree on a new branch (create it with `git worktree add -b <branch> <path>`, choosing a short descriptive branch name and a sibling directory of the repo), not in the current checkout.";
 const ALL_ARGS = new Set(["all", "--all", "-a"]);
 const HELP = [
   "/tdo — pick an item in this project (--all or all: every project)",
@@ -218,7 +220,8 @@ export default function tdoExtension(pi: ExtensionAPI) {
     if (stopped || current !== lifecycle) return;
     const ref = itemRef(started, { showProject });
     const close = showProject ? `tdo done ${started.id} --project ${started.project}` : `tdo done ${started.id}`;
-    const message = `Let's work on tdo item ${ref} (marked as doing). When it's fixed, close it with \`${close} -m "<what changed>"\`.\n\n${formatItemDetail(started)}`;
+    const worktree = loadConfig().worktree ? ` ${WORKTREE_INSTRUCTION}` : "";
+    const message = `Let's work on tdo item ${ref} (marked as doing).${worktree} When it's fixed, close it with \`${close} -m "<what changed>"\`.\n\n${formatItemDetail(started)}`;
     if (ctx.isIdle()) pi.sendUserMessage(message);
     else pi.sendUserMessage(message, { deliverAs: "followUp" });
   }
