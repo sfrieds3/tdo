@@ -43,6 +43,7 @@ if (args[0] === 'issue' && args[1] === 'create') {
   console.log('https://github.com/example/widgets/issues/' + (100 + n));
   process.exit(0);
 }
+if (args[0] === 'issue') { if (process.env.GH_OP_ERROR) { console.error(process.env.GH_OP_ERROR); process.exit(1); } if (mode === 'op-hang') { setInterval(() => {}, 1000); return; } if (mode === 'fail') { console.error('HTTP 502: offline'); process.exit(1); } if (mode === 'noauth') { console.error('HTTP 401: unauthorized'); process.exit(1); } process.exit(0); }
 console.error('unexpected gh call'); process.exit(3);
 `, { mode: 0o755 });
   const env = { PATH: `${bin}:${process.env.PATH}`, GH_LOG: log, GH_MODE: mode, TDO_DB: path.join(dir, "tdo.db"), XDG_CONFIG_HOME: path.join(dir, "config"), HOME: dir };
@@ -251,15 +252,16 @@ test("links keep their destination after the config changes", (t) => {
   assert.equal(h.creates().at(-1).args[3], KEY, "the forced retry goes to the link's original repo");
 });
 
-test("closed items and other projects' items aren't filed in this version", (t) => {
+test("closed items reconcile while other projects require their own checkout", (t) => {
   const h = harness(t);
   h.cli("tracker", "approve", "--yes");
   h.cli("add", "one");
   h.cli("done", "1");
-  assert.match(h.cli("push", "1").out, /closed items can be filed once lifecycle sync lands/);
+  assert.match(h.cli("push", "1").out, /https:\/\/github.com\/example\/widgets\/issues\/101/);
+  assert.equal(h.cli("show", "1", "--json").json().links[0].state, "closed");
   h.cli("add", "elsewhere", "--project", "github.com/example/other");
   assert.match(h.cli("push", "other#1").out, /run tdo push from that project/);
-  assert.equal(h.creates().length, 0);
+  assert.equal(h.creates().length, 1);
 });
 
 test("concurrent claims: only one caller gets a token; superseded completions are ignored", () => {
@@ -295,7 +297,7 @@ test("pushItem warns with the URL when a finished create can't be recorded", (t)
   t.after(() => store.close());
   const item = store.call("addItem", { project: KEY, title: "orphan" });
   const warnings = [];
-  const config = { provider: "github", destination: KEY, labels: [] };
+  const config = { provider: "github", destination: KEY, labels: [], approval: "user-only", closeOnDone: true };
   const fakeTracker = () => ({ provider: "github", check: () => ({ ok: true }), parseIssueUrl: () => undefined, create: () => ({ ok: true, value: { id: "7", url: "https://github.com/example/widgets/issues/7" } }) });
   const failing = { call: (op, ...args) => { if (op === "finishLinkCreate") throw new Error("database is locked"); return store.call(op, ...args); }, close() {} };
   assert.throws(() => pushItem(failing, item, config, { warn: (text) => warnings.push(text), tracker: fakeTracker }), /locked/);
@@ -408,4 +410,111 @@ but this paragraph is user text', 'open', 'x', 'x'),
   assert.equal(byId[4].notes[0].body, "not needed");
   assert.deepEqual(JSON.parse(tdo("ls", "-s", "all", "-q", "fixed", "--json")).map((item) => item.id), [2], "moved notes are searchable once");
   assert.equal(tdo("add", "fresh", "--json").includes('"id": 5'), true);
+});
+
+test("ordinary mutations commit and emit one JSON document even when GitHub is offline", (t) => {
+  const h = harness(t);
+  h.cli("tracker", "approve", "--yes");
+  h.cli("add", "local wins");
+  h.cli("push", "1");
+  h.env.GH_MODE = "fail";
+  const done = h.cli("done", "1", "-m", "fixed locally", "--json");
+  assert.equal(done.code, 0);
+  assert.equal(done.json().status, "done");
+  assert.equal(done.json().notes[0].body, "fixed locally");
+  assert.match(h.errors.at(-1), /sync paused.*saved/);
+  assert.equal(h.cli("show", "1", "--json").json().links[0].queued, 2);
+  assert.match(h.cli("ls", "-s", "all").out, /↗…/);
+  h.env.GH_MODE = "ok";
+  assert.equal(h.cli("reopen", "1", "--json").code, 0);
+  const sent = h.calls().filter((call) => ["close", "reopen"].includes(call.args[1]));
+  assert.deepEqual(sent.map((call) => call.args[1]), ["close", "reopen"]);
+  assert.equal(h.cli("show", "1", "--json").json().links[0].state, "open");
+});
+
+test("no-sync queues durable lifecycle changes and sync uses persisted destination after config changes", (t) => {
+  const h = harness(t);
+  h.cli("tracker", "approve", "--yes");
+  h.cli("add", "bound");
+  h.cli("push", "1");
+  const before = h.calls().length;
+  h.cli("edit", "1", "--title", "edited offline", "--no-sync", "--json");
+  h.cli("note", "1", "queued note", "--no-sync");
+  h.cli("done", "1", "--no-sync");
+  assert.equal(h.calls().length, before);
+  fs.writeFileSync(path.join(h.repo, ".tdo", "config.json"), JSON.stringify({ tracker: { provider: "github", repo: "elsewhere/repo" } }));
+  h.cli("reopen", "1", "--json");
+  assert.equal(h.calls().length, before, "changed approval blocks all delivery");
+  assert.equal(h.cli("sync", "--json").code, 1);
+  h.cli("tracker", "approve", "--yes");
+  const status = h.cli("tracker", "status", "--json").json();
+  assert.equal(status.sync.queued, 4);
+  assert.deepEqual(status.sync.differentDestination, [1]);
+  const synced = h.cli("sync", "--json");
+  assert.equal(synced.code, 0);
+  assert.equal(synced.json()[0].sent, 4);
+  const mutations = h.calls().slice(before).filter((call) => call.args[0] === "issue");
+  assert.deepEqual(mutations.map((call) => call.args[1]), ["edit", "comment", "close", "reopen"]);
+  for (const call of mutations) assert.equal(call.args[call.args.indexOf("--repo") + 1], KEY);
+  assert.equal(mutations[0].args[mutations[0].args.indexOf("--title") + 1], "edited offline");
+});
+
+test("permanent operation failure requires sync --retry and closeOnDone false only posts the note", (t) => {
+  const h = harness(t, { tracker: { provider: "github", closeOnDone: false } });
+  h.cli("tracker", "approve", "--yes");
+  h.cli("add", "permission");
+  h.cli("push", "1");
+  h.env.GH_MODE = "noauth";
+  assert.equal(h.cli("done", "1", "-m", "finished", "--json").code, 0);
+  assert.equal(h.cli("show", "1", "--json").json().links[0].attention, 1);
+  assert.match(h.cli("show", "1").out, /401.*unauthorized/);
+  assert.match(h.cli("ls", "-s", "all").out, /↗!/);
+  const before = h.calls().length;
+  h.env.GH_MODE = "ok";
+  assert.equal(h.cli("sync", "--json").code, 1);
+  assert.equal(h.calls().length, before, "attention must not be silently retried");
+  assert.equal(h.cli("sync", "--retry", "--json").code, 0);
+  assert.equal(h.calls().at(-1).args[1], "comment");
+  assert.equal(h.calls().some((call) => call.args[1] === "close"), false);
+});
+
+test("GitHub lifecycle methods use argv/stdin safely and classify recoverable versus attention errors", async (t) => {
+  const h = harness(t);
+  const { githubTracker } = await import("../src/trackers/github.ts");
+  const gh = githubTracker({ destination: "enterprise.test/owner/repo", env: h.env, timeoutMs: 300 });
+  const title = "title $(touch never) --shell";
+  const body = "body `not executed`\nwith newlines";
+  assert.equal(gh.update("42", { title, body }).ok, true);
+  assert.equal(gh.comment("42", body).ok, true);
+  assert.equal(gh.close("42", "not planned").ok, true);
+  assert.equal(gh.reopen("42").ok, true);
+  const calls = h.calls();
+  assert.deepEqual(calls[0], { args: ["issue", "edit", "42", "--title", title, "--body-file", "-", "--repo", "enterprise.test/owner/repo"], input: body });
+  assert.equal(calls[1].input, body);
+  assert.deepEqual(calls[2].args.slice(0, 5), ["issue", "close", "42", "--reason", "not planned"]);
+  for (const message of ["HTTP 429: slow down", "HTTP 403: API rate limit exceeded", "timeout connecting", "Could not resolve host: api.github.com", "HTTP 502: bad gateway", "unrecognized failure"]) {
+    h.env.GH_OP_ERROR = message;
+    assert.equal(gh.reopen("42").kind, "retryable", message);
+  }
+  for (const message of ["HTTP 401: authentication required", "HTTP 403: forbidden", "HTTP 404: Not Found", "GraphQL: Could not resolve to a Repository", "issue was transferred", "issue deleted"]) {
+    h.env.GH_OP_ERROR = message;
+    assert.equal(gh.close("42", "completed").kind, "attention", message);
+  }
+  delete h.env.GH_OP_ERROR;
+  h.env.GH_MODE = "op-hang";
+  assert.equal(gh.comment("42", body).kind, "retryable", "lost comment response is retryable, not uncertain create");
+});
+
+test("cross-project mutation never borrows the current checkout's approval to drain", (t) => {
+  const h = harness(t);
+  h.cli("tracker", "approve", "--yes");
+  h.cli("add", "other", "--project", "github.com/example/other");
+  const store = createStore(h.env.TDO_DB);
+  const item = store.call("findItem", "1", "github.com/example/other");
+  store.call("attachLink", item, "github", "github.com/example/other", "7", "https://github.com/example/other/issues/7");
+  store.close();
+  const before = h.calls().length;
+  assert.equal(h.cli("done", "other#1", "--json").code, 0);
+  assert.equal(h.calls().length, before);
+  assert.equal(h.cli("show", "other#1", "--json").json().links[0].queued, 1);
 });

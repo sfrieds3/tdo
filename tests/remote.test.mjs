@@ -28,10 +28,10 @@ if (process.env.SSH_MODE === 'descendant') {
 if (process.env.SSH_MODE === 'fail') { console.error('offline'); process.exit(255); }
 if (process.env.SSH_MODE === 'bad') { console.log('not json'); process.exit(0); }
 if (process.env.SSH_MODE === 'version') { console.log(JSON.stringify({version:99,ok:true,result:{}})); process.exit(0); }
-if (process.env.SSH_MODE === 'shape') { console.log(JSON.stringify({version:2,ok:true,result:{}})); process.exit(0); }
+if (process.env.SSH_MODE === 'shape') { console.log(JSON.stringify({version:3,ok:true,result:{}})); process.exit(0); }
 if (process.env.SSH_MODE === 'large') { process.stdout.write('x'.repeat(9*1024*1024)); return; }
 const input = fs.readFileSync(0);
-const result = spawnSync(process.execPath, [process.env.TDO_HELPER, 'internal-rpc'], {input, encoding:'utf8', env:{...process.env,TDO_CONFIG:'/does-not-exist',TDO_DB:'/not-the-requested-db',TDO_PROJECT:'server-project'}});
+const result = spawnSync(process.execPath, [process.env.TDO_HELPER, 'internal-rpc'], {input, encoding:'utf8', env:{...process.env,TDO_CONFIG:'/does-not-exist',TDO_DB:'/not-the-requested-db',TDO_PROJECT:'server-project',TDO_REMOTE_HELPER:'1'}});
 process.stdout.write(result.stdout || ''); process.stderr.write(result.stderr || ''); process.exit(result.status ?? 1);
 `, { mode: 0o755 });
   const db = path.join(dir, "remote space;$(touch injected).db");
@@ -256,7 +256,7 @@ test("sync and async SSH operations enforce the overall timeout", async (t) => {
 
 test("helper validates closed protocol and args before opening a database", (t) => {
   const h = harness(t);
-  const request = { version: 2, path: h.db, operation: "listItems", args: [] };
+  const request = { version: 3, path: h.db, operation: "listItems", args: [] };
   for (const bad of ["not-json", JSON.stringify({ ...request, version: 1 }), JSON.stringify({ ...request, extra: true }), JSON.stringify({ ...request, path: "ssh://host/db" }), JSON.stringify({ ...request, operation: "exec", args: ["DROP TABLE items"] }), JSON.stringify({ ...request, args: [{ limit: "1; DROP TABLE items" }] }), JSON.stringify({ ...request, operation: "addItem", args: [{ project: {}, title: "bad" }] }), "x".repeat(MAX_RPC_BYTES + 1)]) {
     assert.equal(JSON.parse(handleRpc(bad)).ok, false);
   }
@@ -298,4 +298,69 @@ test("local operation store retains an in-memory database across calls", () => {
   store.call("addItem", { project: "local", title: "persistent handle" });
   assert.equal(store.call("listItems").length, 1);
   store.close();
+});
+
+test("lifecycle intent persists through fake SSH, including leases, retries and protocol evolution", (t) => {
+  const h = harness(t);
+  const remote = createStore(h.target, { env: h.env });
+  t.after(() => remote.close());
+  const item = remote.call("addItem", { project: "caller/project", title: "remote queue" });
+  remote.call("attachLink", item, "github", "github.com/example/widgets", "42", "https://github.com/example/widgets/issues/42");
+  remote.call("updateItem", item, { title: "latest" });
+  remote.call("setStatus", item, "done", "remote note", true);
+  remote.call("setStatus", item, "open", undefined, true); // optional hole is JSON null on the wire
+  assert.equal(remote.call("getItem", item).links[0].queued, 4);
+  const reopened = createStore(h.target, { env: h.env });
+  t.after(() => reopened.close());
+  assert.equal(reopened.call("listLinkedItems", "caller/project")[0].notes[0].body, "remote note");
+  assert.equal(remote.call("leaseLinkOps", item, "github", "first"), true);
+  assert.equal(reopened.call("leaseLinkOps", item, "github", "second"), false);
+  assert.equal(reopened.call("ackOp", item, "github", "second", 1), false);
+  assert.equal(remote.call("nextLinkOp", item, "github", "first").op, "update");
+  assert.equal(remote.call("ackOp", item, "github", "first", 1), true);
+  assert.equal(remote.call("failOp", item, "github", "first", 2, true, "auth required"), true);
+  assert.equal(remote.call("releaseLinkOps", item, "github", "first"), true);
+  assert.equal(remote.call("getLink", item, "github").attention, 1);
+  assert.equal(remote.call("retryLinkOps", "other/project"), 0);
+  assert.equal(remote.call("retryLinkOps", "caller/project"), 1);
+  assert.equal(reopened.call("leaseLinkOps", item, "github", "second"), true);
+  for (const [seq, op] of [[2, "comment"], [3, "close"], [4, "reopen"]]) {
+    const next = reopened.call("nextLinkOp", item, "github", "second");
+    assert.deepEqual([next.seq, next.op], [seq, op]);
+    assert.equal(reopened.call("ackOp", item, "github", "second", seq), true);
+  }
+  assert.equal(reopened.call("nextLinkOp", item, "github", "second"), undefined);
+  reopened.call("releaseLinkOps", item, "github", "second");
+  assert.equal(remote.call("getLink", item, "github").state, "open");
+  const local = openDb(h.db);
+  t.after(() => local.close());
+  assert.equal(local.prepare("SELECT next_op_seq FROM links").get().next_op_seq, 5);
+  const old = JSON.parse(handleRpc(JSON.stringify({ version: 2, path: h.db, operation: "setStatus", args: [item, "done"] })));
+  assert.match(old.error, /incompatible RPC protocol/);
+  assert.equal(remote.call("getItem", item).status, "open", "old clients cannot mutate without lifecycle intent");
+});
+
+test("remote-backed lifecycle draining invokes gh only on the caller, never in the SSH helper", (t) => {
+  const h = harness(t);
+  const ghLog = path.join(h.dir, "gh.log");
+  h.env.GH_LOG = ghLog;
+  fs.writeFileSync(path.join(h.dir, "bin", "gh"), `#!${process.execPath}
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const input = args.includes('-') ? fs.readFileSync(0, 'utf8') : '';
+fs.appendFileSync(process.env.GH_LOG, JSON.stringify({args,input,remote:process.env.TDO_REMOTE_HELPER || null})+'\\n');
+if (process.env.TDO_REMOTE_HELPER) process.exit(99);
+process.exit(0);
+`, { mode: 0o755 });
+  fs.writeFileSync(h.env.TDO_CONFIG, JSON.stringify({ projects: { "caller/project": { tracker: { provider: "github", repo: "example/widgets" } } } }));
+  const remote = createStore(h.target, { env: h.env });
+  const item = remote.call("addItem", { project: "caller/project", title: "caller only" });
+  remote.call("attachLink", item, "github", "github.com/example/widgets", "42", "https://github.com/example/widgets/issues/42");
+  remote.close();
+  assert.equal(fs.existsSync(ghLog), false, "RPC operations never run gh");
+  assert.equal(h.cli("done", "1", "-m", "fixed", "--json").status, 0);
+  const calls = fs.readFileSync(ghLog, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(calls.map((call) => call.args[1]), ["comment", "close"]);
+  assert.ok(calls.every((call) => call.remote === null));
+  assert.equal(h.cli("show", "1", "--json").json().links[0].state, "closed");
 });

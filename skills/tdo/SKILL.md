@@ -28,7 +28,9 @@ tdo edit <id> -p high -t +newtag,~oldtag -b "<new body>" --json
 tdo start <id>                     # mark as doing
 tdo done <id> -m "<what fixed it>" # also: drop <id> -m "<why>", reopen <id>
 tdo note <id> "<progress or finding>"   # add a note without changing status
-tdo tracker status --json          # is this project set up to file GitHub issues?
+tdo tracker status --json          # approval, destination, links and queued operation counts
+tdo sync --json                    # deliver queued work for this project only
+tdo sync --retry --json            # reset attention failures only after fixing the cause
 ```
 
 Set `--source` to the agent you are: `claude`, `codex`, `pi`, or similar. Items record their source, host, and timestamps automatically.
@@ -59,3 +61,7 @@ A project can file items as GitHub issues (`tdo push`) once the user has approve
 - **Never run `tdo push`, `tdo tracker approve`, or anything with `--yes` unless the user explicitly asks you to in this turn.** Offer instead: *"Want me to file #3 as a GitHub issue?"*
 - `tdo show <id> --json` lists an item's `links` (issue URL and state); `tdo ls --linked` shows filed items.
 - A link in state `unknown` or `error` needs the user's judgment; report it, don't retry.
+
+Linked items sync one-way to GitHub: title/body/file edits update the issue, notes post comments, and done/drop/reopen change issue state when `closeOnDone` is enabled. Local mutations commit first and still succeed when sync fails. Use `--no-sync` on ordinary mutations to save intent without network delivery. `↗…` means queued work; `↗!` means attention/unknown/error. Delivery pauses while tracker approval is missing or changed; existing links keep their original repository. Comments may be duplicated after a lost response; updates and status operations are idempotent. Notes preceding issue creation are not back-posted. Auto-on-tag and Pi filing prompts are not active in this version.
+
+`sync` only delivers already-authorized links (and pending authorized creates); it does not authorize filing a new item. This is protection against cooperative agents making mistakes, not a security barrier against processes impersonating a human.

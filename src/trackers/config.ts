@@ -31,7 +31,7 @@ export type EffectiveTracker = {
 };
 
 /** Settings accepted now but only acted on by later versions. */
-export const INACTIVE_SETTINGS: readonly (keyof TrackerOverride)[] = ["mode", "closeOnDone"];
+export const INACTIVE_SETTINGS: readonly (keyof TrackerOverride)[] = ["mode", "tag"];
 
 export type TrackerResolution =
   | { kind: "none" }
