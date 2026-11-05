@@ -215,7 +215,7 @@ export function parseStatusFilter(value: unknown): StatusFilter {
 }
 
 export function normalizeTag(value: string): string | undefined {
-  const tag = value.trim().replace(/^#+/, "").toLowerCase().replace(/\s+/g, "-");
+  const tag = value.trim().replace(/^[#=]+/, "").toLowerCase().replace(/\s+/g, "-");
   return tag || undefined;
 }
 

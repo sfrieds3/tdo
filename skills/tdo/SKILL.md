@@ -24,7 +24,7 @@ tdo ls -q "search words" --json    # full-text search over titles and bodies
 tdo ls -t perf -p high --json      # filter by tag; -p means "this priority or more urgent"
 tdo ls -s all --json               # include done/dropped; -a spans every project
 tdo show <id> --json
-tdo edit <id> -p high -t +newtag,-oldtag -b "<new body>" --json
+tdo edit <id> -p high -t +newtag,~oldtag -b "<new body>" --json
 tdo start <id>                     # mark as doing
 tdo done <id> -m "<what fixed it>" # also: drop <id> -m "<why>", reopen <id>
 ```
