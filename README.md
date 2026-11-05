@@ -1,5 +1,7 @@
 # tdo
 
+<img src="assets/tdo.svg" alt="tdo — a checked box" width="64" height="64">
+
 **A per-project backlog for the things you'll fix later.**
 
 You're halfway through a change and notice a flaky test, a slow config loader, a helper with a misleading name. None of it belongs in this commit, and all of it is gone from your head by tomorrow. `tdo` is the place to put it: one command to park an item, scoped to the repo you're in, and still there when you come back — on any machine.
@@ -186,7 +188,7 @@ After `e`, `p`, `x`, or `d` the picker reopens, so you can triage several items 
 
 The Pi picker shows at most 200 active items. If more match, its title shows `200+` and a warning points to `tdo ls -n 0` (or `tdo ls -a -n 0` across projects) and the CLI browser for the complete backlog.
 
-The footer shows `tdo 4 (2!) ▸ #3 login test flakes on CI` — open items, how many are urgent or high, and the item this session is working on. The focus survives `/reload` and session resume, and clears itself once the item is closed or deleted. It refreshes after each agent run, so items the agent adds or closes through the CLI show up right away.
+The footer shows `☑ 4 (2!) ▸ #3 login test flakes on CI` — open items, how many are urgent or high, and the item this session is working on. The checkbox is the terminal counterpart of the [tdo icon](assets/tdo.svg): a plain Unicode glyph (U+2611), with no Nerd Font or terminal image support required. The focus survives `/reload` and session resume, and clears itself once the item is closed or deleted. It refreshes after each agent run, so items the agent adds or closes through the CLI show up right away. An empty backlog hides the status; a store error shows `☑ unavailable` instead of a stale count.
 
 ## How projects are identified
 
