@@ -263,6 +263,13 @@ function dbCommand(args: string[], dbPath: string, io: CliIO, json: boolean): nu
   throw new UsageError("usage: tdo db use <target> | tdo db check");
 }
 
+/** Recovery actions must also offer closed items; ordinary push only offers active ones. */
+function pickerDefaultStatus(command: string, values: { attach?: string; detach?: boolean }): StatusFilter {
+  if (command === "reopen") return "closed";
+  if (command === "push" && (values.detach || values.attach)) return "all";
+  return "active";
+}
+
 export function run(argv: string[], io: Io): number {
   const { values, positionals } = parseArgs({ args: argv, options: OPTIONS, allowPositionals: true, strict: true });
   const [command = io.interactive && !values.json ? "browse" : "ls", ...args] = positionals;
@@ -329,7 +336,7 @@ export function run(argv: string[], io: Io): number {
     if (refs.length) return refs.map(find);
     const pick = io.pick ?? fzfPick(io.env);
     if (!pick) throw new UsageError(`tdo ${command} needs an item id (or install fzf and run it in a terminal to pick one).`);
-    const status = parseStatusFilter(values.status ?? (command === "reopen" ? "closed" : command === "push" && (values.detach || values.attach) ? "all" : "active"));
+    const status = parseStatusFilter(values.status ?? pickerDefaultStatus(command, values));
     const items = db.call("listItems", { project: all ? undefined : project().key, status, limit: 5000 }).sort((a, b) => (all ? a.project.localeCompare(b.project) : 0) || byStatusThenPriority(a, b));
     if (!items.length) throw new Error(`nothing to pick from${all ? "" : ` in ${project().key}`}.`);
     const self = [process.execPath, ...process.execArgv, process.argv[1] ?? "tdo", "--db", dbPath, "--project", project().key].map(shellQuote).join(" ");

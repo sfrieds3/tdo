@@ -173,6 +173,21 @@ test("commands pick with fzf when the id is left out", () => {
   assert.throws(() => harness()("show"), /needs an item id \(or install fzf/);
 });
 
+test("push recovery picker includes closed items and respects explicit status filters", () => {
+  let offered;
+  const tdo = harness({ pick: (lines) => { offered = lines.map((line) => line.split("\t")[0]); return []; } });
+  tdo("add", "active");
+  tdo("add", "closed");
+  tdo("done", "2");
+  // Detach works without a tracker config; cancelling stops before any mutation.
+  assert.throws(() => tdo("push", "--detach"), (error) => error.constructor.name === "Cancelled");
+  assert.deepEqual(offered, [`${PROJECT}#1`, `${PROJECT}#2`]);
+  assert.throws(() => tdo("push", "--detach", "-s", "active"), (error) => error.constructor.name === "Cancelled");
+  assert.deepEqual(offered, [`${PROJECT}#1`]);
+  assert.throws(() => tdo("reopen", "-s", "active"), (error) => error.constructor.name === "Cancelled");
+  assert.deepEqual(offered, [`${PROJECT}#1`]);
+});
+
 test("edit without flags round-trips title and body through the editor", () => {
   let seen;
   let reply = "renamed\n\nwhy it matters\n";

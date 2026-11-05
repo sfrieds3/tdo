@@ -408,6 +408,14 @@ test("formatters render lines, detail, and markdown", () => {
   assert.equal(tdo.formatItemLine(item, { showProject: true }), "widgets#1  high    Fix it  #ci  @ a.ts:1");
   assert.match(tdo.formatItemDetail(item), /priority: high[\s\S]*\n\nwhy$/);
   assert.equal(tdo.formatMarkdown([item]), `## github.com/example/widgets\n\n- [ ] #${item.id} Fix it (high #ci \`a.ts:1\`)\n`);
+  const notes = [
+    { seq: 1, createdAt: "2026-11-05T12:00:00.000Z", status: null, body: "first line\nsecond line" },
+    { seq: 2, createdAt: "2026-11-06T12:00:00.000Z", status: "done", body: "fixed it" },
+  ];
+  assert.equal(tdo.formatMarkdown([{ ...item, notes }]), `## github.com/example/widgets\n\n- [ ] #${item.id} Fix it (high #ci \`a.ts:1\`)\n  - 2026-11-05: first line second line\n  - 2026-11-06 done: fixed it\n`);
+  assert.equal(tdo.formatMarkdown([{ ...item, notes: undefined }]), tdo.formatMarkdown([item]));
+  assert.equal(tdo.formatMarkdown([]), "");
+  db.close();
 });
 
 test("grouped list renders bold project headers and per-project caps", () => {

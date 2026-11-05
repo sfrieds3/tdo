@@ -991,6 +991,10 @@ export function formatNote(note: Note): string {
   return [head + first, ...rest.map((line) => `${" ".repeat(head.length)}${line}`)].join("\n");
 }
 
+function formatMarkdownNotes(notes: Note[] = []): string[] {
+  return notes.map((note) => `  - ${note.createdAt.slice(0, 10)}${note.status ? ` ${note.status}` : ""}: ${note.body.replace(/\n/g, " ")}`);
+}
+
 export function formatMarkdown(items: Item[]): string {
   const byProject = new Map<string, Item[]>();
   for (const item of items) byProject.set(item.project, [...(byProject.get(item.project) ?? []), item]);
@@ -1001,7 +1005,7 @@ export function formatMarkdown(items: Item[]): string {
       const checked = item.status === "done" || item.status === "dropped" ? "x" : " ";
       const meta = [item.priority, ...item.tags.map((tag) => `#${tag}`), item.fileRef ? `\`${item.fileRef}\`` : "", item.status === "dropped" ? "dropped" : ""].filter(Boolean).join(" ");
       lines.push(`- [${checked}] #${item.id} ${item.title} (${meta})`);
-      for (const note of item.notes ?? []) lines.push(`  - ${note.createdAt.slice(0, 10)}${note.status ? ` ${note.status}` : ""}: ${note.body.replace(/\n/g, " ")}`);
+      lines.push(...formatMarkdownNotes(item.notes));
     }
     sections.push(lines.join("\n"));
   }
