@@ -571,3 +571,12 @@ test("Pi awaiting edit prompts from verified command target, not output IDs", as
   assert.equal(h.items()[0].links[0].state, "awaiting-approval");
   assert.equal(h.calls().length, 0);
 });
+
+
+test("Pi worker preserves a relative caller config path when session cwd differs", async (t) => {
+  const h = trackerHarness(t);
+  process.env.TDO_CONFIG = path.relative(process.cwd(), h.config);
+  await h.command.handler("relative config #issue", h.ctx);
+  assert.equal(h.items()[0].links[0].state, "open", JSON.stringify(h.notifications));
+  assert.equal(h.calls().filter((args) => args[1] === "create").length, 1);
+});
