@@ -9,27 +9,22 @@ import { DynamicBorder, type ExtensionAPI, type ExtensionContext } from "@earend
 import { Container, SelectList, Text, matchesKey, type KeyId, type SelectItem } from "@earendil-works/pi-tui";
 import {
   PRIORITIES,
-  addItem,
-  countActive,
-  deleteItem,
   formatItemDetail,
   formatItemLine,
   formatItemList,
   getDbPath,
-  getItem,
   itemRef,
-  listItems,
   loadConfig,
   openDb,
   parseQuickAdd,
   requirePriority,
   resolveProject,
-  setStatus,
-  updateItem,
   type Item,
   type ItemKey,
   type Project,
 } from "../src/core.ts";
+
+import { createAsyncStore, type Operation, type StoreOperations } from "../src/store.ts";
 
 const STATUS_KEY = "tdo";
 const FOCUS_ENTRY = "tdo-focus";
@@ -48,12 +43,23 @@ type Picked = { action: PickerAction; item: Item };
 
 type DbHandle = ReturnType<typeof openDb>;
 
+/** Legacy local-only helper for existing consumers; extension operations use callStore. */
 export function withDb<T>(fn: (db: DbHandle) => T, env: NodeJS.ProcessEnv = process.env): T {
   const db = openDb(getDbPath(env));
   try {
     return fn(db);
   } finally {
     db.close();
+  }
+}
+
+/** One short-lived store per operation; SSH calls never block Pi's event loop. */
+async function callStore<K extends Operation>(operation: K, ...args: StoreOperations[K]["args"]): Promise<StoreOperations[K]["result"]> {
+  const store = createAsyncStore();
+  try {
+    return await store.call(operation, ...args);
+  } finally {
+    store.close();
   }
 }
 
@@ -87,6 +93,9 @@ export default function tdoExtension(pi: ExtensionAPI) {
   const projects = new Map<string, Project>();
   /** The item this session is working on, restored from the session branch. */
   let focus: ItemKey | undefined;
+  let generation = 0;
+  let lifecycle = 0;
+  let stopped = false;
 
   function project(ctx: ExtensionContext): Project {
     const cwd = ctx.cwd || ctx.sessionManager.getCwd();
@@ -100,6 +109,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
 
   function setFocus(key: ItemKey | undefined): void {
     if (sameItem(focus, key)) return;
+    generation++;
     focus = key ? { projectId: key.projectId, id: key.id } : undefined;
     pi.appendEntry(FOCUS_ENTRY, focus ?? null);
   }
@@ -115,40 +125,50 @@ export default function tdoExtension(pi: ExtensionAPI) {
     }
   }
 
-  function refreshStatus(ctx: ExtensionContext): void {
-    if (!ctx.hasUI) return;
+  async function refreshStatus(ctx: ExtensionContext): Promise<void> {
+    if (!ctx.hasUI || stopped) return;
+    const current = ++generation;
+    const key = focus;
     try {
-      const { counts, focused } = withDb((db) => ({
-        counts: countActive(db, project(ctx).key),
-        focused: focus && getItem(db, focus),
-      }));
-      // Drop the focus once the item is closed (often by the agent through the CLI) or deleted.
-      if (focus && focused?.status !== "doing" && focused?.status !== "open") setFocus(undefined);
+      const projectKey = project(ctx).key;
+      const counts = await callStore("countActive", projectKey);
+      const focused = key ? await callStore("getItem", key) : undefined;
+      if (current !== generation || stopped) return;
+      // Only a successful lookup can invalidate the saved focus, never a transport error.
+      if (key && focused?.status !== "doing" && focused?.status !== "open") setFocus(undefined);
       const parts: string[] = [];
       const urgent = counts.urgent + counts.high;
       if (counts.total) parts.push(ctx.ui.theme.fg("muted", `tdo ${counts.total}${urgent ? ` (${urgent}!)` : ""}`));
       if (focus && focused) {
-        const ref = itemRef(focused, { showProject: focused.project !== project(ctx).key });
+        const ref = itemRef(focused, { showProject: focused.project !== projectKey });
         parts.push(ctx.ui.theme.fg("accent", `▸ ${ref} ${truncate(focused.title, FOCUS_TITLE_CHARS)}`));
       }
       ctx.ui.setStatus(STATUS_KEY, parts.length ? parts.join(" ") : undefined);
     } catch {
-      ctx.ui.setStatus(STATUS_KEY, undefined);
+      if (current === generation && !stopped) ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("muted", "tdo unavailable"));
     }
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    lifecycle++;
+    stopped = false;
+    generation++;
     projects.clear();
     restoreFocus(ctx);
-    refreshStatus(ctx);
+    await refreshStatus(ctx);
   });
   pi.on("session_tree", async (_event, ctx) => {
+    lifecycle++;
+    generation++;
     restoreFocus(ctx);
-    refreshStatus(ctx);
+    await refreshStatus(ctx);
   });
   // Agents change items through the CLI, so refresh after each run.
   pi.on("agent_end", async (_event, ctx) => refreshStatus(ctx));
   pi.on("session_shutdown", async (_event, ctx) => {
+    lifecycle++;
+    stopped = true;
+    generation++;
     if (ctx?.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
   });
 
@@ -191,9 +211,13 @@ export default function tdoExtension(pi: ExtensionAPI) {
     }, { blocked: { kind: "question", message: title } });
   }
 
-  function workOn(ctx: ExtensionContext, item: Item, showProject: boolean): void {
-    const started = withDb((db) => setStatus(db, item, "doing"));
+  async function workOn(ctx: ExtensionContext, item: Item, showProject: boolean): Promise<void> {
+    const current = lifecycle;
+    const started = await callStore("setStatus", item, "doing");
+    if (stopped || current !== lifecycle) return;
     setFocus(started);
+    await refreshStatus(ctx);
+    if (stopped || current !== lifecycle) return;
     const ref = itemRef(started, { showProject });
     const close = showProject ? `tdo done ${started.id} --project ${started.project}` : `tdo done ${started.id}`;
     const message = `Let's work on tdo item ${ref} (marked as doing). When it's fixed, close it with \`${close} -m "<what changed>"\`.\n\n${formatItemDetail(started)}`;
@@ -206,7 +230,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
     const ref = itemRef(item, { showProject });
     switch (action) {
       case "work":
-        workOn(ctx, item, showProject);
+        await workOn(ctx, item, showProject);
         return false;
       case "edit": {
         const text = await ctx.ui.editor(`Edit ${ref} — first line is the title, the rest is the body`, [item.title, item.body ? `\n${item.body}` : ""].join("\n").trimEnd());
@@ -216,22 +240,24 @@ export default function tdoExtension(pi: ExtensionAPI) {
           ctx.ui.notify("tdo: title must not be empty; nothing changed.", "warning");
           return true;
         }
-        withDb((db) => updateItem(db, item, { title, body }));
+        await callStore("updateItem", item, { title, body });
         return true;
       }
       case "priority": {
         const labels = PRIORITIES.map((priority) => (priority === item.priority ? `${priority} (current)` : priority));
         const picked = await ctx.ui.select(`Priority for ${ref}`, labels);
-        if (picked) withDb((db) => updateItem(db, item, { priority: requirePriority(picked.replace(/ \(current\)$/, "")) }));
+        if (picked) await callStore("updateItem", item, { priority: requirePriority(picked.replace(/ \(current\)$/, "")) });
         return true;
       }
       case "done":
-        withDb((db) => setStatus(db, item, "done"));
+        await callStore("setStatus", item, "done");
+        await refreshStatus(ctx);
         ctx.ui.notify(`tdo: done ${ref} ${item.title}`, "info");
         return true;
       case "delete":
         if (await ctx.ui.confirm(`Delete ${ref}?`, item.title)) {
-          withDb((db) => deleteItem(db, item));
+          await callStore("deleteItem", item);
+          await refreshStatus(ctx);
           ctx.ui.notify(`tdo: deleted ${ref} ${item.title}`, "info");
         }
         return true;
@@ -239,11 +265,13 @@ export default function tdoExtension(pi: ExtensionAPI) {
   }
 
   async function browse(ctx: ExtensionContext, allProjects: boolean): Promise<void> {
+    const epoch = lifecycle;
     const current = project(ctx);
     const header = allProjects ? "all projects" : current.key;
     let selected: ItemKey | undefined;
     for (;;) {
-      const items = withDb((db) => listItems(db, { project: allProjects ? undefined : current.key, limit: 200 }));
+      const items = await callStore("listItems", { project: allProjects ? undefined : current.key, limit: 200 });
+      if (stopped || epoch !== lifecycle) return;
       // Show project names whenever other projects are in view.
       const showProject = allProjects && items.some((item) => item.project !== current.key);
       if (!items.length) {
@@ -255,10 +283,11 @@ export default function tdoExtension(pi: ExtensionAPI) {
         return;
       }
       const picked = await pick(ctx, items, `tdo — ${header} (${items.length})`, showProject, selected);
-      if (!picked) return;
+      if (!picked || stopped || epoch !== lifecycle) return;
       selected = picked.item;
       const again = await act(ctx, picked, showProject);
-      refreshStatus(ctx);
+      if (stopped || epoch !== lifecycle) return;
+      await refreshStatus(ctx);
       if (!again) return;
     }
   }
@@ -274,9 +303,9 @@ export default function tdoExtension(pi: ExtensionAPI) {
         if (trimmed === "help") return ctx.ui.notify(HELP, "info");
         const quick = parseQuickAdd(trimmed);
         if (!quick.title) return ctx.ui.notify("tdo: add needs a title, e.g. /tdo fix flaky test !high #ci", "warning");
-        const item = withDb((db) => addItem(db, { project: project(ctx), title: quick.title, priority: quick.priority, tags: quick.tags, source: "user", sessionId: sessionId(ctx), host: hostName() }));
+        const item = await callStore("addItem", { project: project(ctx), title: quick.title, priority: quick.priority, tags: quick.tags, source: "user", sessionId: sessionId(ctx), host: hostName() });
+        await refreshStatus(ctx);
         ctx.ui.notify(`tdo: added ${formatItemLine(item)}`, "info");
-        refreshStatus(ctx);
       } catch (error) {
         ctx.ui.notify(`tdo: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
