@@ -9,6 +9,7 @@ import { DynamicBorder, type ExtensionAPI, type ExtensionContext } from "@earend
 import { Container, SelectList, Text, matchesKey, type KeyId, type SelectItem } from "@earendil-works/pi-tui";
 import {
   PRIORITIES,
+  editorText,
   formatItemDetail,
   formatItemLine,
   formatItemList,
@@ -16,6 +17,7 @@ import {
   itemRef,
   loadConfig,
   openDb,
+  parseEditorText,
   parseQuickAdd,
   requirePriority,
   resolveProject,
@@ -42,6 +44,8 @@ type PickerAction = "work" | (typeof PICKER_KEYS)[keyof typeof PICKER_KEYS];
 type Picked = { action: PickerAction; item: Item };
 
 type DbHandle = ReturnType<typeof openDb>;
+
+export { parseEditorText };
 
 /** Legacy local-only helper for existing consumers; extension operations use callStore. */
 export function withDb<T>(fn: (db: DbHandle) => T, env: NodeJS.ProcessEnv = process.env): T {
@@ -81,12 +85,6 @@ function keyString(key: ItemKey): string {
 
 function sameItem(a: ItemKey | undefined, b: ItemKey | undefined): boolean {
   return a === b || (!!a && !!b && a.projectId === b.projectId && a.id === b.id);
-}
-
-/** Splits editor text into a title (first line) and body (the rest). */
-export function parseEditorText(text: string): { title: string; body: string | null } {
-  const [first = "", ...rest] = text.replace(/\r\n/g, "\n").split("\n");
-  return { title: first.trim(), body: rest.join("\n").trim() || null };
 }
 
 export default function tdoExtension(pi: ExtensionAPI) {
@@ -233,7 +231,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
         await workOn(ctx, item, showProject);
         return false;
       case "edit": {
-        const text = await ctx.ui.editor(`Edit ${ref} — first line is the title, the rest is the body`, [item.title, item.body ? `\n${item.body}` : ""].join("\n").trimEnd());
+        const text = await ctx.ui.editor(`Edit ${ref} — first line is the title, the rest is the body`, editorText(item));
         if (text === undefined) return true;
         const { title, body } = parseEditorText(text);
         if (!title) {

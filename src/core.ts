@@ -386,7 +386,11 @@ export type Config = {
   db?: string;
   /** Maps a resolved project key to the key to use instead, e.g. a fork to its upstream. */
   aliases: Record<string, string>;
+  /** Items shown per project by `tdo ls -a`; 0 shows all. */
+  perProject?: number;
 };
+
+export const DEFAULT_PER_PROJECT = 5;
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): Config {
   const file = getConfigPath(env, home);
@@ -404,12 +408,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, home = os.homed
     throw new Error(`invalid JSON in ${file}: ${(error as Error).message}`);
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${file} must contain a JSON object.`);
-  const { db, aliases } = parsed as { db?: unknown; aliases?: unknown };
+  const { db, aliases, perProject } = parsed as { db?: unknown; aliases?: unknown; perProject?: unknown };
+  if (perProject !== undefined && !(Number.isInteger(perProject) && (perProject as number) >= 0)) throw new Error(`${file}: "perProject" must be a non-negative integer.`);
   if (db !== undefined && typeof db !== "string") throw new Error(`${file}: "db" must be a string.`);
   if (aliases !== undefined && (!aliases || typeof aliases !== "object" || Array.isArray(aliases) || Object.values(aliases).some((value) => typeof value !== "string" || !value.trim()))) {
     throw new Error(`${file}: "aliases" must map project keys to non-empty strings.`);
   }
-  return { db: db?.trim() ? expandHome(db.trim(), home) : undefined, aliases: { ...(aliases as Record<string, string> | undefined) } };
+  return {
+    db: db?.trim() ? expandHome(db.trim(), home) : undefined,
+    aliases: { ...(aliases as Record<string, string> | undefined) },
+    ...(perProject !== undefined ? { perProject: perProject as number } : {}),
+  };
 }
 
 /** Database path: `TDO_DB`, then the config's `db`, then `$XDG_DATA_HOME/tdo/tdo.db`. */
@@ -735,17 +744,79 @@ export function itemRef(item: Item, options: { showProject?: boolean } = {}): st
   return options.showProject ? `${nameFromKey(item.project)}#${item.id}` : `#${item.id}`;
 }
 
-export function formatItemLine(item: Item, options: { showProject?: boolean } = {}): string {
-  const parts = [itemRef(item, options), item.priority.padEnd(6)];
-  if (item.status !== "open") parts.push(`[${item.status}]`);
+const ANSI = { bold: [1, 22], dim: [2, 22], red: [31, 39], yellow: [33, 39], cyan: [36, 39] } as const;
+type Style = keyof typeof ANSI;
+
+function paint(text: string, color: boolean | undefined, ...styles: Style[]): string {
+  return color ? styles.reduce((out, style) => `\x1b[${ANSI[style][0]}m${out}\x1b[${ANSI[style][1]}m`, text) : text;
+}
+
+const PRIORITY_STYLE: Record<Priority, Style[]> = { urgent: ["red", "bold"], high: ["yellow"], normal: [], low: ["dim"] };
+
+export type FormatOptions = {
+  /** Prefix ids with the project name (`widgets#3`). */
+  showProject?: boolean;
+  /** Emit ANSI colors. */
+  color?: boolean;
+};
+
+export function formatItemLine(item: Item, options: FormatOptions = {}): string {
+  const { color } = options;
+  const parts = [paint(itemRef(item, options), color, "bold"), paint(item.priority, color, ...PRIORITY_STYLE[item.priority]) + " ".repeat(6 - item.priority.length)];
+  if (item.status !== "open") parts.push(paint(`[${item.status}]`, color, item.status === "doing" ? "cyan" : "dim"));
   parts.push(item.title);
-  if (item.tags.length) parts.push(item.tags.map((tag) => `#${tag}`).join(" "));
-  if (item.fileRef) parts.push(`@ ${item.fileRef}`);
+  if (item.tags.length) parts.push(paint(item.tags.map((tag) => `#${tag}`).join(" "), color, "cyan"));
+  if (item.fileRef) parts.push(paint(`@ ${item.fileRef}`, color, "dim"));
   return parts.join("  ");
 }
 
-export function formatItemList(items: Item[], options: { showProject?: boolean; empty?: string } = {}): string {
+export function formatItemList(items: Item[], options: FormatOptions & { empty?: string } = {}): string {
   return items.length ? items.map((item) => formatItemLine(item, options)).join("\n") : (options.empty ?? "(nothing here)");
+}
+
+const STATUS_RANK: Record<Status, number> = { doing: 0, open: 1, done: 2, dropped: 3 };
+
+/** Most urgent first; within a priority, doing before open, then oldest first. */
+export function byPriority(a: Item, b: Item): number {
+  return PRIORITIES.indexOf(a.priority) - PRIORITIES.indexOf(b.priority)
+    || STATUS_RANK[a.status] - STATUS_RANK[b.status]
+    || a.createdAt.localeCompare(b.createdAt)
+    || a.id - b.id;
+}
+
+/**
+ * Renders items grouped by project under a bold header, most urgent first, showing at most
+ * `perProject` items per project (0 = all). Projects with the most urgent items come first.
+ */
+export function formatGroupedList(items: Item[], options: { perProject?: number; color?: boolean; empty?: string } = {}): string {
+  if (!items.length) return options.empty ?? "(nothing here)";
+  const { color } = options;
+  const perProject = options.perProject ?? DEFAULT_PER_PROJECT;
+  const groups = new Map<string, Item[]>();
+  for (const item of items) groups.set(item.project, [...(groups.get(item.project) ?? []), item]);
+  for (const group of groups.values()) group.sort(byPriority);
+  const ordered = [...groups.entries()].sort(([keyA, a], [keyB, b]) => byPriority(a[0]!, b[0]!) || b.length - a.length || keyA.localeCompare(keyB));
+  return ordered.map(([key, group]) => {
+    const urgent = group.filter((item) => item.priority === "urgent" || item.priority === "high").length;
+    const summary = `${group.length} item${group.length === 1 ? "" : "s"}${urgent ? `, ${urgent}!` : ""}`;
+    const header = `${paint(nameFromKey(key), color, "bold")}  ${paint(`${key} · ${summary}`, color, "dim")}`;
+    const shown = perProject > 0 ? group.slice(0, perProject) : group;
+    const lines = shown.map((item) => `  ${formatItemLine(item, { color })}`);
+    const hidden = group.length - shown.length;
+    if (hidden > 0) lines.push(paint(`  … ${hidden} more (tdo ls --project ${key})`, color, "dim"));
+    return [header, ...lines].join("\n");
+  }).join("\n\n");
+}
+
+/** Splits editor text into a title (first line) and body (the rest). */
+export function parseEditorText(text: string): { title: string; body: string | null } {
+  const [first = "", ...rest] = text.replace(/\r\n/g, "\n").split("\n");
+  return { title: first.trim(), body: rest.join("\n").trim() || null };
+}
+
+/** The editor text for an item: title, blank line, body. */
+export function editorText(item: Item): string {
+  return item.body ? `${item.title}\n\n${item.body}` : item.title;
 }
 
 export function formatItemDetail(item: Item): string {

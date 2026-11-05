@@ -83,6 +83,93 @@ test("SSH CLI full CRUD, FTS, metadata, project refs, tags, counts and exports u
   assert.ok(!fs.existsSync(path.join(h.dir, "injected")));
 });
 
+test("SSH grouped listings honor per-project caps, priority, filters and JSON", (t) => {
+  const h = harness(t);
+  fs.writeFileSync(h.env.TDO_CONFIG, JSON.stringify({ perProject: 1 }));
+  h.cli("add", "normal #ci");
+  h.cli("add", "urgent !urgent #ci");
+  h.cli("add", "other !high", "--project", "other/name");
+  const grouped = h.cli("ls", "-a").text;
+  assert.match(grouped, /urgent/);
+  assert.match(grouped, /1 more/);
+  assert.ok(grouped.indexOf("caller/project") < grouped.indexOf("other/name"));
+  assert.equal(h.cli("ls", "-a", "--json").json().length, 2);
+  assert.equal(h.cli("ls", "-a", "-n", "0", "--json").json().length, 3);
+  assert.deepEqual(h.cli("ls", "-a", "-t", "ci", "-p", "high", "--json").json().map((item) => item.title), ["urgent"]);
+  assert.throws(() => h.cli("ls", "-a", "--limit=-1"), /non-negative integer/);
+});
+
+test("SSH ID-less pickers and editor use selected --db including preview subprocesses", (t) => {
+  const h = harness(t);
+  h.cli("add", "first");
+  h.cli("add", "second");
+  const argv1 = process.argv[1];
+  process.argv[1] = script;
+  t.after(() => { process.argv[1] = argv1; });
+  const env = { ...h.env, TDO_DB: path.join(h.dir, "wrong.db") };
+  const out = [];
+  const io = { out: (text) => out.push(text), cwd: h.dir, env,
+    pick(lines, options) {
+      assert.equal(lines.length, 2);
+      assert.equal(options.multi, true);
+      assert.ok(options.preview.includes(h.target));
+      const preview = spawnSync(options.preview.replace("{1}", "caller/project#1"), { shell: true, encoding: "utf8", cwd: h.dir, env });
+      assert.equal(preview.status, 0, preview.stderr);
+      assert.match(preview.stdout, /first/);
+      return lines.map((line) => line.split("\t")[0]);
+    },
+  };
+  assert.equal(run(["--db", h.target, "start"], io), 0);
+  assert.equal(h.cli("count", "--json").json().doing, 2);
+  assert.equal(run(["--db", h.target, "edit", "1"], { ...io, edit: (text) => {
+    assert.equal(text, "first");
+    return "edited\n\nremote body";
+  } }), 0);
+  assert.equal(h.cli("show", "1", "--json").json().body, "remote body");
+  run(["--db", h.target, "edit", "1"], { ...io, edit: () => "edited" });
+  assert.equal(h.cli("show", "1", "--json").json().body, null);
+  assert.ok(!fs.existsSync(env.TDO_DB));
+});
+
+test("SSH browser subprocesses retain --db and helpers feed, toggle and update remote items", (t) => {
+  const h = harness(t);
+  h.cli("add", "current");
+  h.cli("add", "other", "--project", "other/name");
+  const argv1 = process.argv[1];
+  process.argv[1] = script;
+  t.after(() => { process.argv[1] = argv1; });
+  const env = { ...h.env, TDO_DB: path.join(h.dir, "wrong.db") };
+  let stateFile;
+  const code = run(["--db", h.target], { out() {}, cwd: h.dir, env, interactive: true,
+    runFzf(args, childEnv) {
+      const feed = args.find((arg) => arg.startsWith("--bind=start:reload(")).slice("--bind=start:reload(".length, -1);
+      stateFile = feed.match(/_fzf feed (.*)$/)[1];
+      const exec = (command) => {
+        const result = spawnSync(command, { shell: true, encoding: "utf8", cwd: h.dir, env: childEnv });
+        assert.equal(result.status, 0, result.stderr);
+        return result.stdout;
+      };
+      assert.ok(feed.includes(h.target));
+      assert.match(exec(feed), /current/);
+      assert.doesNotMatch(exec(feed), /other\/name/);
+      exec(feed.replace("_fzf feed", "_fzf toggle-all"));
+      assert.match(exec(feed), /other\/name#1/);
+      exec(feed.replace("_fzf feed", "_fzf raise") + " caller/project#1");
+      exec(feed.replace("_fzf feed", "_fzf lower") + " other/name#1");
+      const preview = args.find((arg) => arg.startsWith("--preview=")).slice("--preview=".length);
+      assert.match(exec(preview.replace("{1}", "caller/project#1")), /priority:.*high/);
+      exec(feed.replace("_fzf feed", "_fzf toggle-closed"));
+      assert.match(exec(feed.replace("_fzf feed", "_fzf header")), /open \+ closed/);
+      return 130;
+    },
+  });
+  assert.equal(code, 0);
+  assert.ok(!fs.existsSync(stateFile));
+  assert.equal(h.cli("show", "1", "--json").json().priority, "high");
+  assert.equal(h.cli("show", "name#1", "--json").json().priority, "low");
+  assert.ok(!fs.existsSync(env.TDO_DB));
+});
+
 test("async store is nonblocking and supports the same typed operations", async (t) => {
   const h = harness(t);
   const store = createAsyncStore(h.target, { env: h.env });
