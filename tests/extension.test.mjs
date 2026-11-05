@@ -161,6 +161,7 @@ test("/tdo picker keys edit, re-prioritize, close, and delete, then reopen the p
   assert.equal(h.byTitle("tidy logging").status, "done");
   assert.equal(h.byTitle("scratch idea"), undefined, "d deleted the selected item");
   assert.match(h.notifications.at(-1).message, /deleted #3 scratch idea/);
+  assert.equal(h.statuses.get("tdo"), "tdo 1 (1!)", "the footer drops the deleted item");
   assert.equal(h.sent.length, 0);
 });
 
@@ -470,7 +471,7 @@ test("Pi picker cannot consent on another project's behalf", async (t) => {
 function repoTracker(h) {
   execFileSync("git", ["init", "-q", h.dir]);
   fs.mkdirSync(path.join(h.dir, ".tdo"));
-  fs.writeFileSync(path.join(h.dir, ".tdo", "config.json"), JSON.stringify({ tracker: { provider: "github", mode: "auto-on-tag" } }));
+  fs.writeFileSync(path.join(h.dir, ".tdo", "config.json"), JSON.stringify({ project: PROJECT, tracker: { provider: "github", mode: "auto-on-tag" } }));
 }
 
 test("Pi project approval and item consent are separate, with exact config details and no filing on item refusal", async (t) => {
@@ -490,7 +491,7 @@ test("Pi project approval and item consent are separate, with exact config detai
 test("Pi revalidates changed repo approval and does not persist stale consent", async (t) => {
   let h;
   h = trackerHarness(t, { keys: [["g"], []], confirmations: [async () => {
-    fs.writeFileSync(path.join(h.dir, ".tdo", "config.json"), JSON.stringify({ tracker: { provider: "github", repo: "foreign/repo" } }));
+    fs.writeFileSync(path.join(h.dir, ".tdo", "config.json"), JSON.stringify({ project: PROJECT, tracker: { provider: "github", repo: "foreign/repo" } }));
     return true;
   }] });
   repoTracker(h);

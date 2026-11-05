@@ -130,9 +130,12 @@ async function finishItem(ctx: ExtensionContext, item: Item, valid: () => boolea
   ctx.ui.notify(`tdo: done ${displayRef(ctx, item)} ${item.title}`, "info");
   return true;
 }
-async function deleteItem(ctx: ExtensionContext, item: Item, valid: () => boolean): Promise<boolean> {
+async function deleteItem(ctx: ExtensionContext, item: Item, valid: () => boolean, refreshStatus: (ctx: ExtensionContext) => Promise<void>): Promise<boolean> {
   if (!await ctx.ui.confirm(`Delete ${displayRef(ctx, item)}?`, item.title) || !valid()) return true;
   await callStore("deleteItem", item);
+  if (!valid()) return false;
+  // Clears a deleted focus and drops the item from the footer counts.
+  await refreshStatus(ctx);
   if (!valid()) return false;
   ctx.ui.notify(`tdo: deleted ${displayRef(ctx, item)} ${item.title}`, "info");
   return true;
@@ -294,7 +297,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
       case "edit": return editItem(ctx, item, valid, trackerUi);
       case "priority": return changePriority(ctx, item, valid, trackerUi);
       case "done": return finishItem(ctx, item, valid, trackerUi);
-      case "delete": return deleteItem(ctx, item, valid);
+      case "delete": return deleteItem(ctx, item, valid, refreshStatus);
 
     }
   }

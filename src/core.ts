@@ -304,10 +304,27 @@ export function readRepoConfig(root: string): RepoConfig | undefined {
 
 function detectProject(cwd: string, env: NodeJS.ProcessEnv, home: string): Project {
   const top = git(cwd, ["rev-parse", "--show-toplevel"]);
-  const repoProject = top ? readRepoConfig(top)?.project : undefined;
-  if (env.TDO_PROJECT?.trim()) return { ...projectFromKey(env.TDO_PROJECT), root: top ?? path.resolve(cwd) };
-  if (!top) return { ...projectFromKey(`local:${homeRelative(path.resolve(cwd), home)}`), root: path.resolve(cwd) };
+  const forced = env.TDO_PROJECT?.trim();
+  if (forced) {
+    const project = projectFromKey(forced);
+    // The checkout's tracker config applies only when the override names this checkout's project.
+    let repoProject: string | undefined;
+    let repoError: unknown;
+    try { repoProject = top ? readRepoConfig(top)?.project : undefined; } catch (error) { repoError = error; }
+    const own = [checkoutProject(cwd, top, home).key, ...(repoProject ? [projectFromKey(repoProject).key] : [])];
+    if (!own.includes(project.key)) return project;
+    if (repoError) throw repoError;
+    return { ...project, root: top ?? path.resolve(cwd) };
+  }
+  if (!top) return checkoutProject(cwd, top, home);
+  const repoProject = readRepoConfig(top)?.project;
   if (repoProject) return { ...projectFromKey(repoProject), root: top };
+  return checkoutProject(cwd, top, home);
+}
+
+/** The project a checkout maps to without `.tdo/config.json`: `.tdo-project`, the git remote, or the path. */
+function checkoutProject(cwd: string, top: string | undefined, home: string): Project {
+  if (!top) return { ...projectFromKey(`local:${homeRelative(path.resolve(cwd), home)}`), root: path.resolve(cwd) };
   try {
     const override = fs.readFileSync(path.join(top, PROJECT_FILE), "utf8").split("\n")[0]?.trim();
     if (override) return { ...projectFromKey(override), root: top };

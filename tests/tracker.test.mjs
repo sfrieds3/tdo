@@ -657,6 +657,18 @@ test("TDO_PROJECT retains checkout tracker approval and rejects malformed repo c
   assert.match(h.cli("add", "must fail").error.message, /invalid JSON/);
 });
 
+test("TDO_PROJECT naming another project ignores this checkout's tracker config", (t) => {
+  const h = harness(t, { tracker: { provider: "github", mode: "auto-on-tag" } });
+  h.cli("tracker", "approve", "--yes");
+  h.env.TDO_PROJECT = "github.com/example/other";
+  const added = h.cli("add", "elsewhere #issue", "--json");
+  assert.equal(added.code, 0);
+  assert.deepEqual(added.json().links, [], "repo A's auto-on-tag doesn't apply to other/project");
+  fs.writeFileSync(path.join(h.repo, ".tdo", "config.json"), "{broken");
+  assert.equal(h.cli("ls").code, 0, "a malformed checkout config doesn't break an unrelated project");
+  assert.equal(h.creates().length, 0);
+});
+
 for (const command of ["done", "drop"]) {
   test(`auto-on-tag reconciles ${command} immediately without backposting old notes`, (t) => {
     const h = harness(t, { tracker: { provider: "github", mode: "auto-on-tag" } });
