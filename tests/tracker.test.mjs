@@ -678,17 +678,21 @@ for (const command of ["done", "drop"]) {
   });
 }
 
-test("auto pending no-sync then done shares a five-operation drain budget", (t) => {
+test("ordinary multi-item mutation creates at most one pending issue before bounded draining", (t) => {
   const h = harness(t, { tracker: { provider: "github", mode: "auto-on-tag" } });
   h.cli("tracker", "approve", "--yes");
   const ids = Array.from({ length: 6 }, (_, i) => String(h.cli("add", `pending ${i} #issue`, "--no-sync", "--json").json().id));
   const result = h.cli("done", ...ids, "-m", "pre-create note", "--json");
   assert.equal(result.code, 0);
   assert.equal(result.json().length, 6);
-  assert.equal(h.creates().length, 6);
-  assert.equal(h.calls().filter((call) => call.args[1] === "close").length, 5);
+  assert.equal(h.creates().length, 1);
+  assert.equal(h.calls().filter((call) => call.args[1] === "close").length, 1);
   assert.equal(h.calls().filter((call) => call.args[1] === "comment").length, 0);
   const links = ids.map((id) => h.cli("show", id, "--json").json().links[0]);
-  assert.equal(links.filter((link) => link.state === "closed").length, 5);
-  assert.equal(links.reduce((n, link) => n + link.queued, 0), 1);
+  assert.equal(links.filter((link) => link.state === "closed").length, 1);
+  assert.equal(links.filter((link) => link.state === "pending").length, 5);
+  assert.equal(h.cli("sync").code, 0);
+  assert.equal(h.creates().length, 6);
+  assert.equal(h.calls().filter((call) => call.args[1] === "close").length, 6);
+  assert.equal(h.calls().filter((call) => call.args[1] === "comment").length, 0);
 });

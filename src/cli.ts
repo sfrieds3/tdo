@@ -382,8 +382,10 @@ export function run(argv: string[], io: Io): number {
       return;
     }
     // This checkout cannot approve another project's repository configuration.
-    const refreshed = items.filter((item) => item.project === project().key).flatMap((item) => {
-      if (!item.links.some((link) => link.state === "pending")) return [item];
+    const currentItems = items.filter((item) => item.project === project().key);
+    const pending = currentItems.find((item) => item.links.some((link) => link.state === "pending"));
+    const refreshed = currentItems.flatMap((item) => {
+      if (item !== pending) return [item];
       try {
         const result = pushItem(db, item, resolution.tracker, { warn, env: io.env, noSync: true });
         if (result.error) warn(`tdo: ${result.error}`);
