@@ -173,7 +173,7 @@ In the picker:
 
 | Key | Action |
 |---|---|
-| `enter` | **Work on it**: marks it `doing` and hands it to the agent. With `"worktree": true` in the [config file](#configuration), the agent is asked to do the work in a new git worktree and branch it names itself. |
+| `enter` | **Work on it**: marks it `doing` and hands it to the agent. With `"worktree": true` in the [config file](#configuration), the agent is asked to do the work in a new git worktree (under the main checkout's `.worktrees/`) and branch it names itself. |
 | `e` | Edit in the editor: the first line is the title, the rest is the body. |
 | `p` | Change priority. |
 | `x` | Mark done. |
