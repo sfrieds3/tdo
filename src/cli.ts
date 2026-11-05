@@ -68,7 +68,7 @@ usage:
 
 browser keys (plain tdo, or tdo browse [-a] [-s all]):
   enter view · ctrl-e edit · ctrl-s start · ctrl-d done · ctrl-x drop · ctrl-r reopen
-  alt-up/alt-down priority · alt-d delete · ctrl-n add the query as an item
+  alt-up/alt-down priority · alt-d delete · alt-n add the query as an item
   ctrl-a all projects · ctrl-t include closed · tab marks several · esc quit
 
 options:
@@ -144,6 +144,9 @@ function onPath(name: string, env: NodeJS.ProcessEnv): boolean {
   return (env.PATH ?? "").split(path.delimiter).some((dir) => dir && fs.existsSync(path.join(dir, name)));
 }
 
+/** ctrl-n/ctrl-p always move the cursor, even when FZF_DEFAULT_OPTS (e.g. --history) rebinds them. */
+const CURSOR_BINDS = ["--bind=ctrl-n:down", "--bind=ctrl-p:up"];
+
 /** fzf over the items; reads its UI from /dev/tty, so stdin/stdout stay free for the item list and result. */
 function fzfPick(env: NodeJS.ProcessEnv): Interactive["pick"] | undefined {
   if (!process.stdin.isTTY || !process.stderr.isTTY || !onPath("fzf", env)) return undefined;
@@ -151,6 +154,7 @@ function fzfPick(env: NodeJS.ProcessEnv): Interactive["pick"] | undefined {
     const args = [
       "--ansi", "--delimiter=\t", "--with-nth=2..", "--no-sort", "--layout=reverse", "--height=60%",
       `--header=${header}`, `--preview=${preview}`, "--preview-window=right,55%,wrap",
+      ...CURSOR_BINDS,
       ...(multi ? ["--multi", "--bind=ctrl-a:toggle-all"] : []),
     ];
     const extra = env.TDO_FZF_OPTS?.trim();
@@ -514,7 +518,7 @@ export const BROWSE_KEYS: [string, string, string][] = [
   ["alt-up", "prio+", "execute-silent($T _fzf raise $S {+1})+reload($T _fzf feed $S)"],
   ["alt-down", "prio-", "execute-silent($T _fzf lower $S {+1})+reload($T _fzf feed $S)"],
   ["alt-d", "delete", "execute($T _fzf delete $S {+1})+reload($T _fzf feed $S)"],
-  ["ctrl-n", "add query", "execute-silent($T add {q})+clear-query+reload($T _fzf feed $S)"],
+  ["alt-n", "add query", "execute-silent($T add {q})+clear-query+reload($T _fzf feed $S)"],
   ["ctrl-a", "all projects", "execute-silent($T _fzf toggle-all $S)+reload($T _fzf feed $S)+transform-header($T _fzf header $S)"],
   ["ctrl-t", "closed", "execute-silent($T _fzf toggle-closed $S)+reload($T _fzf feed $S)+transform-header($T _fzf header $S)"],
 ];
@@ -533,6 +537,7 @@ export function browseArgs(tdo: string, stateFile: string, header: string, float
     "--prompt=tdo> ", `--header=${header}`, "--header-first",
     `--preview=${tdo} show {1}`, "--preview-window=right,50%,wrap",
     `--bind=start:reload(${expand("$T _fzf feed $S")})`,
+    ...CURSOR_BINDS,
     ...BROWSE_KEYS.map(([key, , action]) => `--bind=${key}:${expand(action)}`),
   ];
 }
