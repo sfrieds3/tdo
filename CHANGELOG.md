@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.0](https://github.com/sfrieds3/tdo/compare/v0.2.0...v0.3.0) (2026-11-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* per-project item ids and /tdo picker actions ([#4](https://github.com/sfrieds3/tdo/issues/4))
+
+### Features
+
+* fzf browser, fzf pickers, and grouped ls -a ([#6](https://github.com/sfrieds3/tdo/issues/6)) ([520b159](https://github.com/sfrieds3/tdo/commit/520b159773db0689f48d56fc69faf9bde9bd263c))
+* per-project item ids and /tdo picker actions ([#4](https://github.com/sfrieds3/tdo/issues/4)) ([a4e8495](https://github.com/sfrieds3/tdo/commit/a4e8495ada6f307e5250da831b40dc4580ea4317))
+* support SSH remote databases across CLI and Pi ([#7](https://github.com/sfrieds3/tdo/issues/7)) ([440097a](https://github.com/sfrieds3/tdo/commit/440097aa61f3d2ed8238ac59f2f1a0d472e47626))
+
 ## [0.2.0](https://github.com/sfrieds3/tdo/compare/v0.1.0...v0.2.0) (2026-11-03)
 
 
