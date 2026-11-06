@@ -5,12 +5,18 @@ on:
     branches: [main]
   pull_request:
   workflow_call:
+    inputs:
+      checkout_ref:
+        description: Immutable commit to test when called by release automation
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ inputs.checkout_ref || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -25,6 +31,9 @@ jobs:
         node: [22, 24, 26]
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          persist-credentials: false
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v6
         with:
@@ -41,7 +50,7 @@ jobs:
         run: |
           node src/cli.ts add "smoke test !high #ci"
           node src/cli.ts ls --json | node -e 'const items = JSON.parse(require("fs").readFileSync(0, "utf8")); if (items.length !== 1 || items[0].priority !== "high") process.exit(1)'
-          node src/cli.ts done 1
+          node src/cli.ts 'done' 1
 
   # Releases are versioned from commit messages, and PRs are squash-merged with the
   # PR title as the commit message, so titles must be conventional commits.
