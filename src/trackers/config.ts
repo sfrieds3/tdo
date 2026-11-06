@@ -2,7 +2,7 @@
  * Tracker configuration: the repo's committed `.tdo/config.json` `tracker` block, merged with the
  * user's `projects.<key>.tracker` overrides, normalized, and checked against the user's approval.
  */
-import { canonicalJson, normalizeTag, readRepoConfig, sha256, type Config, type Project } from "../core.ts";
+import { canonicalJson, normalizeTag, projectFromKey, readRepoConfig, sha256, type Config, type Item, type Project, type Status } from "../core.ts";
 
 export const PROVIDERS = ["github"] as const;
 export type Provider = (typeof PROVIDERS)[number];
@@ -29,9 +29,6 @@ export type EffectiveTracker = {
   /** Which source set each key, for `tracker status`. */
   sources: Partial<Record<keyof TrackerOverride, "repo" | "user">>;
 };
-
-/** Settings accepted now but only acted on by later versions. */
-export const INACTIVE_SETTINGS: readonly (keyof TrackerOverride)[] = ["mode", "tag"];
 
 export type TrackerResolution =
   | { kind: "none" }
@@ -172,4 +169,14 @@ export function setApproval(raw: Record<string, unknown>, projectKey: string, ha
   else delete projects[projectKey];
   const { projects: _previous, ...rest } = raw;
   return Object.keys(projects).length ? { ...rest, projects } : rest;
+}
+
+/** Foreign links need their own known user policy; approval hashes imply missing repository policy. */
+export function statusPolicy(item: Item, current: string, status: Status, resolution: TrackerResolution, config: Config): boolean {
+  if (item.project === current) return resolution.kind === "ok" ? resolution.tracker.closeOnDone : true;
+  if (status === "doing" || !item.links.some((link) => ["open", "closed"].includes(link.state))) return false;
+  const raw = config.projects?.[item.project]?.tracker;
+  const foreign = resolveTracker(projectFromKey(item.project), config);
+  if (raw && typeof raw === "object" && !("approved" in raw) && foreign.kind === "ok") return foreign.tracker.closeOnDone;
+  throw new Error(`${item.project}#${item.id}: tracker lifecycle policy is unknown; run from its project checkout or configure project tracker in your user config.`);
 }

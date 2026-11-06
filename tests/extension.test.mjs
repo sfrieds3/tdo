@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createRequire } from "node:module";
 import test from "node:test";
+import { execFileSync } from "node:child_process";
 
 const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
 const { createJiti } = requireFromPi("jiti");
@@ -12,7 +13,7 @@ const core = await import("../src/core.ts");
 
 const PROJECT = "github.com/example/widgets";
 
-function harness({ selections = [], keys = [], editorText, confirm = true } = {}) {
+function harness({ selections = [], keys = [], editorText, confirm = true, confirmations = [] } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tdo-ext-"));
   const dbPath = path.join(dir, "tdo.db");
   process.env.TDO_DB = dbPath;
@@ -20,6 +21,7 @@ function harness({ selections = [], keys = [], editorText, confirm = true } = {}
   process.env.XDG_CONFIG_HOME = path.join(dir, "config");
   const handlers = new Map();
   const notifications = [];
+  const dialogs = [];
   const statuses = new Map();
   const sent = [];
   const tools = [];
@@ -45,7 +47,7 @@ function harness({ selections = [], keys = [], editorText, confirm = true } = {}
       theme,
       async select(_title, options) { const next = selections.shift(); return typeof next === "function" ? next(options) : next; },
       async editor() { return editorText; },
-      async confirm() { return confirm; },
+      async confirm(title, message) { dialogs.push({ title, message }); const next = confirmations.length ? confirmations.shift() : confirm; return typeof next === "function" ? await next(title, message) : next; },
       // Drive the real picker component with queued keystrokes; an empty queue means esc.
       async custom(factory) {
         return new Promise((resolve) => {
@@ -63,11 +65,11 @@ function harness({ selections = [], keys = [], editorText, confirm = true } = {}
     },
   };
   extension.default(pi);
-  const emit = async (name, event = {}) => { for (const handler of handlers.get(name) || []) await handler(event, ctx); };
+  const emit = async (name, event = {}) => { let result; for (const handler of handlers.get(name) || []) result = await handler(event, ctx) ?? result; return result; };
   const items = () => { const db = core.openDb(dbPath); try { return core.listItems(db, { status: "all" }); } finally { db.close(); } };
   const addDirect = (input) => { const db = core.openDb(dbPath); try { return core.addItem(db, { project: PROJECT, ...input }); } finally { db.close(); } };
   const byTitle = (title) => items().find((item) => item.title === title);
-  return { dir, dbPath, tools, command, ctx, emit, items, byTitle, addDirect, notifications, statuses, sent, entries, pickerTitles };
+  return { dir, dbPath, tools, command, ctx, emit, items, byTitle, addDirect, notifications, statuses, sent, entries, pickerTitles, dialogs };
 }
 
 const DOWN = "\x1b[B";
@@ -145,9 +147,10 @@ else if (args === 'remote get-url origin') console.log('https://${PROJECT}.git')
   assert.equal(h.statuses.get("tdo"), "☑ 1 (1!)");
   assert.match(h.notifications.find((entry) => entry.message.includes("added"))?.message, /added #1/);
   await h.emit("agent_end");
-  assert.equal(fs.readFileSync(calls, "utf8").trim().split("\n").length, 3, "successful resolution stays cached");
+  assert.ok(fs.readFileSync(calls, "utf8").split("rev-parse --show-toplevel").length > 2, "later operations resolve fresh configuration rather than retaining stale consent context");
+  const beforeSession = fs.readFileSync(calls, "utf8").trim().split("\n").length;
   await h.emit("session_start");
-  assert.equal(fs.readFileSync(calls, "utf8").trim().split("\n").length, 6, "session start clears the cache");
+  assert.equal(fs.readFileSync(calls, "utf8").trim().split("\n").length, beforeSession + 3, "session start resolves fresh configuration");
 
   for (const transition of ["session_shutdown", "session_tree", "session_start"]) {
     fs.unlinkSync(release);
@@ -241,6 +244,7 @@ test("/tdo picker keys edit, re-prioritize, close, and delete, then reopen the p
   assert.equal(h.byTitle("tidy logging").status, "done");
   assert.equal(h.byTitle("scratch idea"), undefined, "d deleted the selected item");
   assert.match(h.notifications.at(-1).message, /deleted #3 scratch idea/);
+  assert.equal(h.statuses.get("tdo"), "☑ 1 (1!)", "the footer drops the deleted item");
   assert.equal(h.sent.length, 0);
 });
 
@@ -439,4 +443,287 @@ test("/tdo picker: config worktree asks the agent to work in a new worktree and 
   assert.equal(h.sent.length, 1);
   assert.ok(h.sent[0].text.includes(extension.WORKTREE_INSTRUCTION));
   assert.match(h.sent[0].text, /tdo done 1 -m/);
+});
+
+
+function trackerHarness(t, options = {}) {
+  const saved = { ...process.env };
+  const h = harness(options);
+  t.after(() => { process.env = saved; fs.rmSync(h.dir, { recursive: true, force: true }); });
+  h.config = path.join(process.env.XDG_CONFIG_HOME, "tdo", "config.json");
+  fs.mkdirSync(path.dirname(h.config), { recursive: true });
+  fs.writeFileSync(h.config, JSON.stringify({ projects: { [PROJECT]: { tracker: { provider: "github", mode: "auto-on-tag", closeOnDone: false } } } }));
+  const bin = path.join(h.dir, "bin");
+  fs.mkdirSync(bin);
+  h.log = path.join(h.dir, "gh.log");
+  process.env.GH_LOG = h.log;
+  process.env.PATH = `${bin}:${process.env.PATH}`;
+  fs.writeFileSync(path.join(bin, "gh"), `#!${process.execPath}
+const fs = require('node:fs');
+fs.appendFileSync(process.env.GH_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');
+if (process.argv[2] === 'auth') process.exit(0);
+if (process.argv[3] === 'create') console.log('https://github.com/example/widgets/issues/42');
+`, { mode: 0o755 });
+  h.calls = () => fs.existsSync(h.log) ? fs.readFileSync(h.log, "utf8").trim().split("\n").map(JSON.parse) : [];
+  h.awaiting = (title = "agent item") => {
+    const db = core.openDb(h.dbPath);
+    try { return core.addItem(db, { project: PROJECT, title, tags: ["issue"], source: "pi" }, { provider: "github", destination: PROJECT, tag: "issue", authorized: false }); }
+    finally { db.close(); }
+  };
+  return h;
+}
+const bashCall = (id, command) => ({ toolName: "bash", toolCallId: id, input: { command } });
+const bashResult = (id, command, text = "awaiting-approval") => ({ ...bashCall(id, command), content: [{ type: "text", text }], isError: false });
+
+test("Pi guard requires confirmation for supported flags and basic quoted subcommands", async (t) => {
+  const h = trackerHarness(t, { confirm: false });
+  const commands = ["tdo push 1", "tdo --json push 1", "tdo tracker approve --yes", "tdo tracker --yes approve", "tdo tracker --json approve --yes", `tdo 'tracker' --yes "approve"`, `tdo "push" 1`];
+  for (const command of commands) {
+    assert.equal((await h.emit("tool_call", bashCall(command, command))).block, true, command);
+    assert.equal(h.dialogs.at(-1).message, command);
+  }
+  assert.equal(h.dialogs.length, commands.length);
+  h.ctx.hasUI = false;
+  for (const command of commands) assert.equal((await h.emit("tool_call", bashCall(command, command))).block, true, command);
+  assert.equal(h.dialogs.length, commands.length, "no UI means no prompt or authorization");
+  h.ctx.hasUI = true;
+  h.ctx.ui.confirm = async () => { throw new Error("UI closed"); };
+  assert.equal((await h.emit("tool_call", bashCall("4", "tdo push 1"))).block, true);
+  assert.equal(await h.emit("tool_call", bashCall("5", "tdo ls")), undefined);
+});
+
+test("Pi footer counts awaiting including closed items, and does not repopulate after shutdown", async (t) => {
+  const h = trackerHarness(t);
+  const item = h.awaiting();
+  const db = core.openDb(h.dbPath); core.setStatus(db, item, "done"); db.close();
+  await h.emit("session_start");
+  assert.equal(h.statuses.get("tdo"), "1 awaiting");
+  await h.emit("session_shutdown");
+  await h.emit("agent_end");
+  assert.equal(h.statuses.get("tdo"), undefined);
+});
+
+test("Pi quick add uses human auto intent and async worker; editor/done reuse PR2 lifecycle with closeOnDone false", async (t) => {
+  const h = trackerHarness(t, { keys: [["e"], ["x"], []], editorText: "edited title\n\nnew body" });
+  let ticked = false;
+  const timer = setTimeout(() => { ticked = true; }, 0);
+  await h.command.handler("human #issue", h.ctx);
+  clearTimeout(timer);
+  assert.equal(ticked, true);
+  assert.equal(h.items()[0].links[0].state, "open", JSON.stringify(h.notifications));
+  await h.command.handler("", h.ctx);
+  assert.equal(h.items()[0].status, "done");
+  assert.equal(h.items()[0].links[0].queued, 0);
+  assert.equal(h.calls().filter((args) => args[1] === "create").length, 1);
+  assert.equal(h.calls().filter((args) => args[1] === "edit").length, 1);
+  assert.equal(h.calls().filter((args) => args[1] === "close").length, 0);
+});
+
+test("Pi agent result prompts only verified new matching awaiting items; output IDs are not authority", async (t) => {
+  const h = trackerHarness(t);
+  const command = 'tdo add "agent item #issue" --source pi --json';
+  await h.emit("tool_call", bashCall("add", command));
+  const item = h.awaiting();
+  await h.emit("tool_result", bashResult("add", command, '{"id":999,"links":[{"state":"awaiting-approval"}]}'));
+  assert.equal(h.items()[0].links[0].state, "open", JSON.stringify(h.notifications));
+  assert.match(h.dialogs[0].title, new RegExp(`File #${item.id}.*github.com/example/widgets`));
+  assert.equal(h.calls().filter((args) => args[1] === "create").length, 1);
+  await h.emit("tool_result", bashResult("add", command));
+  assert.equal(h.dialogs.length, 1);
+});
+
+test("Pi ignores forged results, existing awaiting items, foreign overrides, and noninteractive adds", async (t) => {
+  const h = trackerHarness(t);
+  h.awaiting();
+  await h.emit("tool_result", bashResult("forged", "tdo add anything"));
+  await h.emit("tool_call", bashCall("existing", 'tdo add "agent item #issue"'));
+  await h.emit("tool_result", bashResult("existing", 'tdo add "agent item #issue"'));
+  for (const command of ['cd elsewhere && tdo add other', 'tdo add other --db /tmp/other', 'tdo add other --project foreign', 'TDO_DB=x tdo add other', 'tdo add other -C elsewhere']) {
+    await h.emit("tool_call", bashCall(command, command));
+    await h.emit("tool_result", bashResult(command, command));
+  }
+  h.ctx.hasUI = false;
+  await h.command.handler("script #issue", h.ctx);
+  assert.equal(h.byTitle("script").links[0].state, "awaiting-approval");
+  assert.equal(h.dialogs.length, 0);
+  assert.equal(h.calls().length, 0);
+});
+
+test("Pi deduplicates concurrent result dialogs and revalidates item/config after confirmation", async (t) => {
+  const h = trackerHarness(t, { confirmations: [async () => {
+    const db = core.openDb(h.dbPath); core.updateItem(db, h.items()[0], { title: "changed while waiting" }); db.close();
+    return true;
+  }] });
+  const command = 'tdo add "agent item #issue"';
+  await h.emit("tool_call", bashCall("a", command));
+  await h.emit("tool_call", bashCall("b", command));
+  h.awaiting();
+  await Promise.all([h.emit("tool_result", bashResult("a", command)), h.emit("tool_result", bashResult("b", command))]);
+  assert.equal(h.dialogs.length, 1);
+  assert.equal(h.calls().length, 0);
+  assert.equal(h.items()[0].links[0].state, "awaiting-approval");
+});
+
+test("Pi picker cannot consent on another project's behalf", async (t) => {
+  const h = trackerHarness(t, { keys: [[DOWN, "g"], []] });
+  h.addDirect({ title: "here" });
+  h.addDirect({ project: "github.com/example/foreign", title: "foreign" });
+  await h.command.handler("--all", h.ctx);
+  assert.equal(h.dialogs.length, 0);
+  assert.equal(h.calls().length, 0);
+});
+
+
+function repoTracker(h) {
+  execFileSync("git", ["init", "-q", h.dir]);
+  fs.mkdirSync(path.join(h.dir, ".tdo"));
+  fs.writeFileSync(path.join(h.dir, ".tdo", "config.json"), JSON.stringify({ project: PROJECT, tracker: { provider: "github", mode: "auto-on-tag" } }));
+}
+
+test("Pi project approval and item consent are separate, with exact config details and no filing on item refusal", async (t) => {
+  const h = trackerHarness(t, { keys: [["g"], []], confirmations: [true, false] });
+  repoTracker(h);
+  h.awaiting();
+  await h.command.handler("", h.ctx);
+  assert.equal(h.dialogs.length, 2);
+  assert.match(h.dialogs[0].title, /Approve project/);
+  for (const detail of ["provider: github", `destination: ${PROJECT}`, "mode: auto-on-tag", "tag: #issue", "labels: none", "closeOnDone: false"]) assert.ok(h.dialogs[0].message.includes(detail), detail);
+  assert.match(h.dialogs[1].title, /File #1/);
+  assert.match(JSON.parse(fs.readFileSync(h.config)).projects[PROJECT].tracker.approved, /^sha256:/);
+  assert.equal(h.calls().length, 0);
+  assert.equal(h.items()[0].links[0].state, "awaiting-approval");
+});
+
+test("Pi revalidates changed repo approval and does not persist stale consent", async (t) => {
+  let h;
+  h = trackerHarness(t, { keys: [["g"], []], confirmations: [async () => {
+    fs.writeFileSync(path.join(h.dir, ".tdo", "config.json"), JSON.stringify({ project: PROJECT, tracker: { provider: "github", repo: "foreign/repo" } }));
+    return true;
+  }] });
+  repoTracker(h);
+  h.awaiting();
+  await h.command.handler("", h.ctx);
+  assert.equal(JSON.parse(fs.readFileSync(h.config)).projects[PROJECT].tracker.approved, undefined);
+  assert.equal(h.dialogs.length, 1);
+  assert.equal(h.calls().length, 0);
+});
+
+test("Pi confirmation names a link's persisted repo rather than the current config destination", async (t) => {
+  const h = trackerHarness(t, { keys: [["g"], []], confirm: false });
+  h.awaiting();
+  const config = JSON.parse(fs.readFileSync(h.config));
+  config.projects[PROJECT].tracker.repo = "other/repo";
+  fs.writeFileSync(h.config, JSON.stringify(config));
+  await h.command.handler("", h.ctx);
+  assert.match(h.dialogs[0].title, /github.com\/example\/widgets/);
+  assert.doesNotMatch(h.dialogs[0].title, /other\/repo/);
+  assert.equal(h.calls().length, 0);
+});
+
+test("Pi serializes guard dialogs and rejects confirmation after session navigation", async (t) => {
+  let release;
+  let inDialog = 0;
+  let maxDialogs = 0;
+  const h = trackerHarness(t, { confirmations: [async () => {
+    inDialog++; maxDialogs = Math.max(maxDialogs, inDialog);
+    await new Promise((resolve) => { release = resolve; });
+    inDialog--; return true;
+  }, async () => { inDialog++; maxDialogs = Math.max(maxDialogs, inDialog); inDialog--; return true; }] });
+  const first = h.emit("tool_call", bashCall("a", "tdo push 1"));
+  const second = h.emit("tool_call", bashCall("b", "tdo tracker approve"));
+  while (!release) await new Promise((resolve) => setTimeout(resolve, 1));
+  await h.emit("session_tree");
+  release();
+  assert.equal((await first).block, true);
+  assert.equal((await second).block, true);
+  assert.equal(maxDialogs, 1);
+  assert.equal(h.dialogs.length, 1);
+});
+
+test("Pi linked done drains asynchronously and tracker failures never fail the local mutation", async (t) => {
+  const h = trackerHarness(t, { keys: [["x"], []] });
+  const config = JSON.parse(fs.readFileSync(h.config)); config.projects[PROJECT].tracker.closeOnDone = true;
+  fs.writeFileSync(h.config, JSON.stringify(config));
+  await h.command.handler("human #issue", h.ctx);
+  const gh = path.join(h.dir, "bin", "gh");
+  fs.writeFileSync(gh, `#!${process.execPath}\nconsole.error('network offline'); process.exit(1);\n`, { mode: 0o755 });
+  await h.command.handler("", h.ctx);
+  const [item] = h.items();
+  assert.equal(item.status, "done");
+  assert.equal(item.links[0].queued, 1);
+  assert.ok(h.notifications.some((note) => note.message.includes("local change saved")));
+  assert.ok(h.notifications.some((note) => note.message.includes("done #1")));
+});
+
+test("Pi RPC quick-add cannot manufacture human provenance even when dialogs are available", async (t) => {
+  const h = trackerHarness(t);
+  h.ctx.mode = "rpc";
+  await h.command.handler("rpc item #issue", h.ctx);
+  const [item] = h.items();
+  assert.equal(item.links[0].state, "awaiting-approval");
+  const db = core.openDb(h.dbPath);
+  assert.equal(db.prepare("SELECT created_by_human AS human FROM items WHERE id = ?").get(item.id).human, 0);
+  db.close();
+  assert.equal(h.calls().length, 0);
+});
+
+test("Pi awaiting edit prompts from verified command target, not output IDs", async (t) => {
+  const h = trackerHarness(t, { confirm: false });
+  const item = h.addDirect({ title: "existing agent", source: "pi" });
+  const command = `tdo edit ${item.id} -t issue --json`;
+  await h.emit("tool_call", bashCall("edit", command));
+  const db = core.openDb(h.dbPath);
+  core.updateItem(db, item, { addTags: ["issue"] }, { provider: "github", destination: PROJECT, tag: "issue", authorized: true });
+  db.close();
+  await h.emit("tool_result", bashResult("edit", command, '{"id":999,"links":[{"state":"awaiting-approval"}]}'));
+  assert.equal(h.dialogs.length, 1);
+  assert.match(h.dialogs[0].title, /File #1/);
+  assert.equal(h.items()[0].links[0].state, "awaiting-approval");
+  assert.equal(h.calls().length, 0);
+});
+
+
+test("Pi worker preserves a relative caller config path when session cwd differs", async (t) => {
+  const h = trackerHarness(t);
+  process.env.TDO_CONFIG = path.relative(process.cwd(), h.config);
+  await h.command.handler("relative config #issue", h.ctx);
+  assert.equal(h.items()[0].links[0].state, "open", JSON.stringify(h.notifications));
+  assert.equal(h.calls().filter((args) => args[1] === "create").length, 1);
+});
+
+for (const policy of [true, false, undefined, "approval-only", "invalid"]) {
+  test(`Pi foreign linked done respects user lifecycle policy: ${policy}`, async (t) => {
+    const h = trackerHarness(t, { keys: [["x"], []] });
+    const foreign = "github.com/example/foreign";
+    const item = h.addDirect({ project: foreign, title: "foreign linked" });
+    const db = core.openDb(h.dbPath);
+    core.attachLink(db, item, "github", foreign, "7", "url");
+    db.close();
+    const config = JSON.parse(fs.readFileSync(h.config));
+    if (policy !== undefined) config.projects[foreign] = { tracker: policy === "approval-only" ? { provider: "github", approved: "missing-repo-hash" } : policy === "invalid" ? { provider: "oops" } : { provider: "github", closeOnDone: policy } };
+    fs.writeFileSync(h.config, JSON.stringify(config));
+    await h.command.handler("--all", h.ctx);
+    const saved = h.items()[0];
+    const known = typeof policy === "boolean";
+    assert.equal(saved.status, known ? "done" : "open");
+    assert.equal(saved.links[0].queued, policy === true ? 1 : 0);
+    if (!known) assert.match(h.notifications.at(-1).message, /policy is unknown/);
+    assert.equal(h.calls().length, 0, "foreign links never drain under checkout approval");
+  });
+}
+
+test("Pi unknown foreign policy allows doing and nonlinked done", async (t) => {
+  const h = trackerHarness(t, { keys: [[ENTER], [DOWN, "x"], []] });
+  const foreign = "github.com/example/foreign";
+  const linked = h.addDirect({ project: foreign, title: "linked" });
+  const db = core.openDb(h.dbPath);
+  core.attachLink(db, linked, "github", foreign, "7", "url");
+  db.close();
+  await h.command.handler("--all", h.ctx);
+  assert.equal(h.items()[0].status, "doing");
+  assert.equal(h.items()[0].links[0].queued, 0);
+  const other = h.addDirect({ project: "github.com/example/plain", title: "unlinked", priority: "urgent" });
+  await h.command.handler("--all", h.ctx);
+  assert.equal(h.items().find((item) => item.projectId === other.projectId).status, "done");
+  assert.equal(h.calls().length, 0);
 });

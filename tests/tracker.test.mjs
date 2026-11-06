@@ -580,3 +580,131 @@ test("unknown foreign linked lifecycle policy refuses the entire selection befor
   core.updateConfig((raw) => ({ ...raw, projects: { ...raw.projects, [foreign.project]: { tracker: { provider: "github", approved: "repo-hash" } } } }), h.env);
   assert.match(h.cli("done", "other#1").error.message, /policy is unknown/, "a repo approval cannot reconstruct missing repository policy");
 });
+
+test("auto-on-tag requires immutable human provenance, a human current command, and approval", (t) => {
+  const h = harness(t, { tracker: { provider: "github", mode: "auto-on-tag" } });
+  const unapproved = h.cli("add", "unapproved #issue", "--json").json();
+  assert.equal(unapproved.links[0].state, "awaiting-approval");
+  assert.equal(h.creates().length, 0);
+  assert.equal(h.cli("tracker", "approve", "--yes").code, 0);
+  const human = h.cli("add", "human #issue", "--json").json();
+  assert.equal(h.cli("show", String(human.id), "--json").json().links[0].state, "open");
+  const agent = h.cli("add", "agent", "--source", "pi", "--json").json();
+  const edited = h.cli("edit", String(agent.id), "-t", "issue", "--json").json();
+  assert.equal(edited.links[0].state, "awaiting-approval");
+  const humanLater = h.cli("add", "human later", "--json").json();
+  assert.equal(h.cli("edit", String(humanLater.id), "-t", "issue", "--source", "pi", "--json").json().links[0].state, "awaiting-approval");
+  h.cli("edit", String(unapproved.id), "--title", "human cannot promote awaiting");
+  h.cli("sync");
+  assert.equal(h.creates().length, 1);
+  assert.deepEqual(h.cli("ls", "--awaiting", "--json").json().map((item) => item.id), [unapproved.id, agent.id, humanLater.id]);
+  h.cli("done", String(agent.id), "-m", "local only");
+  h.cli("sync");
+  assert.equal(h.creates().length, 1);
+  const db = core.openDb(h.env.TDO_DB);
+  assert.equal(db.prepare("SELECT created_by_human AS human FROM items WHERE id = ?").get(agent.id).human, 0);
+  db.close();
+});
+
+test("auto intent is atomic with add/edit, no-sync saves authorized pending, and sync ignores awaiting", (t) => {
+  const h = harness(t, { tracker: { provider: "github", mode: "auto-on-tag" } });
+  h.cli("tracker", "approve", "--yes");
+  const item = h.cli("add", "deferred #issue", "--no-sync", "--json").json();
+  assert.equal(item.links[0].state, "pending");
+  assert.equal(item.links[0].destination, KEY);
+  assert.equal(h.creates().length, 0);
+  h.cli("sync");
+  assert.equal(h.creates().length, 1);
+  const db = core.openDb(h.env.TDO_DB);
+  const intent = { provider: "github", destination: KEY, tag: "issue", authorized: true };
+  db.exec("CREATE TRIGGER fail_auto BEFORE INSERT ON links BEGIN SELECT RAISE(ABORT, 'intent failed'); END");
+  assert.throws(() => core.addItem(db, { project: KEY, title: "rollback", tags: ["issue"], createdByHuman: true }, intent), /intent failed/);
+  assert.equal(core.listItems(db, { query: "rollback" }).length, 0);
+  const target = core.addItem(db, { project: KEY, title: "edit target", createdByHuman: true });
+  assert.throws(() => core.updateItem(db, target, { title: "changed", addTags: ["issue"] }, intent), /intent failed/);
+  assert.equal(core.getItem(db, target).title, "edit target");
+  assert.deepEqual(core.getItem(db, target).tags, []);
+  db.close();
+});
+
+test("auto-on-tag noninteractive and invalid/disabled config never sends; failure preserves local JSON success", (t) => {
+  const h = harness(t, { tracker: { provider: "github", mode: "auto-on-tag" }, mode: "fail" });
+  h.cli("tracker", "approve", "--yes");
+  const out = [];
+  const code = run(["add", "script #issue", "--json"], { out: (text) => out.push(text), err() {}, cwd: h.repo, env: h.env, tty: false });
+  assert.equal(code, 0);
+  assert.equal(JSON.parse(out.join("\n")).links[0].state, "awaiting-approval");
+  const failed = h.cli("add", "local survives #issue", "--json");
+  assert.equal(failed.code, 0);
+  const saved = h.cli("show", String(failed.json().id), "--json").json();
+  assert.equal(saved.links[0].state, "unknown");
+  h.cli("edit", String(saved.id), "--title", "still unknown");
+  h.cli("sync");
+  assert.equal(h.creates().length, 1);
+  fs.writeFileSync(path.join(h.repo, ".tdo", "config.json"), JSON.stringify({ tracker: { provider: "oops", mode: "auto-on-tag" } }));
+  assert.deepEqual(h.cli("add", "invalid #issue", "--json").json().links, []);
+  assert.equal(h.creates().length, 1);
+});
+
+test("TDO_PROJECT retains checkout tracker approval and rejects malformed repo config", (t) => {
+  const h = harness(t, { tracker: { provider: "github", mode: "auto-on-tag" } });
+  h.env.TDO_PROJECT = KEY;
+  assert.equal(h.cli("add", "env tagged #issue", "--json").json().links[0].state, "awaiting-approval");
+  assert.equal(h.cli("tracker", "approve", "--yes").code, 0);
+  assert.equal(h.cli("add", "env authorized #issue", "--json").code, 0);
+  assert.equal(h.creates().length, 1);
+  fs.writeFileSync(path.join(h.repo, ".tdo", "config.json"), "{broken");
+  assert.match(h.cli("add", "must fail").error.message, /invalid JSON/);
+});
+
+test("TDO_PROJECT naming another project ignores this checkout's tracker config", (t) => {
+  const h = harness(t, { tracker: { provider: "github", mode: "auto-on-tag" } });
+  h.cli("tracker", "approve", "--yes");
+  h.env.TDO_PROJECT = "github.com/example/other";
+  const added = h.cli("add", "elsewhere #issue", "--json");
+  assert.equal(added.code, 0);
+  assert.deepEqual(added.json().links, [], "repo A's auto-on-tag doesn't apply to other/project");
+  fs.writeFileSync(path.join(h.repo, ".tdo", "config.json"), "{broken");
+  assert.equal(h.cli("ls").code, 0, "a malformed checkout config doesn't break an unrelated project");
+  assert.equal(h.creates().length, 0);
+});
+
+for (const command of ["done", "drop"]) {
+  test(`auto-on-tag reconciles ${command} immediately without backposting old notes`, (t) => {
+    const h = harness(t, { tracker: { provider: "github", mode: "auto-on-tag" } });
+    h.cli("tracker", "approve", "--yes");
+    const item = h.cli("add", "closed later", "--json").json();
+    h.cli("note", String(item.id), "historical note");
+    h.cli(command, String(item.id), "-m", "historical status note");
+    const edited = h.cli("edit", String(item.id), "-t", "issue", "--json");
+    assert.equal(edited.code, 0);
+    assert.equal(edited.json().id, item.id);
+    const saved = h.cli("show", String(item.id), "--json").json();
+    assert.equal(saved.links[0].state, "closed");
+    assert.equal(saved.links[0].queued, 0);
+    const closes = h.calls().filter((call) => call.args[1] === "close");
+    assert.equal(closes.length, 1);
+    assert.ok(closes[0].args.includes(command === "done" ? "completed" : "not planned"));
+    assert.equal(h.calls().filter((call) => call.args[1] === "comment").length, 0);
+    assert.doesNotMatch(h.creates()[0].input, /historical/);
+  });
+}
+
+test("ordinary multi-item mutation creates at most one pending issue before bounded draining", (t) => {
+  const h = harness(t, { tracker: { provider: "github", mode: "auto-on-tag" } });
+  h.cli("tracker", "approve", "--yes");
+  const ids = Array.from({ length: 6 }, (_, i) => String(h.cli("add", `pending ${i} #issue`, "--no-sync", "--json").json().id));
+  const result = h.cli("done", ...ids, "-m", "pre-create note", "--json");
+  assert.equal(result.code, 0);
+  assert.equal(result.json().length, 6);
+  assert.equal(h.creates().length, 1);
+  assert.equal(h.calls().filter((call) => call.args[1] === "close").length, 1);
+  assert.equal(h.calls().filter((call) => call.args[1] === "comment").length, 0);
+  const links = ids.map((id) => h.cli("show", id, "--json").json().links[0]);
+  assert.equal(links.filter((link) => link.state === "closed").length, 1);
+  assert.equal(links.filter((link) => link.state === "pending").length, 5);
+  assert.equal(h.cli("sync").code, 0);
+  assert.equal(h.creates().length, 6);
+  assert.equal(h.calls().filter((call) => call.args[1] === "close").length, 6);
+  assert.equal(h.calls().filter((call) => call.args[1] === "comment").length, 0);
+});

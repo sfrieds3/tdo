@@ -4,11 +4,15 @@
  * Agents (Pi, Claude Code, Codex, ...) use the `tdo` CLI through the bundled skill
  * (skills/tdo/SKILL.md), so this extension has no model-facing tool of its own.
  */
+import { statusPolicy } from "../src/trackers/config.ts";
+import { autoIntent, isHumanCommand } from "../src/trackers/auto.ts";
+import { createTrackerUi, registerTrackerEvents, trackerForItem, trackerContext } from "./tracker.ts";
 import * as os from "node:os";
 import { DynamicBorder, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, SelectList, Text, matchesKey, type KeyId, type SelectItem } from "@earendil-works/pi-tui";
 import {
   PRIORITIES,
+  canonicalJson,
   editorText,
   formatItemDetail,
   formatItemLine,
@@ -26,7 +30,7 @@ import {
   type Project,
 } from "../src/core.ts";
 
-import { createAsyncStore, type Operation, type StoreOperations } from "../src/store.ts";
+import { callStore } from "./store.ts";
 
 const STATUS_KEY = "tdo";
 /** Text counterpart of assets/tdo.svg (U+2611); no Nerd Font or image protocol needed. */
@@ -41,12 +45,12 @@ export const NO_IDS_INSTRUCTION = "Don't put tdo ids (#3, tdo#3, name#3) in comm
 const ALL_ARGS = new Set(["all", "--all", "-a"]);
 const HELP = [
   "/tdo — pick an item in this project (--all or all: every project)",
-  "  enter work on it · e edit · p priority · x done · d delete · esc close",
+  "  enter work on it · e edit · p priority · x done · d delete · g Push to GitHub (current project tracker) · esc close",
   "/tdo <title> [!urgent|!high|!low] [#tag] — add",
 ].join("\n");
 
 /** Picker keys, beyond enter (work on it) and esc. */
-export const PICKER_KEYS = { e: "edit", p: "priority", x: "done", d: "delete" } as const;
+export const PICKER_KEYS = { g: "push", e: "edit", p: "priority", x: "done", d: "delete" } as const;
 type PickerAction = "work" | (typeof PICKER_KEYS)[keyof typeof PICKER_KEYS];
 type Picked = { action: PickerAction; item: Item };
 
@@ -61,16 +65,6 @@ export function withDb<T>(fn: (db: DbHandle) => T, env: NodeJS.ProcessEnv = proc
     return fn(db);
   } finally {
     db.close();
-  }
-}
-
-/** One short-lived store per operation; SSH calls never block Pi's event loop. */
-async function callStore<K extends Operation>(operation: K, ...args: StoreOperations[K]["args"]): Promise<StoreOperations[K]["result"]> {
-  const store = createAsyncStore();
-  try {
-    return await store.call(operation, ...args);
-  } finally {
-    store.close();
   }
 }
 
@@ -94,6 +88,62 @@ function sameItem(a: ItemKey | undefined, b: ItemKey | undefined): boolean {
   return a === b || (!!a && !!b && a.projectId === b.projectId && a.id === b.id);
 }
 
+function intent(ctx: ExtensionContext, itemProject?: string) {
+  const state = trackerContext(ctx);
+  if (itemProject && itemProject !== state.project.key) return undefined;
+  return autoIntent(state.resolution.kind === "ok" ? state.resolution.tracker : undefined, isHumanCommand(ctx.hasUI && ctx.mode !== "rpc", "user"));
+}
+function closeOnDone(ctx: ExtensionContext, item: Item, status: "done" | "doing"): boolean {
+  const current = trackerContext(ctx);
+  return statusPolicy(item, current.project.key, status, current.resolution, loadConfig());
+}
+
+function displayRef(ctx: ExtensionContext, item: Item): string {
+  return itemRef(item, { showProject: item.project !== trackerContext(ctx).project.key });
+}
+
+type TrackerUi = ReturnType<typeof createTrackerUi>;
+async function editItem(ctx: ExtensionContext, item: Item, valid: () => boolean, trackerUi: TrackerUi): Promise<boolean> {
+  const text = await ctx.ui.editor(`Edit ${displayRef(ctx, item)} — first line is the title, the rest is the body`, editorText(item));
+  if (text === undefined || !valid()) return true;
+  const { title, body } = parseEditorText(text);
+  if (!title) {
+    ctx.ui.notify("tdo: title must not be empty; nothing changed.", "warning");
+    return true;
+  }
+  const updated = await callStore("updateItem", item, { title, body }, intent(ctx, item.project));
+  if (valid()) await trackerUi.afterMutation(ctx, updated);
+  return true;
+}
+async function changePriority(ctx: ExtensionContext, item: Item, valid: () => boolean, trackerUi: TrackerUi): Promise<boolean> {
+  const labels = PRIORITIES.map((priority) => (priority === item.priority ? `${priority} (current)` : priority));
+  const picked = await ctx.ui.select(`Priority for ${displayRef(ctx, item)}`, labels);
+  if (picked && valid()) {
+    const updated = await callStore("updateItem", item, { priority: requirePriority(picked.replace(/ \(current\)$/, "")) }, intent(ctx, item.project));
+    if (valid()) await trackerUi.afterMutation(ctx, updated);
+  }
+  return true;
+}
+
+async function finishItem(ctx: ExtensionContext, item: Item, valid: () => boolean, trackerUi: TrackerUi): Promise<boolean> {
+  const updated = await callStore("setStatus", item, "done", undefined, closeOnDone(ctx, item, "done"));
+  if (!valid()) return false;
+  await trackerUi.afterMutation(ctx, updated);
+  if (!valid()) return false;
+  ctx.ui.notify(`tdo: done ${displayRef(ctx, item)} ${item.title}`, "info");
+  return true;
+}
+async function deleteItem(ctx: ExtensionContext, item: Item, valid: () => boolean, refreshStatus: (ctx: ExtensionContext) => Promise<void>): Promise<boolean> {
+  if (!await ctx.ui.confirm(`Delete ${displayRef(ctx, item)}?`, item.title) || !valid()) return true;
+  await callStore("deleteItem", item);
+  if (!valid()) return false;
+  // Clears a deleted focus and drops the item from the footer counts.
+  await refreshStatus(ctx);
+  if (!valid()) return false;
+  ctx.ui.notify(`tdo: deleted ${displayRef(ctx, item)} ${item.title}`, "info");
+  return true;
+}
+
 export default function tdoExtension(pi: ExtensionAPI) {
   const projects = new Map<string, Promise<Project>>();
   /** The item this session is working on, restored from the session branch. */
@@ -101,19 +151,20 @@ export default function tdoExtension(pi: ExtensionAPI) {
   let generation = 0;
   let lifecycle = 0;
   let stopped = false;
+  const trackerUi = createTrackerUi(() => !stopped, () => lifecycle);
+  registerTrackerEvents(pi, trackerUi, () => !stopped, () => lifecycle, refreshStatus);
 
   function project(ctx: ExtensionContext): Promise<Project> {
     const cwd = ctx.cwd || ctx.sessionManager.getCwd();
-    let resolved = projects.get(cwd);
-    if (!resolved) {
-      resolved = resolveProjectAsync(cwd);
-      const pending = resolved;
-      void pending.catch(() => {
-        if (projects.get(cwd) === pending) projects.delete(cwd);
-      });
-      projects.set(cwd, resolved);
+    // Share in-flight I/O, but never retain settled project/tracker configuration across commands.
+    let pending = projects.get(cwd);
+    if (!pending) {
+      pending = resolveProjectAsync(cwd);
+      projects.set(cwd, pending);
+      const clear = () => { if (projects.get(cwd) === pending) projects.delete(cwd); };
+      void pending.then(clear, clear);
     }
-    return resolved;
+    return pending;
   }
 
   function setFocus(key: ItemKey | undefined): void {
@@ -141,6 +192,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
     try {
       const projectKey = (await project(ctx)).key;
       const counts = await callStore("countActive", projectKey);
+      const links = await callStore("countLinks", projectKey);
       const focused = key ? await callStore("getItem", key) : undefined;
       if (current !== generation || stopped) return;
       // Only a successful lookup can invalidate the saved focus, never a transport error.
@@ -148,6 +200,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
       const parts: string[] = [];
       const urgent = counts.urgent + counts.high;
       if (counts.total) parts.push(ctx.ui.theme.fg("muted", `${TDO_ICON} ${counts.total}${urgent ? ` (${urgent}!)` : ""}`));
+      if (links["awaiting-approval"]?.length) parts.push(ctx.ui.theme.fg("muted", `${links["awaiting-approval"]!.length} awaiting`));
       if (focus && focused) {
         const ref = itemRef(focused, { showProject: focused.project !== projectKey });
         parts.push(ctx.ui.theme.fg("accent", `▸ ${ref} ${truncate(focused.title, FOCUS_TITLE_CHARS)}`));
@@ -159,14 +212,15 @@ export default function tdoExtension(pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    projects.clear();
     lifecycle++;
     stopped = false;
     generation++;
-    projects.clear();
     restoreFocus(ctx);
     await refreshStatus(ctx);
   });
   pi.on("session_tree", async (_event, ctx) => {
+    projects.clear();
     lifecycle++;
     generation++;
     restoreFocus(ctx);
@@ -175,6 +229,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
   // Agents change items through the CLI, so refresh after each run.
   pi.on("agent_end", async (_event, ctx) => refreshStatus(ctx));
   pi.on("session_shutdown", async (_event, ctx) => {
+    projects.clear();
     lifecycle++;
     stopped = true;
     generation++;
@@ -199,12 +254,13 @@ export default function tdoExtension(pi: ExtensionAPI) {
       if (start > 0) list.setSelectedIndex(start);
       const finish = (action: PickerAction) => {
         const item = byKey.get(list.getSelectedItem()?.value ?? "");
+        if (action === "push" && (!item || !canPush(ctx, item))) return;
         if (item) done({ action, item });
       };
       list.onSelect = () => finish("work");
       list.onCancel = () => done(undefined);
       container.addChild(list);
-      container.addChild(new Text(theme.fg("dim", "↑↓ move · enter work on it · e edit · p priority · x done · d delete · esc close")));
+      container.addChild(new Text(theme.fg("dim", `↑↓ move · enter work on it · e edit · p priority · x done · d delete${items.some((item) => canPush(ctx, item)) ? " · g Push to GitHub" : ""} · esc close`)));
       container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
       return {
         capturesViewportInput: list.capturesViewportInput,
@@ -220,9 +276,15 @@ export default function tdoExtension(pi: ExtensionAPI) {
     }, { blocked: { kind: "question", message: title } });
   }
 
+  function canPush(ctx: ExtensionContext, item: Item): boolean {
+    return !!trackerForItem(ctx, item);
+  }
+
   async function workOn(ctx: ExtensionContext, item: Item, showProject: boolean): Promise<void> {
     const current = lifecycle;
-    const started = await callStore("setStatus", item, "doing");
+    const started = await callStore("setStatus", item, "doing", undefined, closeOnDone(ctx, item, "doing"));
+    if (stopped || current !== lifecycle) return;
+    await trackerUi.afterMutation(ctx, started);
     if (stopped || current !== lifecycle) return;
     setFocus(started);
     await refreshStatus(ctx);
@@ -237,40 +299,21 @@ export default function tdoExtension(pi: ExtensionAPI) {
 
   /** Runs a picker action; returns true when the picker should reopen. */
   async function act(ctx: ExtensionContext, { action, item }: Picked, showProject: boolean): Promise<boolean> {
-    const ref = itemRef(item, { showProject });
+    const stamp = lifecycle;
+    const context = canonicalJson(trackerContext(ctx));
+    const valid = () => !stopped && stamp === lifecycle && context === canonicalJson(trackerContext(ctx));
     switch (action) {
+      case "push":
+        if (canPush(ctx, item)) await trackerUi.push(ctx, item);
+        return true;
       case "work":
         await workOn(ctx, item, showProject);
         return false;
-      case "edit": {
-        const text = await ctx.ui.editor(`Edit ${ref} — first line is the title, the rest is the body`, editorText(item));
-        if (text === undefined) return true;
-        const { title, body } = parseEditorText(text);
-        if (!title) {
-          ctx.ui.notify("tdo: title must not be empty; nothing changed.", "warning");
-          return true;
-        }
-        await callStore("updateItem", item, { title, body });
-        return true;
-      }
-      case "priority": {
-        const labels = PRIORITIES.map((priority) => (priority === item.priority ? `${priority} (current)` : priority));
-        const picked = await ctx.ui.select(`Priority for ${ref}`, labels);
-        if (picked) await callStore("updateItem", item, { priority: requirePriority(picked.replace(/ \(current\)$/, "")) });
-        return true;
-      }
-      case "done":
-        await callStore("setStatus", item, "done");
-        await refreshStatus(ctx);
-        ctx.ui.notify(`tdo: done ${ref} ${item.title}`, "info");
-        return true;
-      case "delete":
-        if (await ctx.ui.confirm(`Delete ${ref}?`, item.title)) {
-          await callStore("deleteItem", item);
-          await refreshStatus(ctx);
-          ctx.ui.notify(`tdo: deleted ${ref} ${item.title}`, "info");
-        }
-        return true;
+      case "edit": return editItem(ctx, item, valid, trackerUi);
+      case "priority": return changePriority(ctx, item, valid, trackerUi);
+      case "done": return finishItem(ctx, item, valid, trackerUi);
+      case "delete": return deleteItem(ctx, item, valid, refreshStatus);
+
     }
   }
 
@@ -320,6 +363,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
       return matches.length > 0 ? matches : null;
     },
     handler: async (args, ctx) => {
+      const stamp = lifecycle;
       const trimmed = args.trim();
       try {
         if (!trimmed) return await browse(ctx, false);
@@ -327,16 +371,18 @@ export default function tdoExtension(pi: ExtensionAPI) {
         if (trimmed === "help") return ctx.ui.notify(HELP, "info");
         const quick = parseQuickAdd(trimmed);
         if (!quick.title) return ctx.ui.notify("tdo: add needs a title, e.g. /tdo fix flaky test !high #ci", "warning");
-        const epoch = lifecycle;
         const session = sessionId(ctx);
         const current = await project(ctx);
-        if (stopped || epoch !== lifecycle) return;
-        const item = await callStore("addItem", { project: current, title: quick.title, priority: quick.priority, tags: quick.tags, source: "user", sessionId: session, host: hostName(), createdByHuman: true });
-        if (stopped || epoch !== lifecycle) return;
+        if (stopped || stamp !== lifecycle) return;
+        const item = await callStore("addItem", { project: current, title: quick.title, priority: quick.priority, tags: quick.tags, source: "user", sessionId: session, host: hostName(), createdByHuman: isHumanCommand(ctx.hasUI && ctx.mode !== "rpc", "user") }, intent(ctx));
+        if (stopped || stamp !== lifecycle) return;
+        await trackerUi.afterMutation(ctx, item);
+        if (stopped || stamp !== lifecycle) return;
         await refreshStatus(ctx);
-        if (stopped || epoch !== lifecycle) return;
+        if (stopped || stamp !== lifecycle) return;
         ctx.ui.notify(`tdo: added ${formatItemLine(item)}`, "info");
       } catch (error) {
+        if (stopped || stamp !== lifecycle) return;
         ctx.ui.notify(`tdo: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
     },

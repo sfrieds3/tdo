@@ -115,7 +115,7 @@ Status notes (`tdo done 3 -m "fixed the empty-file case"`) and standalone notes 
 
 ### GitHub issues
 
-This version supports **manual filing and one-way lifecycle sync** (tdo → GitHub). Issues are created only by an explicit push; auto-on-tag and Pi filing actions are not active yet. Install and authenticate the [GitHub CLI](https://cli.github.com/) (`gh auth login`) on the machine where you run tdo. With an SSH database, `gh` still runs locally, never through the database helper.
+This version supports **manual filing, auto-on-tag, and one-way lifecycle sync** (tdo → GitHub). Only selected items become issues. Install and authenticate the [GitHub CLI](https://cli.github.com/) (`gh auth login`) on the machine where you run tdo. With an SSH database, `gh` still runs locally, never through the database helper.
 
 Commit a tracker block in `.tdo/config.json` at the repository root:
 
@@ -162,7 +162,9 @@ To keep tracker settings private, put them under `projects.<project-key>.tracker
 }
 ```
 
-User settings override individual repository settings; labels replace the whole list. A tracker defined only in your user config needs no approval. Set that project's `"tracker": false` to disable it. Defaults are `mode: "manual"`, `tag: "issue"`, `labels: []`, and `closeOnDone: true`. `closeOnDone` controls close/reopen delivery. `mode: "auto-on-tag"` and `tag` are accepted and included in approval, but **auto-filing is not active yet**. `tracker status` calls out these inactive settings.
+User settings override individual repository settings; labels replace the whole list. A tracker defined only in your user config needs no approval. Set that project's `"tracker": false` to disable it. Defaults are `mode: "manual"`, `tag: "issue"`, `labels: []`, and `closeOnDone: true`. `closeOnDone` controls close/reopen delivery. `mode: "auto-on-tag"` enables filing when an add or edit leaves the item carrying `tag` (default `#issue`). The item must have been created by a human (TTY plus source `cli`/`user`), the current command must also be human, and the effective tracker must be approved. Otherwise the link is saved as `awaiting-approval`, never created by `sync`; explicitly push it to consent. A human edit does not change an agent-created item’s provenance. Authorized `--no-sync` creates stay `pending` for a later sync. Existing awaiting/error/unknown links are never auto-promoted. Removing the tag does not detach a link.
+
+`tdo ls --awaiting` filters awaiting links (use `-s all` to include closed items). In Pi, the footer counts awaiting items; `/tdo` offers **g Push to GitHub** only for items in the current resolvable project. Filing requires explicit item consent, separately from project config approval. The extension also offers consent after verified agent adds/edits that became awaiting, and guards bash `tdo push`/`tdo tracker approve` calls with confirmation. Without UI these guarded calls fail closed. Shell recognition is best-effort: complex scripts or cwd/database/project overrides do not trigger post-result filing dialogs. Network work runs asynchronously on the caller, never in the database helper.
 
 A new issue contains the title and body, plus the file reference if present, without tdo identifiers or notes. Notes written before creation completes are never back-posted. Concurrent edits during creation are reconciled against the current item atomically; already-done/dropped items can be filed and are then closed when `closeOnDone` is true. Pushing an already-filed item returns its existing link rather than creating another issue. Existing links retain their original destination if configuration changes; `tracker status` lists destination and last-synced status mismatches.
 
@@ -301,7 +303,7 @@ Schema: `projects` has a UUID `id` and the project `key`; `items` is keyed by `(
 
 ### Upgrading for notes and GitHub issues
 
-**Compatibility break:** this feature uses schema v3 and SSH RPC v4. Update tdo on both the caller and database host to the same release before using an SSH database. Old helpers fail the protocol check; after updating the helper, an existing v2 remote database still requires an explicit `tdo migrate`. Local databases upgrade automatically on open, with a backup; use the commands below to preview first:
+**Compatibility break:** this feature uses schema v3 and SSH RPC v5. Update tdo on both the caller and database host to the same release before using an SSH database. Old helpers fail the protocol check; after updating the helper, an existing v2 remote database still requires an explicit `tdo migrate`. Local databases upgrade automatically on open, with a backup; use the commands below to preview first:
 
 ```sh
 tdo migrate --dry-run
@@ -328,7 +330,7 @@ Items are renumbered per project in their original order, so the oldest item in 
 
 ### SSH remote database
 
-Install a compatible version of `tdo` and Node 22.18+ on the server. The remote noninteractive shell must find `tdo` on `PATH`; use the same tdo release on both ends. Unlimited list/export support was introduced in RPC protocol v2, structured notes and issue filing in v3, and lifecycle queues in v4. This release requires v4: upgrade both ends together. Older helpers are rejected rather than allowed to silently apply the old row ceiling. Configure SSH keys/agent, host keys, and any jump hosts with your normal SSH setup first. No daemon, database file synchronization, or network-mounted SQLite file is needed.
+Install a compatible version of `tdo` and Node 22.18+ on the server. The remote noninteractive shell must find `tdo` on `PATH`; use the same tdo release on both ends. Unlimited list/export support was introduced in RPC protocol v2, structured notes and issue filing in v3, lifecycle queues in v4, and consent-aware automatic filing in v5. This release requires v5: upgrade both ends together. Older helpers are rejected rather than allowed to silently apply the old row ceiling. Configure SSH keys/agent, host keys, and any jump hosts with your normal SSH setup first. No daemon, database file synchronization, or network-mounted SQLite file is needed.
 
 ```sh
 tdo db use 'ssh://you@backlog-host/home/you/.local/share/tdo/tdo.db'

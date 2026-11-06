@@ -60,9 +60,18 @@ test(`${resolve.name} prefers env, repo config, override file, remote, then home
   assert.equal((await resolve(sub, { env, home, config: { aliases: { "repo/configured": "shared/backlog" } } })).key, "shared/backlog");
   fs.writeFileSync(repoConfig, JSON.stringify({ tracker: "validated by tracker commands only" }));
   assert.equal((await resolve(sub, { env, home, config: NO_CONFIG })).key, "example/custom");
+  for (const forced of ["example/custom", "repo/configured"]) {
+    fs.writeFileSync(repoConfig, JSON.stringify({ project: "repo/configured" }));
+    const own = await resolve(sub, { env: { TDO_PROJECT: forced }, home, config: NO_CONFIG });
+    assert.equal(own.key, forced);
+    assert.equal(fs.realpathSync(own.root), fs.realpathSync(repo), "own-project overrides retain the checkout tracker root");
+  }
+  const foreign = await resolve(sub, { env: { TDO_PROJECT: "foreign/project" }, home, config: NO_CONFIG });
+  assert.equal(foreign.root, undefined, "foreign-project overrides must not inherit checkout consent");
   fs.writeFileSync(repoConfig, "{ invalid");
   await assert.rejects(async () => resolve(sub, { env, home, config: NO_CONFIG }), /invalid JSON/);
   assert.equal((await resolve(sub, { env: { TDO_PROJECT: "forced" }, home, config: NO_CONFIG })).key, "forced");
+  await assert.rejects(async () => resolve(sub, { env: { TDO_PROJECT: "example/custom" }, home, config: NO_CONFIG }), /invalid JSON/);
   fs.writeFileSync(repoConfig, JSON.stringify({ project: " " }));
   await assert.rejects(async () => resolve(sub, { env, home, config: NO_CONFIG }), /non-empty string/);
   fs.rmSync(repoConfig);
