@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.6.0](https://github.com/sfrieds3/tdo/compare/v0.5.0...v0.6.0) (2026-11-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* add consent-aware auto-on-tag and Pi issue filing ([#18](https://github.com/sfrieds3/tdo/issues/18))
+* sync linked GitHub issue lifecycle through a durable queue ([#17](https://github.com/sfrieds3/tdo/issues/17))
+* add manual GitHub issue filing and structured notes ([#16](https://github.com/sfrieds3/tdo/issues/16))
+
+### Features
+
+* add consent-aware auto-on-tag and Pi issue filing ([#18](https://github.com/sfrieds3/tdo/issues/18)) ([6a0e6d2](https://github.com/sfrieds3/tdo/commit/6a0e6d2bbcd0d1aadf39852277035661d4cc9ef4))
+* add manual GitHub issue filing and structured notes ([#16](https://github.com/sfrieds3/tdo/issues/16)) ([d1a4380](https://github.com/sfrieds3/tdo/commit/d1a4380b821c45349f9cd66a2c47e9681e2b8689))
+* sync linked GitHub issue lifecycle through a durable queue ([#17](https://github.com/sfrieds3/tdo/issues/17)) ([fcdef16](https://github.com/sfrieds3/tdo/commit/fcdef16052d967c8335360f4f5f794af3ada329b))
+
 ## [0.5.0](https://github.com/sfrieds3/tdo/compare/v0.4.0...v0.5.0) (2026-11-06)
 
 
