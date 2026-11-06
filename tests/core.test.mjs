@@ -29,30 +29,72 @@ test("normalizeRemote maps ssh, scp, and https remotes to host/owner/repo", () =
   assert.equal(tdo.normalizeRemote(""), undefined);
 });
 
-test("resolveProject prefers env, override file, remote, then home-relative path", () => {
+for (const resolve of [tdo.resolveProject, tdo.resolveProjectAsync]) {
+test(`${resolve.name} prefers env, repo config, override file, remote, then home-relative path`, async (t) => {
   const home = tempDir();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const repo = path.join(home, "code", "widgets");
   fs.mkdirSync(repo, { recursive: true });
   const env = {};
-  assert.equal(tdo.resolveProject(repo, { env, home, config: NO_CONFIG }).key, "local:~/code/widgets");
+  assert.equal((await resolve(repo, { env, home, config: NO_CONFIG })).key, "local:~/code/widgets");
 
   git(repo, "init", "-q");
-  assert.equal(tdo.resolveProject(repo, { env, home, config: NO_CONFIG }).key, "local:~/code/widgets");
+  assert.equal((await resolve(repo, { env, home, config: NO_CONFIG })).key, "local:~/code/widgets");
 
   git(repo, "remote", "add", "upstream", "https://github.com/upstream/widgets.git");
   git(repo, "remote", "add", "origin", "git@github.com:example/widgets.git");
   const sub = path.join(repo, "src");
   fs.mkdirSync(sub);
-  const project = tdo.resolveProject(sub, { env, home, config: NO_CONFIG });
+  const project = await resolve(sub, { env, home, config: NO_CONFIG });
   assert.equal(project.key, "github.com/example/widgets");
   assert.equal(project.name, "widgets");
   assert.equal(fs.realpathSync(project.root), fs.realpathSync(repo));
 
   fs.writeFileSync(path.join(repo, ".tdo-project"), "example/custom\n");
-  assert.equal(tdo.resolveProject(sub, { env, home, config: NO_CONFIG }).key, "example/custom");
+  assert.equal((await resolve(sub, { env, home, config: NO_CONFIG })).key, "example/custom");
 
-  assert.equal(tdo.resolveProject(sub, { env: { TDO_PROJECT: "forced" }, home, config: NO_CONFIG }).key, "forced");
+  fs.mkdirSync(path.join(repo, ".tdo"));
+  const repoConfig = path.join(repo, tdo.REPO_CONFIG_FILE);
+  fs.writeFileSync(repoConfig, JSON.stringify({ project: "repo/configured" }));
+  assert.equal((await resolve(sub, { env, home, config: NO_CONFIG })).key, "repo/configured");
+  assert.equal((await resolve(sub, { env, home, config: { aliases: { "repo/configured": "shared/backlog" } } })).key, "shared/backlog");
+  fs.writeFileSync(repoConfig, JSON.stringify({ tracker: "validated by tracker commands only" }));
+  assert.equal((await resolve(sub, { env, home, config: NO_CONFIG })).key, "example/custom");
+  fs.writeFileSync(repoConfig, "{ invalid");
+  await assert.rejects(async () => resolve(sub, { env, home, config: NO_CONFIG }), /invalid JSON/);
+  assert.equal((await resolve(sub, { env: { TDO_PROJECT: "forced" }, home, config: NO_CONFIG })).key, "forced");
+  fs.writeFileSync(repoConfig, JSON.stringify({ project: " " }));
+  await assert.rejects(async () => resolve(sub, { env, home, config: NO_CONFIG }), /non-empty string/);
+  fs.rmSync(repoConfig);
+  fs.mkdirSync(repoConfig);
+  await assert.rejects(async () => resolve(sub, { env, home, config: NO_CONFIG }), /EISDIR/);
 });
+
+test(`${resolve.name} reads aliases and shares a local backlog across worktrees`, async (t) => {
+  const home = tempDir();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const repo = path.join(home, "repo");
+  const worktree = path.join(home, "worktree");
+  fs.mkdirSync(repo);
+  git(repo, "init", "-q");
+  git(repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "initial");
+  git(repo, "worktree", "add", "-qb", "test", worktree);
+  const env = { TDO_CONFIG: path.join(home, "config.json") };
+  const options = { env, home };
+  const main = await resolve(repo, options);
+  const linked = await resolve(worktree, options);
+  assert.equal(main.key, "local:~/repo");
+  assert.equal(linked.key, main.key);
+  assert.equal(fs.realpathSync(linked.root), fs.realpathSync(worktree));
+  fs.writeFileSync(env.TDO_CONFIG, JSON.stringify({ aliases: { [main.key]: "shared/backlog", forced: "shared/forced" } }));
+  assert.equal((await resolve(worktree, options)).key, "shared/backlog");
+  assert.equal((await resolve(repo, { ...options, env: { ...env, TDO_PROJECT: "forced" } })).key, "shared/forced");
+  fs.writeFileSync(env.TDO_CONFIG, "{ nope");
+  await assert.rejects(async () => resolve(repo, options), /invalid JSON/);
+  fs.writeFileSync(env.TDO_CONFIG, JSON.stringify({ aliases: { bad: 1 } }));
+  await assert.rejects(async () => resolve(repo, options), /"aliases" must map/);
+});
+}
 
 test("priority, tag, and quick-add parsing", () => {
   assert.equal(tdo.parsePriority("HIGH"), "high");
@@ -117,6 +159,18 @@ test("items can be added, listed, searched, updated, and closed", () => {
 
   assert.throws(() => tdo.addItem(db, { project, title: "   " }), /title must not be empty/);
   assert.throws(() => tdo.setStatus(db, { projectId: a.projectId, id: 999 }, "done"), /No tdo item #999/);
+});
+
+test("listItems accepts zero as unlimited and rejects invalid limits", () => {
+  const db = tdo.openDb(":memory:");
+  try {
+    for (let i = 0; i < 3; i++) tdo.addItem(db, { project: "test", title: `item ${i}` });
+    assert.equal(tdo.listItems(db, { limit: 0 }).length, 3);
+    assert.equal(tdo.listItems(db, { limit: 1 }).length, 1);
+    for (const limit of [-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "0"]) {
+      assert.throws(() => tdo.listItems(db, { limit }), /limit must be a non-negative safe integer/);
+    }
+  } finally { db.close(); }
 });
 
 test("item numbers are per project and never reused", () => {
@@ -427,7 +481,7 @@ test("grouped list renders bold project headers and per-project caps", () => {
   assert.equal(tdo.formatGroupedList(items, { perProject: 1 }), [
     "widgets  github.com/example/widgets · 2 items, 1!",
     "  #2  urgent  w-urgent",
-    "  … 1 more (tdo ls --project github.com/example/widgets)",
+    "  … 1 more (tdo ls --project github.com/example/widgets -n 0)",
     "",
     "gadgets  github.com/example/gadgets · 1 item, 1!",
     "  #1  high    g-high",

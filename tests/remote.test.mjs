@@ -5,8 +5,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import { run } from "../src/cli.ts";
-import { openDb, schemaVersion } from "../src/core.ts";
-import { createStore, createAsyncStore, parseTarget, handleRpc, MAX_RPC_BYTES } from "../src/store.ts";
+import { addItem, openDb, schemaVersion } from "../src/core.ts";
+import { createStore, createAsyncStore, parseTarget, handleRpc, MAX_RPC_BYTES, RPC_VERSION } from "../src/store.ts";
 
 const script = new URL("../src/cli.ts", import.meta.url).pathname;
 function harness(t) {
@@ -28,19 +28,20 @@ if (process.env.SSH_MODE === 'descendant') {
 if (process.env.SSH_MODE === 'fail') { console.error('offline'); process.exit(255); }
 if (process.env.SSH_MODE === 'bad') { console.log('not json'); process.exit(0); }
 if (process.env.SSH_MODE === 'version') { console.log(JSON.stringify({version:99,ok:true,result:{}})); process.exit(0); }
-if (process.env.SSH_MODE === 'shape') { console.log(JSON.stringify({version:2,ok:true,result:{}})); process.exit(0); }
+if (process.env.SSH_MODE === 'shape') { console.log(JSON.stringify({version:${RPC_VERSION},ok:true,result:{}})); process.exit(0); }
 if (process.env.SSH_MODE === 'large') { process.stdout.write('x'.repeat(9*1024*1024)); return; }
 const input = fs.readFileSync(0);
-const result = spawnSync(process.execPath, [process.env.TDO_HELPER, 'internal-rpc'], {input, encoding:'utf8', env:{...process.env,TDO_CONFIG:'/does-not-exist',TDO_DB:'/not-the-requested-db',TDO_PROJECT:'server-project'}});
-process.stdout.write(result.stdout || ''); process.stderr.write(result.stderr || ''); process.exit(result.status ?? 1);
+const result = spawnSync(process.execPath, [process.env.TDO_HELPER, 'internal-rpc'], {input, encoding:'utf8', maxBuffer:${MAX_RPC_BYTES}, env:{...process.env,TDO_CONFIG:'/does-not-exist',TDO_DB:'/not-the-requested-db',TDO_PROJECT:'server-project'}});
+process.stdout.write(result.stdout || ''); process.stderr.write(result.stderr || ''); process.exitCode = result.status ?? 1;
 `, { mode: 0o755 });
   const db = path.join(dir, "remote space;$(touch injected).db");
   const target = `ssh://alice@test-alias:2222${db.split("/").map(encodeURIComponent).join("/")}`;
   const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, SSH_LOG: log, TDO_HELPER: script, TDO_CONFIG: path.join(dir, "config.json"), TDO_DB: target, TDO_PROJECT: "caller/project", TDO_SOURCE: "agent", TDO_SESSION_ID: "session-1" };
   const cli = (...argv) => {
     const out = [];
-    const status = run(argv, { out: (text) => out.push(text), cwd: dir, env });
-    return { status, text: out.join("\n"), json: () => JSON.parse(out.join("\n")) };
+    const err = [];
+    const status = run(argv, { out: (text) => out.push(text), err: (text) => err.push(text), cwd: dir, env });
+    return { status, text: out.join("\n"), err: err.join("\n"), json: () => JSON.parse(out.join("\n")) };
   };
   return { dir, db, target, env, cli, log };
 }
@@ -97,6 +98,29 @@ test("SSH grouped listings honor per-project caps, priority, filters and JSON", 
   assert.equal(h.cli("ls", "-a", "-n", "0", "--json").json().length, 3);
   assert.deepEqual(h.cli("ls", "-a", "-t", "ci", "-p", "high", "--json").json().map((item) => item.title), ["urgent"]);
   assert.throws(() => h.cli("ls", "-a", "--limit=-1"), /non-negative integer/);
+});
+
+test("SSH unlimited lists and exports pass the old row ceiling and preserve diagnostics", async (t) => {
+  const h = harness(t);
+  const db = openDb(h.db);
+  try {
+    for (let i = 1; i <= 5001; i++) addItem(db, { project: "caller/project", title: `bulk ${i}` });
+  } finally { db.close(); }
+  const limited = h.cli("ls", "-n", "2", "--json");
+  assert.equal(limited.json().length, 2);
+  assert.match(limited.err, /more items/);
+  const unlimited = h.cli("ls", "-n", "0", "--json");
+  assert.equal(unlimited.json().length, 5001);
+  assert.equal(unlimited.err, "");
+  assert.equal(h.cli("export").json().length, 5001);
+  const store = createAsyncStore(h.target, { env: h.env });
+  try {
+    const items = await store.call("listItems", { limit: 0 });
+    assert.equal(items.length, 5001);
+    assert.equal(items.at(-1).title, "bulk 5001");
+    await assert.rejects(store.call("listItems", { limit: -1 }), /invalid arguments/);
+    await assert.rejects(store.call("getItemByNumber", "caller/project", 0), /invalid arguments/);
+  } finally { store.close(); }
 });
 
 test("SSH ID-less pickers and editor use selected --db including preview subprocesses", (t) => {
@@ -256,8 +280,8 @@ test("sync and async SSH operations enforce the overall timeout", async (t) => {
 
 test("helper validates closed protocol and args before opening a database", (t) => {
   const h = harness(t);
-  const request = { version: 2, path: h.db, operation: "listItems", args: [] };
-  for (const bad of ["not-json", JSON.stringify({ ...request, version: 1 }), JSON.stringify({ ...request, extra: true }), JSON.stringify({ ...request, path: "ssh://host/db" }), JSON.stringify({ ...request, operation: "exec", args: ["DROP TABLE items"] }), JSON.stringify({ ...request, args: [{ limit: "1; DROP TABLE items" }] }), JSON.stringify({ ...request, operation: "addItem", args: [{ project: {}, title: "bad" }] }), "x".repeat(MAX_RPC_BYTES + 1)]) {
+  const request = { version: RPC_VERSION, path: h.db, operation: "listItems", args: [] };
+  for (const bad of ["not-json", JSON.stringify({ ...request, version: 1 }), JSON.stringify({ ...request, version: 2 }), JSON.stringify({ ...request, extra: true }), JSON.stringify({ ...request, path: "ssh://host/db" }), JSON.stringify({ ...request, operation: "exec", args: ["DROP TABLE items"] }), JSON.stringify({ ...request, args: [{ limit: "1; DROP TABLE items" }] }), JSON.stringify({ ...request, operation: "addItem", args: [{ project: {}, title: "bad" }] }), "x".repeat(MAX_RPC_BYTES + 1)]) {
     assert.equal(JSON.parse(handleRpc(bad)).ok, false);
   }
   assert.ok(!fs.existsSync(h.db));
