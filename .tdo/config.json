@@ -1,0 +1,8 @@
+{
+  "tracker": {
+    "provider": "github",
+    "repo": "sfrieds3/tdo",
+    "mode": "auto-on-tag",
+    "tag": "issue"
+  }
+}
