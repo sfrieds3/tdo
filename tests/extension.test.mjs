@@ -96,7 +96,90 @@ test("footer count refreshes on session start and after agent runs", async () =>
   h.addDirect({ title: "Handle empty config", priority: "high" });
   h.addDirect({ title: "Tidy logging", priority: "low" });
   await h.emit("agent_end");
-  assert.equal(h.statuses.get("tdo"), "tdo 2 (1!)");
+  assert.equal(h.statuses.get("tdo"), "☑ 2 (1!)");
+});
+
+test("project resolution is nonblocking, awaited, and shared by concurrent extension calls", async (t) => {
+  const saved = { ...process.env };
+  const h = harness();
+  const bin = path.join(h.dir, "bin");
+  const marker = path.join(h.dir, "git-started");
+  const release = path.join(h.dir, "git-release");
+  const calls = path.join(h.dir, "git-calls");
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, "git"), `#!${process.execPath}
+const fs = require('node:fs');
+const args = process.argv.slice(4).join(' ');
+fs.appendFileSync(${JSON.stringify(calls)}, args + '\\n');
+if (args === 'rev-parse --show-toplevel') {
+  fs.writeFileSync(${JSON.stringify(marker)}, 'ready');
+  const timeout = setTimeout(() => process.exit(1), 2000);
+  const poll = setInterval(() => {
+    if (!fs.existsSync(${JSON.stringify(release)})) return;
+    clearInterval(poll); clearTimeout(timeout);
+    console.log(${JSON.stringify(h.dir)});
+  }, 10);
+} else if (args === 'remote') console.log('origin');
+else if (args === 'remote get-url origin') console.log('https://${PROJECT}.git');
+`, { mode: 0o755 });
+  delete process.env.TDO_PROJECT;
+  process.env.PATH = `${bin}:${process.env.PATH}`;
+  t.after(() => {
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+    Object.assign(process.env, saved);
+    fs.rmSync(h.dir, { recursive: true, force: true });
+  });
+  const status = h.emit("session_start");
+  const add = h.command.handler("await project !high", h.ctx);
+  const browse = h.command.handler("", h.ctx);
+  try {
+    for (let i = 0; i < 100 && !fs.existsSync(marker); i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(fs.existsSync(marker), "git has started while the event loop remains responsive");
+    assert.equal(h.statuses.size, 0, "footer waits for resolution");
+    assert.equal(h.notifications.length, 0, "commands wait for resolution");
+    assert.equal(fs.existsSync(h.dbPath), false, "no store operations before resolution");
+    assert.equal(fs.readFileSync(calls, "utf8"), "rev-parse --show-toplevel\n", "concurrent callers share one pending resolution");
+  } finally {
+    fs.writeFileSync(release, "go");
+    await Promise.all([status, add, browse]);
+  }
+  assert.equal(h.byTitle("await project").project, PROJECT);
+  assert.equal(h.statuses.get("tdo"), "☑ 1 (1!)");
+  assert.match(h.notifications.find((entry) => entry.message.includes("added"))?.message, /added #1/);
+  await h.emit("agent_end");
+  assert.ok(fs.readFileSync(calls, "utf8").split("rev-parse --show-toplevel").length > 2, "later operations resolve fresh configuration rather than retaining stale consent context");
+  const beforeSession = fs.readFileSync(calls, "utf8").trim().split("\n").length;
+  await h.emit("session_start");
+  assert.equal(fs.readFileSync(calls, "utf8").trim().split("\n").length, beforeSession + 3, "session start resolves fresh configuration");
+
+  for (const transition of ["session_shutdown", "session_tree", "session_start"]) {
+    fs.unlinkSync(release);
+    fs.unlinkSync(marker);
+    const refresh = h.emit("session_start");
+    const staleAdd = h.command.handler(`stale ${transition}`, h.ctx);
+    const staleBrowse = h.command.handler("", h.ctx);
+    for (let i = 0; i < 100 && !fs.existsSync(marker); i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(fs.existsSync(marker));
+    const changed = h.emit(transition);
+    fs.writeFileSync(release, "go");
+    await Promise.all([refresh, staleAdd, staleBrowse, changed]);
+    assert.equal(h.byTitle(`stale ${transition}`), undefined, "old commands must not write after a lifecycle change");
+  }
+});
+
+test("failed project resolution is evicted so commands can retry after config repair", async () => {
+  const h = harness();
+  const configDir = path.join(h.dir, "config", "tdo");
+  fs.mkdirSync(configDir, { recursive: true });
+  const config = path.join(configDir, "config.json");
+  fs.writeFileSync(config, "{ nope");
+  await h.command.handler("not saved", h.ctx);
+  assert.equal(h.notifications.at(-1).level, "error");
+  assert.match(h.notifications.at(-1).message, /invalid JSON/);
+  assert.equal(h.items().length, 0);
+  fs.writeFileSync(config, "{}");
+  await h.command.handler("saved after repair", h.ctx);
+  assert.equal(h.byTitle("saved after repair").project, PROJECT);
 });
 
 test("/tdo quick-adds with inline priority and tags", async () => {
@@ -109,7 +192,7 @@ test("/tdo quick-adds with inline priority and tags", async () => {
   assert.equal(item.source, "user");
   assert.equal(item.sessionId, "session-1");
   assert.match(h.notifications.at(-1).message, /^tdo: added #1/);
-  assert.equal(h.statuses.get("tdo"), "tdo 1 (1!)");
+  assert.equal(h.statuses.get("tdo"), "☑ 1 (1!)");
   // Old status verbs are gone from the command; they are just titles now.
   await h.command.handler("done later", h.ctx);
   assert.equal(h.byTitle("done later")?.status, "open");
@@ -129,18 +212,18 @@ test("/tdo picker: enter works on an item and shows it in the footer until it cl
   assert.match(h.sent[0].text, /Let's work on tdo item #1/);
   assert.match(h.sent[0].text, /tdo done 1 -m/);
   assert.doesNotMatch(h.sent[0].text, /worktree/);
-  assert.equal(h.statuses.get("tdo"), "tdo 2 (1!) ▸ #1 rename helpers");
+  assert.equal(h.statuses.get("tdo"), "☑ 2 (1!) ▸ #1 rename helpers");
 
   // A reload restores the focus from the session branch.
   await h.emit("session_start");
-  assert.equal(h.statuses.get("tdo"), "tdo 2 (1!) ▸ #1 rename helpers");
+  assert.equal(h.statuses.get("tdo"), "☑ 2 (1!) ▸ #1 rename helpers");
 
   // The agent closes it through the CLI; the footer drops the focus after the run.
   const db = core.openDb(process.env.TDO_DB);
   core.setStatus(db, h.byTitle("rename helpers"), "done");
   db.close();
   await h.emit("agent_end");
-  assert.equal(h.statuses.get("tdo"), "tdo 1 (1!)");
+  assert.equal(h.statuses.get("tdo"), "☑ 1 (1!)");
   assert.deepEqual(h.entries.at(-1), { type: "custom", customType: "tdo-focus", data: null });
 });
 
@@ -161,8 +244,31 @@ test("/tdo picker keys edit, re-prioritize, close, and delete, then reopen the p
   assert.equal(h.byTitle("tidy logging").status, "done");
   assert.equal(h.byTitle("scratch idea"), undefined, "d deleted the selected item");
   assert.match(h.notifications.at(-1).message, /deleted #3 scratch idea/);
-  assert.equal(h.statuses.get("tdo"), "tdo 1 (1!)", "the footer drops the deleted item");
+  assert.equal(h.statuses.get("tdo"), "☑ 1 (1!)", "the footer drops the deleted item");
   assert.equal(h.sent.length, 0);
+});
+
+test("Pi picker discloses overflow only when more than 200 items match", async () => {
+  const h = harness();
+  const db = core.openDb(h.dbPath);
+  try {
+    for (let i = 1; i <= 200; i++) core.addItem(db, { project: PROJECT, title: `item ${i}` });
+  } finally { db.close(); }
+  await h.command.handler("", h.ctx);
+  assert.equal(h.notifications.length, 0, "exactly 200 is complete");
+  assert.match(h.pickerTitles.at(-1), /\(200\)/);
+  h.addDirect({ title: "overflow" });
+  await h.command.handler("", h.ctx);
+  assert.equal(h.notifications.at(-1).level, "warning");
+  assert.match(h.notifications.at(-1).message, /first 200 active items.*tdo ls -n 0/);
+  assert.match(h.pickerTitles.at(-1), /\(200\+\)/);
+  await h.command.handler("--all", h.ctx);
+  assert.match(h.notifications.at(-1).message, /tdo ls -a -n 0/);
+  h.ctx.hasUI = false;
+  const before = h.notifications.length;
+  await h.command.handler("", h.ctx);
+  assert.equal(h.notifications[before].level, "warning", "non-UI browsing also discloses truncation");
+  assert.equal(h.notifications.at(-1).message.split("\n").length, 200);
 });
 
 test("/tdo --all browses every project with project-qualified ids", async () => {
@@ -224,12 +330,12 @@ test("SSH extension quick-add, footer, and work instructions await writes withou
   delete process.env.TDO_TEST_DELAY;
   assert.equal(h.byTitle("remote fix").priority, "high");
   assert.deepEqual(h.byTitle("remote fix").tags, ["ci"]);
-  assert.equal(h.statuses.get("tdo"), "tdo 1 (1!)");
+  assert.equal(h.statuses.get("tdo"), "☑ 1 (1!)");
   assert.match(h.notifications.at(-1).message, /added #1/);
   await h.command.handler("", h.ctx);
   assert.equal(h.byTitle("remote fix").status, "doing");
   assert.match(h.sent[0].text, /marked as doing/);
-  assert.equal(h.statuses.get("tdo"), "tdo 1 (1!) ▸ #1 remote fix");
+  assert.equal(h.statuses.get("tdo"), "☑ 1 (1!) ▸ #1 remote fix");
 });
 
 test("SSH picker edits, changes priority, closes and deletes through internal-rpc", async (t) => {
@@ -247,7 +353,7 @@ test("SSH picker edits, changes priority, closes and deletes through internal-rp
   assert.equal(edited.priority, "urgent");
   assert.equal(h.byTitle("close me").status, "done");
   assert.equal(h.byTitle("delete me"), undefined);
-  assert.equal(h.statuses.get("tdo"), "tdo 1 (1!)");
+  assert.equal(h.statuses.get("tdo"), "☑ 1 (1!)");
 });
 
 test("SSH failures preserve saved focus and recover; only a successful absent lookup clears it", async (t) => {
@@ -257,7 +363,7 @@ test("SSH failures preserve saved focus and recover; only a successful absent lo
   const entryCount = h.entries.length;
   process.env.TDO_TEST_FAIL = "1";
   await h.emit("agent_end");
-  assert.equal(h.statuses.get("tdo"), "tdo unavailable");
+  assert.equal(h.statuses.get("tdo"), "☑ unavailable");
   assert.equal(h.entries.length, entryCount);
   assert.equal(h.notifications.length, 0, "background refresh errors stay quiet");
   await h.command.handler("not saved", h.ctx);
@@ -267,7 +373,7 @@ test("SSH failures preserve saved focus and recover; only a successful absent lo
   assert.equal(h.entries.length, entryCount);
   process.env.TDO_TEST_FAIL = "getItem";
   await h.emit("agent_end");
-  assert.equal(h.statuses.get("tdo"), "tdo unavailable", "failed focus lookup is not an absent item");
+  assert.equal(h.statuses.get("tdo"), "☑ unavailable", "failed focus lookup is not an absent item");
   assert.equal(h.entries.length, entryCount);
   delete process.env.TDO_TEST_FAIL;
   await h.emit("agent_end");
@@ -317,9 +423,9 @@ test("older SSH refreshes cannot overwrite newer results or repopulate status af
   delete process.env.TDO_TEST_DELAY;
   h.addDirect({ title: "two" });
   await h.emit("agent_end");
-  assert.equal(h.statuses.get("tdo"), "tdo 2");
+  assert.equal(h.statuses.get("tdo"), "☑ 2");
   await old;
-  assert.equal(h.statuses.get("tdo"), "tdo 2");
+  assert.equal(h.statuses.get("tdo"), "☑ 2");
   process.env.TDO_TEST_DELAY = "150";
   const shutdownPending = h.emit("agent_end");
   await h.waitForResponse();

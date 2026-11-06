@@ -24,7 +24,7 @@ import {
   parseEditorText,
   parseQuickAdd,
   requirePriority,
-  resolveProject,
+  resolveProjectAsync,
   type Item,
   type ItemKey,
   type Project,
@@ -33,10 +33,13 @@ import {
 import { callStore } from "./store.ts";
 
 const STATUS_KEY = "tdo";
+/** Text counterpart of assets/tdo.svg (U+2611); no Nerd Font or image protocol needed. */
+const TDO_ICON = "☑";
 const FOCUS_ENTRY = "tdo-focus";
 const FOCUS_TITLE_CHARS = 40;
+const PICKER_LIMIT = 200;
 /** Added to the hand-off when config `worktree` is true; the agent picks the names. */
-export const WORKTREE_INSTRUCTION = "Do the work in a new git worktree on a new branch (create it with `git worktree add -b <branch> <path>`, choosing a short descriptive branch name and a sibling directory of the repo), not in the current checkout.";
+export const WORKTREE_INSTRUCTION = "Do the work in a new git worktree on a new branch (create it with `git worktree add -b <branch> <main-checkout>/.worktrees/<name>`, choosing a short descriptive branch and directory name; never put it next to the repo), not in the current checkout.";
 /** tdo ids are local bookkeeping; on GitHub `#3` links to an unrelated issue or PR. */
 export const NO_IDS_INSTRUCTION = "Don't put tdo ids (#3, tdo#3, name#3) in commit messages, PR text, or branch names; describe the change instead.";
 const ALL_ARGS = new Set(["all", "--all", "-a"]);
@@ -142,6 +145,7 @@ async function deleteItem(ctx: ExtensionContext, item: Item, valid: () => boolea
 }
 
 export default function tdoExtension(pi: ExtensionAPI) {
+  const projects = new Map<string, Promise<Project>>();
   /** The item this session is working on, restored from the session branch. */
   let focus: ItemKey | undefined;
   let generation = 0;
@@ -150,9 +154,17 @@ export default function tdoExtension(pi: ExtensionAPI) {
   const trackerUi = createTrackerUi(() => !stopped, () => lifecycle);
   registerTrackerEvents(pi, trackerUi, () => !stopped, () => lifecycle, refreshStatus);
 
-  function project(ctx: ExtensionContext): Project {
+  function project(ctx: ExtensionContext): Promise<Project> {
     const cwd = ctx.cwd || ctx.sessionManager.getCwd();
-    return resolveProject(cwd, { config: loadConfig() });
+    // Share in-flight I/O, but never retain settled project/tracker configuration across commands.
+    let pending = projects.get(cwd);
+    if (!pending) {
+      pending = resolveProjectAsync(cwd);
+      projects.set(cwd, pending);
+      const clear = () => { if (projects.get(cwd) === pending) projects.delete(cwd); };
+      void pending.then(clear, clear);
+    }
+    return pending;
   }
 
   function setFocus(key: ItemKey | undefined): void {
@@ -178,7 +190,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
     const current = ++generation;
     const key = focus;
     try {
-      const projectKey = project(ctx).key;
+      const projectKey = (await project(ctx)).key;
       const counts = await callStore("countActive", projectKey);
       const links = await callStore("countLinks", projectKey);
       const focused = key ? await callStore("getItem", key) : undefined;
@@ -187,7 +199,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
       if (key && focused?.status !== "doing" && focused?.status !== "open") setFocus(undefined);
       const parts: string[] = [];
       const urgent = counts.urgent + counts.high;
-      if (counts.total) parts.push(ctx.ui.theme.fg("muted", `tdo ${counts.total}${urgent ? ` (${urgent}!)` : ""}`));
+      if (counts.total) parts.push(ctx.ui.theme.fg("muted", `${TDO_ICON} ${counts.total}${urgent ? ` (${urgent}!)` : ""}`));
       if (links["awaiting-approval"]?.length) parts.push(ctx.ui.theme.fg("muted", `${links["awaiting-approval"]!.length} awaiting`));
       if (focus && focused) {
         const ref = itemRef(focused, { showProject: focused.project !== projectKey });
@@ -195,11 +207,12 @@ export default function tdoExtension(pi: ExtensionAPI) {
       }
       ctx.ui.setStatus(STATUS_KEY, parts.length ? parts.join(" ") : undefined);
     } catch {
-      if (current === generation && !stopped) ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("muted", "tdo unavailable"));
+      if (current === generation && !stopped) ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("muted", `${TDO_ICON} unavailable`));
     }
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    projects.clear();
     lifecycle++;
     stopped = false;
     generation++;
@@ -207,6 +220,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
     await refreshStatus(ctx);
   });
   pi.on("session_tree", async (_event, ctx) => {
+    projects.clear();
     lifecycle++;
     generation++;
     restoreFocus(ctx);
@@ -215,6 +229,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
   // Agents change items through the CLI, so refresh after each run.
   pi.on("agent_end", async (_event, ctx) => refreshStatus(ctx));
   pi.on("session_shutdown", async (_event, ctx) => {
+    projects.clear();
     lifecycle++;
     stopped = true;
     generation++;
@@ -304,12 +319,20 @@ export default function tdoExtension(pi: ExtensionAPI) {
 
   async function browse(ctx: ExtensionContext, allProjects: boolean): Promise<void> {
     const epoch = lifecycle;
-    const current = project(ctx);
+    const current = await project(ctx);
+    if (stopped || epoch !== lifecycle) return;
     const header = allProjects ? "all projects" : current.key;
     let selected: ItemKey | undefined;
+    let warned = false;
     for (;;) {
-      const items = await callStore("listItems", { project: allProjects ? undefined : current.key, limit: 200 });
+      const found = await callStore("listItems", { project: allProjects ? undefined : current.key, limit: PICKER_LIMIT + 1 });
       if (stopped || epoch !== lifecycle) return;
+      const truncated = found.length > PICKER_LIMIT;
+      const items = found.slice(0, PICKER_LIMIT);
+      if (truncated && !warned) {
+        ctx.ui.notify(`tdo: showing only the first ${PICKER_LIMIT} active items. Use tdo ls${allProjects ? " -a" : ""} -n 0 to show all, or the CLI browser to search everything.`, "warning");
+        warned = true;
+      }
       // Show project names whenever other projects are in view.
       const showProject = allProjects && items.some((item) => item.project !== current.key);
       if (!items.length) {
@@ -320,7 +343,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
         ctx.ui.notify(formatItemList(items, { showProject }), "info");
         return;
       }
-      const picked = await pick(ctx, items, `tdo — ${header} (${items.length})`, showProject, selected);
+      const picked = await pick(ctx, items, `tdo — ${header} (${items.length}${truncated ? "+" : ""})`, showProject, selected);
       if (!picked || stopped || epoch !== lifecycle) return;
       selected = picked.item;
       const again = await act(ctx, picked, showProject);
@@ -348,7 +371,10 @@ export default function tdoExtension(pi: ExtensionAPI) {
         if (trimmed === "help") return ctx.ui.notify(HELP, "info");
         const quick = parseQuickAdd(trimmed);
         if (!quick.title) return ctx.ui.notify("tdo: add needs a title, e.g. /tdo fix flaky test !high #ci", "warning");
-        const item = await callStore("addItem", { project: project(ctx), title: quick.title, priority: quick.priority, tags: quick.tags, source: "user", sessionId: sessionId(ctx), host: hostName(), createdByHuman: isHumanCommand(ctx.hasUI && ctx.mode !== "rpc", "user") }, intent(ctx));
+        const session = sessionId(ctx);
+        const current = await project(ctx);
+        if (stopped || stamp !== lifecycle) return;
+        const item = await callStore("addItem", { project: current, title: quick.title, priority: quick.priority, tags: quick.tags, source: "user", sessionId: session, host: hostName(), createdByHuman: isHumanCommand(ctx.hasUI && ctx.mode !== "rpc", "user") }, intent(ctx));
         if (stopped || stamp !== lifecycle) return;
         await trackerUi.afterMutation(ctx, item);
         if (stopped || stamp !== lifecycle) return;
