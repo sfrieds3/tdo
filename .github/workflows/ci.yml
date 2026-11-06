@@ -5,18 +5,12 @@ on:
     branches: [main]
   pull_request:
   workflow_call:
-    inputs:
-      checkout_ref:
-        description: Immutable commit to test when called by release automation
-        type: string
-        required: false
-        default: ''
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ inputs.checkout_ref || github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -32,7 +26,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.checkout_ref || github.sha }}
           persist-credentials: false
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v6
