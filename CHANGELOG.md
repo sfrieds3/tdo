@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.0](https://github.com/sfrieds3/tdo/compare/v0.4.0...v0.5.0) (2026-11-06)
+
+
+### Features
+
+* add tdo icon to Pi statusline ([#22](https://github.com/sfrieds3/tdo/issues/22)) ([dd42179](https://github.com/sfrieds3/tdo/commit/dd4217966872b7ce7662e6fb3687fda6df7eedec))
+
+
+### Bug Fixes
+
+* make list limits explicit and exports complete ([#23](https://github.com/sfrieds3/tdo/issues/23)) ([4ca2fc2](https://github.com/sfrieds3/tdo/commit/4ca2fc20ad0fb05f75266760addeebc13272c80f))
+* resolve Pi projects without blocking the event loop ([#20](https://github.com/sfrieds3/tdo/issues/20)) ([95ebe72](https://github.com/sfrieds3/tdo/commit/95ebe72f758621ffade2bf73bcde6125ecacf087))
+* worktree hand-off creates worktrees under .worktrees/ ([#24](https://github.com/sfrieds3/tdo/issues/24)) ([99aa89b](https://github.com/sfrieds3/tdo/commit/99aa89b7b09e6f176de55435dcd1475115781d55))
+
 ## [0.4.0](https://github.com/sfrieds3/tdo/compare/v0.3.0...v0.4.0) (2026-11-05)
 
 

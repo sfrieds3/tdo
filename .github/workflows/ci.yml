@@ -25,6 +25,8 @@ jobs:
         node: [22, 24, 26]
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v6
         with:
@@ -41,7 +43,7 @@ jobs:
         run: |
           node src/cli.ts add "smoke test !high #ci"
           node src/cli.ts ls --json | node -e 'const items = JSON.parse(require("fs").readFileSync(0, "utf8")); if (items.length !== 1 || items[0].priority !== "high") process.exit(1)'
-          node src/cli.ts done 1
+          node src/cli.ts 'done' 1
 
   # Releases are versioned from commit messages, and PRs are squash-merged with the
   # PR title as the commit message, so titles must be conventional commits.

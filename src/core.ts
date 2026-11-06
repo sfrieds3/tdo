@@ -4,7 +4,7 @@
  * Shared by the `tdo` CLI (src/cli.ts) and the Pi extension (extensions/tdo.ts); agents use the CLI via skills/tdo.
  * Uses only erasable TypeScript syntax so Node can run it directly with type stripping.
  */
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
@@ -13,6 +13,7 @@ import * as path from "node:path";
 import type * as Sqlite from "node:sqlite";
 import { transaction } from "./transaction.ts";
 import { enqueueLinked, enqueueOp, queueCounts } from "./link-ops.ts";
+import { promisify } from "node:util";
 import { migrateDb } from "./migrations/index.ts";
 
 type DatabaseSync = Sqlite.DatabaseSync;
@@ -132,10 +133,14 @@ export type ListFilter = {
   /** Include this priority and anything more urgent. */
   minPriority?: Priority;
   query?: string;
+  /** Maximum rows (default 500); 0 returns all matching rows. */
   limit?: number;
   /** Only items with a tracker link. */
   linked?: boolean;
 };
+
+export const DEFAULT_LIST_LIMIT = 500;
+export const LIST_TRUNCATED = "… more items (use -n 0 to show all, or -s / -q to narrow)";
 
 const MAX_TITLE_CHARS = 200;
 
@@ -254,7 +259,11 @@ function realpath(target: string): string {
 }
 
 export function homeRelative(target: string, home = os.homedir()): string {
-  const relative = path.relative(realpath(home), realpath(target));
+  return homeRelativePaths(target, realpath(home), realpath(target));
+}
+
+function homeRelativePaths(target: string, home: string, resolved: string): string {
+  const relative = path.relative(home, resolved);
   if (!relative) return "~";
   if (relative.startsWith("..") || path.isAbsolute(relative)) return target;
   return `~/${relative.split(path.sep).join("/")}`;
@@ -288,6 +297,10 @@ export function readRepoConfig(root: string): RepoConfig | undefined {
     if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR") return undefined;
     throw error;
   }
+  return parseRepoConfig(file, raw);
+}
+
+function parseRepoConfig(file: string, raw: string): RepoConfig {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -300,26 +313,39 @@ export function readRepoConfig(root: string): RepoConfig | undefined {
   return { file, ...(project !== undefined ? { project: (project as string).trim() } : {}), ...(tracker !== undefined ? { tracker } : {}) };
 }
 
-function detectProject(cwd: string, env: NodeJS.ProcessEnv, home: string): Project {
+type ProjectRead = { kind: "git"; args: string[] } | { kind: "file" | "repo-config" | "realpath"; path: string };
+type ProjectOptions = { env?: NodeJS.ProcessEnv; home?: string; config?: Config };
+
+/** One set of precedence rules, driven by either synchronous or asynchronous I/O. */
+function* detectProject(cwd: string, env: NodeJS.ProcessEnv, home: string): Generator<ProjectRead, Project, string | undefined> {
   if (env.TDO_PROJECT?.trim()) return projectFromKey(env.TDO_PROJECT);
-  const top = git(cwd, ["rev-parse", "--show-toplevel"]);
-  if (!top) return { ...projectFromKey(`local:${homeRelative(path.resolve(cwd), home)}`), root: path.resolve(cwd) };
-  const repoProject = readRepoConfig(top)?.project;
-  if (repoProject) return { ...projectFromKey(repoProject), root: top };
-  try {
-    const override = fs.readFileSync(path.join(top, PROJECT_FILE), "utf8").split("\n")[0]?.trim();
-    if (override) return { ...projectFromKey(override), root: top };
-  } catch {
-    // No override file.
+  const top = yield { kind: "git", args: ["rev-parse", "--show-toplevel"] };
+  const root = top || path.resolve(cwd);
+  if (top) {
+    const configFile = path.join(top, REPO_CONFIG_FILE);
+    const rawConfig = yield { kind: "repo-config", path: configFile };
+    const repoProject = rawConfig === undefined ? undefined : parseRepoConfig(configFile, rawConfig).project;
+    if (repoProject) return { ...projectFromKey(repoProject), root };
+    const file = yield { kind: "file", path: path.join(top, PROJECT_FILE) };
+    const override = file?.split("\n")[0]?.trim();
+    if (override) return { ...projectFromKey(override), root };
+    const remotes = ((yield { kind: "git", args: ["remote"] }) ?? "").split("\n").map((name) => name.trim()).filter(Boolean);
+    const remote = remotes.includes("origin") ? "origin" : remotes[0];
+    const key = remote ? normalizeRemote((yield { kind: "git", args: ["remote", "get-url", remote] }) ?? "") : undefined;
+    if (key) return { ...projectFromKey(key), root };
   }
-  const remotes = (git(cwd, ["remote"]) ?? "").split("\n").map((name) => name.trim()).filter(Boolean);
-  const remote = remotes.includes("origin") ? "origin" : remotes[0];
-  const key = remote ? normalizeRemote(git(cwd, ["remote", "get-url", remote]) ?? "") : undefined;
-  if (key) return { ...projectFromKey(key), root: top };
   // Worktrees share their main checkout's backlog.
-  const commonDir = git(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
-  const mainRoot = commonDir && path.basename(commonDir) === ".git" ? path.dirname(commonDir) : top;
-  return { ...projectFromKey(`local:${homeRelative(mainRoot, home)}`), root: top };
+  const commonDir = top ? yield { kind: "git", args: ["rev-parse", "--path-format=absolute", "--git-common-dir"] } : undefined;
+  const mainRoot = commonDir && path.basename(commonDir) === ".git" ? path.dirname(commonDir) : root;
+  const realHome = (yield { kind: "realpath", path: home }) ?? path.resolve(home);
+  const realRoot = (yield { kind: "realpath", path: mainRoot }) ?? path.resolve(mainRoot);
+  const local = homeRelativePaths(mainRoot, realHome, realRoot);
+  return { ...projectFromKey(`local:${local}`), root };
+}
+
+function aliasProject(project: Project, config: Config): Project {
+  const alias = config.aliases[project.key];
+  return alias ? { ...projectFromKey(alias), root: project.root } : project;
 }
 
 /**
@@ -327,12 +353,50 @@ function detectProject(cwd: string, env: NodeJS.ProcessEnv, home: string): Proje
  * `.tdo-project` file at the repo root, then the normalized git remote (origin first), then `local:<home-relative main worktree path>`.
  * The result is then mapped through the config's `aliases`.
  */
-export function resolveProject(cwd: string, options: { env?: NodeJS.ProcessEnv; home?: string; config?: Config } = {}): Project {
+export function resolveProject(cwd: string, options: ProjectOptions = {}): Project {
   const env = options.env ?? process.env;
   const home = options.home ?? os.homedir();
-  const project = detectProject(cwd, env, home);
-  const alias = (options.config ?? loadConfig(env, home)).aliases[project.key];
-  return alias ? { ...projectFromKey(alias), root: project.root } : project;
+  const detection = detectProject(cwd, env, home);
+  let step = detection.next();
+  while (!step.done) {
+    const read = step.value;
+    let value: string | undefined;
+    try {
+      value = read.kind === "git" ? git(cwd, read.args) : read.kind !== "realpath" ? fs.readFileSync(read.path, "utf8") : fs.realpathSync(read.path);
+    } catch (error) {
+      if (read.kind === "repo-config" && !["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+      // Missing override files and unresolved realpaths fall back in detectProject.
+    }
+    step = detection.next(value);
+  }
+  return aliasProject(step.value, options.config ?? loadConfig(env, home));
+}
+
+const execFileAsync = promisify(execFile);
+
+/** Nonblocking equivalent of resolveProject for event-loop consumers such as Pi. */
+export async function resolveProjectAsync(cwd: string, options: ProjectOptions = {}): Promise<Project> {
+  const env = options.env ?? process.env;
+  const home = options.home ?? os.homedir();
+  const detection = detectProject(cwd, env, home);
+  let step = detection.next();
+  while (!step.done) {
+    const read = step.value;
+    let value: string | undefined;
+    try {
+      if (read.kind === "git") {
+        const { stdout } = await execFileAsync("git", ["-C", cwd, ...read.args], { encoding: "utf8", timeout: 5000 });
+        value = stdout.trim() || undefined;
+      } else {
+        value = read.kind !== "realpath" ? await fs.promises.readFile(read.path, "utf8") : await fs.promises.realpath(read.path);
+      }
+    } catch (error) {
+      if (read.kind === "repo-config" && !["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+      // Match the sync resolver's fallback on git or filesystem errors.
+    }
+    step = detection.next(value);
+  }
+  return aliasProject(step.value, options.config ?? await loadConfigAsync(env, home));
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +482,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, home = os.homed
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { aliases: {} };
     throw error;
   }
+  return parseConfig(raw, file, home);
+}
+
+export async function loadConfigAsync(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): Promise<Config> {
+  const file = getConfigPath(env, home);
+  let raw: string;
+  try {
+    raw = await fs.promises.readFile(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { aliases: {} };
+    throw error;
+  }
+  return parseConfig(raw, file, home);
+}
+
+function parseConfig(raw: string, file: string, home: string): Config {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -820,6 +900,8 @@ export function ftsQuery(text: string): string | undefined {
 }
 
 export function listItems(db: DatabaseSync, filter: ListFilter = {}): Item[] {
+  const limit = filter.limit ?? DEFAULT_LIST_LIMIT;
+  if (!Number.isSafeInteger(limit) || limit < 0) throw new Error("limit must be a non-negative safe integer.");
   const where: string[] = [];
   const values: (string | number)[] = [];
   if (filter.project !== undefined) { where.push("p.key = ?"); values.push(filter.project); }
@@ -840,9 +922,8 @@ export function listItems(db: DatabaseSync, filter: ListFilter = {}): Item[] {
   const order = closedFirst
     ? "i.closed_at DESC, i.created_at DESC"
     : "CASE i.status WHEN 'doing' THEN 0 WHEN 'open' THEN 1 ELSE 2 END, i.priority, i.created_at, p.key, i.id";
-  const limit = Math.max(1, Math.min(filter.limit ?? 500, 5000));
-  const sql = `${ITEM_SELECT}${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY ${order} LIMIT ${limit}`;
-  return withExtras(db, db.prepare(sql).all(...values) as ItemRow[]);
+  const sql = `${ITEM_SELECT}${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY ${order} LIMIT ?`;
+  return withExtras(db, db.prepare(sql).all(...values, limit === 0 ? -1 : limit) as ItemRow[]);
 }
 
 export type ActiveCounts = { total: number; doing: number } & Record<Priority, number>;
@@ -935,8 +1016,9 @@ export function linkMarker(links: Link[] | undefined): string | undefined {
   }
 }
 
-export function formatItemList(items: Item[], options: FormatOptions & { empty?: string } = {}): string {
-  return items.length ? items.map((item) => formatItemLine(item, options)).join("\n") : (options.empty ?? "(nothing here)");
+export function formatItemList(items: Item[], options: FormatOptions & { empty?: string; truncated?: boolean } = {}): string {
+  const text = items.length ? items.map((item) => formatItemLine(item, options)).join("\n") : (options.empty ?? "(nothing here)");
+  return options.truncated ? `${text}\n${paint(LIST_TRUNCATED, options.color, "dim")}` : text;
 }
 
 const STATUS_RANK: Record<Status, number> = { doing: 0, open: 1, done: 2, dropped: 3 };
@@ -968,7 +1050,7 @@ export function formatGroupedList(items: Item[], options: { perProject?: number;
     const shown = perProject > 0 ? group.slice(0, perProject) : group;
     const lines = shown.map((item) => `  ${formatItemLine(item, { color })}`);
     const hidden = group.length - shown.length;
-    if (hidden > 0) lines.push(paint(`  … ${hidden} more (tdo ls --project ${key})`, color, "dim"));
+    if (hidden > 0) lines.push(paint(`  … ${hidden} more (tdo ls --project ${key} -n 0)`, color, "dim"));
     return [header, ...lines].join("\n");
   }).join("\n\n");
 }

@@ -1,5 +1,10 @@
 # tdo
 
+[![Build](https://github.com/sfrieds3/tdo/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sfrieds3/tdo/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/github/v/release/sfrieds3/tdo)](https://github.com/sfrieds3/tdo/releases/latest)
+
+<img src="assets/tdo.svg" alt="tdo — a checked box" width="64" height="64">
+
 **A per-project backlog for the things you'll fix later.**
 
 You're halfway through a change and notice a flaky test, a slow config loader, a helper with a misleading name. None of it belongs in this commit, and all of it is gone from your head by tomorrow. `tdo` is the place to put it: one command to park an item, scoped to the repo you're in, and still there when you come back — on any machine.
@@ -97,6 +102,10 @@ Leave the id out of `show`, `edit`, `start`, `done`, `drop`, `reopen`, `note`, `
 Global options: `--db TARGET` for a one-off local or SSH database override, `--json` for machine-readable output, `--project KEY` to target another project, `-C DIR` to resolve the project from another directory, `-a` / `--all` to span every project. `add` also takes `--source NAME` (or `TDO_SOURCE`) to record who added the item; it defaults to `cli`.
 
 `tdo project` shows the resolved project key and `tdo paths` shows where the database and config live.
+
+**List limits:** `tdo ls` shows at most 500 matching items by default. `-n N` (or `--limit N`) changes the limit; `-n 0` shows all matching items, with or without `-a`, and there is no hidden 5,000-row ceiling. `ls -a` applies its limit per project (default 5), not globally. When results are omitted, text output includes a dim `… more` notice; `--json` keeps the same array shape and writes a truncation warning to stderr. Exactly filling a limit does not produce a warning unless another matching item exists. Use `-n 0` for a complete list, increase `-n`, or narrow with `-s` / `-q` / `-t`.
+
+`tdo export` always includes every matching item in the current project (all statuses by default); `-a` spans all projects and `-s` selects statuses. Exports, the CLI browser, and CLI fzf pickers have no row limit. Large SSH results can still exceed the transport byte/time bounds described below; that fails explicitly rather than returning a partial export.
 
 `-p` on `ls` means "this priority or more urgent", so `tdo ls -p high` shows urgent and high items. Priorities accept prefixes (`-p u`).
 
@@ -223,7 +232,7 @@ widgets  github.com/example/widgets · 7 items, 3!
   #6  high    speed up build
   #4  normal  tidy logs
   #5  normal  doc the api
-  … 2 more (tdo ls --project github.com/example/widgets)
+  … 2 more (tdo ls --project github.com/example/widgets -n 0)
 
 gadgets  github.com/example/gadgets · 1 item
   #1  normal  bump deps
@@ -259,7 +268,7 @@ In the picker:
 
 | Key | Action |
 |---|---|
-| `enter` | **Work on it**: marks it `doing` and hands it to the agent. With `"worktree": true` in the [config file](#configuration), the agent is asked to do the work in a new git worktree and branch it names itself. |
+| `enter` | **Work on it**: marks it `doing` and hands it to the agent. With `"worktree": true` in the [config file](#configuration), the agent is asked to do the work in a new git worktree (under the main checkout's `.worktrees/`) and branch it names itself. |
 | `e` | Edit in the editor: the first line is the title, the rest is the body. |
 | `p` | Change priority. |
 | `x` | Mark done. |
@@ -268,7 +277,9 @@ In the picker:
 
 After `e`, `p`, `x`, or `d` the picker reopens, so you can triage several items in a row.
 
-The footer shows `tdo 4 (2!) ▸ #3 login test flakes on CI` — open items, how many are urgent or high, and the item this session is working on. The focus survives `/reload` and session resume, and clears itself once the item is closed or deleted. It refreshes after each agent run, so items the agent adds or closes through the CLI show up right away.
+The Pi picker shows at most 200 active items. If more match, its title shows `200+` and a warning points to `tdo ls -n 0` (or `tdo ls -a -n 0` across projects) and the CLI browser for the complete backlog.
+
+The footer shows `☑ 4 (2!) ▸ #3 login test flakes on CI` — open items, how many are urgent or high, and the item this session is working on. The checkbox is the terminal counterpart of the [tdo icon](assets/tdo.svg): a plain Unicode glyph (U+2611), with no Nerd Font or terminal image support required. The focus survives `/reload` and session resume, and clears itself once the item is closed or deleted. It refreshes after each agent run, so items the agent adds or closes through the CLI show up right away. An empty backlog hides the status; a store error shows `☑ unavailable` instead of a stale count.
 
 ## How projects are identified
 
@@ -286,11 +297,11 @@ The result then goes through `aliases` in the [config file](#configuration), so 
 
 The database lives at `$XDG_DATA_HOME/tdo/tdo.db` — `~/.local/share/tdo/tdo.db` by default, on macOS too. Set `db` in the config file or `TDO_DB` to put it elsewhere. It is plain SQLite in WAL mode, so `sqlite3 ~/.local/share/tdo/tdo.db` works for ad-hoc queries.
 
-Schema: `projects` has a UUID `id` and the project `key`; `items` is keyed by `(project_id, id)`, where `id` is the per-project number; `tags`, `notes`, and `links` reference that pair. Full-text search lives in `items_fts`, kept in sync by triggers and covering notes as well as titles and bodies. Schema v3 also reserves `link_ops` for future lifecycle sync; this version does not enqueue or drain operations.
+Schema: `projects` has a UUID `id` and the project `key`; `items` is keyed by `(project_id, id)`, where `id` is the per-project number; `tags`, `notes`, and `links` reference that pair. Full-text search lives in `items_fts`, kept in sync by triggers and covering notes as well as titles and bodies. Schema v3 includes `link_ops`, which stores the durable lifecycle queue; item edits, notes, and status transitions enqueue operations atomically with the local change.
 
 ### Upgrading for notes and GitHub issues
 
-**Compatibility break:** this feature uses schema v3 and SSH RPC v2. Update tdo on both the caller and database host to the same release before using an SSH database. Old helpers fail the protocol check; after updating the helper, an existing v2 remote database still requires an explicit `tdo migrate`. Local databases upgrade automatically on open, with a backup; use the commands below to preview first:
+**Compatibility break:** this feature uses schema v3 and SSH RPC v4. Update tdo on both the caller and database host to the same release before using an SSH database. Old helpers fail the protocol check; after updating the helper, an existing v2 remote database still requires an explicit `tdo migrate`. Local databases upgrade automatically on open, with a backup; use the commands below to preview first:
 
 ```sh
 tdo migrate --dry-run
@@ -317,7 +328,7 @@ Items are renumbered per project in their original order, so the oldest item in 
 
 ### SSH remote database
 
-Install a compatible version of `tdo` and Node 22.18+ on the server. The remote noninteractive shell must find `tdo` on `PATH`; use the same tdo release on both ends. Configure SSH keys/agent, host keys, and any jump hosts with your normal SSH setup first. No daemon, database file synchronization, or network-mounted SQLite file is needed.
+Install a compatible version of `tdo` and Node 22.18+ on the server. The remote noninteractive shell must find `tdo` on `PATH`; use the same tdo release on both ends. Unlimited list/export support was introduced in RPC protocol v2, structured notes and issue filing in v3, and lifecycle queues in v4. This release requires v4: upgrade both ends together. Older helpers are rejected rather than allowed to silently apply the old row ceiling. Configure SSH keys/agent, host keys, and any jump hosts with your normal SSH setup first. No daemon, database file synchronization, or network-mounted SQLite file is needed.
 
 ```sh
 tdo db use 'ssh://you@backlog-host/home/you/.local/share/tdo/tdo.db'
@@ -373,6 +384,12 @@ Everything works without a config file. To change defaults, create `$XDG_CONFIG_
 Repository config is separate: `.tdo/config.json` accepts `project` and `tracker`, not user settings such as `db`. A malformed repository file or invalid `project` fails project resolution; an invalid tracker block is reported by tracker commands without blocking ordinary backlog commands.
 
 Environment variables: `TDO_DB`, `TDO_CONFIG`, `TDO_PROJECT` (force a project key), `TDO_SOURCE` (default `--source`), `TDO_FZF_OPTS` (extra fzf flags), `NO_COLOR` / `FORCE_COLOR`.
+
+## Release automation
+
+Release-please maintains a release PR after changes land on `main`. GitHub may require approval before running CI on that bot-created PR. Approve the workflow run and wait for the checks to pass before merging when you are ready to release; there is no separate automatic release-PR CI bypass.
+
+Merging the release PR publishes the release, updates floating tags, and attaches the package tarball. This workflow does not enforce pre-merge approval or passing checks itself; those requirements depend on repository branch protection.
 
 ## Development
 
