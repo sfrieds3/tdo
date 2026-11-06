@@ -30,8 +30,9 @@ test("normalizeRemote maps ssh, scp, and https remotes to host/owner/repo", () =
 });
 
 for (const resolve of [tdo.resolveProject, tdo.resolveProjectAsync]) {
-test(`${resolve.name} prefers env, override file, remote, then home-relative path`, async () => {
+test(`${resolve.name} prefers env, repo config, override file, remote, then home-relative path`, async (t) => {
   const home = tempDir();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const repo = path.join(home, "code", "widgets");
   fs.mkdirSync(repo, { recursive: true });
   const env = {};
@@ -52,7 +53,21 @@ test(`${resolve.name} prefers env, override file, remote, then home-relative pat
   fs.writeFileSync(path.join(repo, ".tdo-project"), "example/custom\n");
   assert.equal((await resolve(sub, { env, home, config: NO_CONFIG })).key, "example/custom");
 
+  fs.mkdirSync(path.join(repo, ".tdo"));
+  const repoConfig = path.join(repo, tdo.REPO_CONFIG_FILE);
+  fs.writeFileSync(repoConfig, JSON.stringify({ project: "repo/configured" }));
+  assert.equal((await resolve(sub, { env, home, config: NO_CONFIG })).key, "repo/configured");
+  assert.equal((await resolve(sub, { env, home, config: { aliases: { "repo/configured": "shared/backlog" } } })).key, "shared/backlog");
+  fs.writeFileSync(repoConfig, JSON.stringify({ tracker: "validated by tracker commands only" }));
+  assert.equal((await resolve(sub, { env, home, config: NO_CONFIG })).key, "example/custom");
+  fs.writeFileSync(repoConfig, "{ invalid");
+  await assert.rejects(async () => resolve(sub, { env, home, config: NO_CONFIG }), /invalid JSON/);
   assert.equal((await resolve(sub, { env: { TDO_PROJECT: "forced" }, home, config: NO_CONFIG })).key, "forced");
+  fs.writeFileSync(repoConfig, JSON.stringify({ project: " " }));
+  await assert.rejects(async () => resolve(sub, { env, home, config: NO_CONFIG }), /non-empty string/);
+  fs.rmSync(repoConfig);
+  fs.mkdirSync(repoConfig);
+  await assert.rejects(async () => resolve(sub, { env, home, config: NO_CONFIG }), /EISDIR/);
 });
 
 test(`${resolve.name} reads aliases and shares a local backlog across worktrees`, async (t) => {
@@ -126,7 +141,8 @@ test("items can be added, listed, searched, updated, and closed", () => {
 
   const done = tdo.setStatus(db, a, "done", "fixed by retry");
   assert.ok(done.closedAt);
-  assert.match(done.body, /\[done \d{4}-\d{2}-\d{2}\] fixed by retry/);
+  assert.equal(done.body, a.body, "status notes no longer touch the body");
+  assert.deepEqual(done.notes.map((note) => [note.status, note.body]), [["done", "fixed by retry"]]);
   assert.deepEqual(tdo.listItems(db, { project: project.key }).map((item) => item.id), [b.id, c.id]);
   assert.deepEqual(tdo.listItems(db, { project: project.key, status: "closed" }).map((item) => item.id), [a.id]);
   assert.equal(tdo.setStatus(db, a, "open").closedAt, null);
@@ -212,7 +228,7 @@ test("v1 databases migrate to uuid projects and per-project ids, with a backup",
   assert.deepEqual(tdo.planMigration(preview).map((row) => [row.project, row.from, row.to]), [["a", 1, 1], ["a", 5, 2], ["b", 2, 1]]);
   const result = tdo.migrateDb(preview, dbPath);
   preview.close();
-  assert.deepEqual([result.from, result.to], [1, 2]);
+  assert.deepEqual([result.from, result.to], [1, 3]);
   assert.ok(fs.existsSync(result.backup), "backup written");
   const backup = tdo.openDb(result.backup, { migrate: false });
   assert.equal(tdo.schemaVersion(backup), 1, "backup keeps the old schema");
@@ -272,6 +288,7 @@ test("failed v1 conversion rolls back DDL, data and user_version and keeps one b
 test("future chains advance each step and roll the whole chain back on failure", async (t) => {
   const { runMigrations } = await import("../src/migrations/index.ts");
   const { SCHEMA_V2, migrateFromV1 } = await import("../src/migrations/v2.ts");
+  const { migrateToV3 } = await import("../src/migrations/v3.ts");
   const fresh = tdo.openDb(":memory:", { migrate: false });
   const upgradedPath = await v1Db();
   const upgraded = tdo.openDb(upgradedPath, { migrate: false });
@@ -280,33 +297,34 @@ test("future chains advance each step and roll the whole chain back on failure",
   const steps = [
     { from: 0, to: 2, apply: (db) => { calls.push(tdo.schemaVersion(db)); db.exec(SCHEMA_V2); } },
     { from: 1, to: 2, apply: migrateFromV1, preview: tdo.planMigration },
-    { from: 2, to: 3, apply: (db) => {
+    { from: 2, to: 3, apply: (db) => { calls.push(tdo.schemaVersion(db)); migrateToV3(db); } },
+    { from: 3, to: 4, apply: (db) => {
       calls.push(tdo.schemaVersion(db));
       db.exec("ALTER TABLE projects ADD COLUMN future TEXT");
       throw new Error("future failure");
     } },
   ];
   const before = upgraded.prepare("SELECT * FROM items ORDER BY id").all();
-  assert.throws(() => runMigrations(fresh, undefined, steps, 3), /future failure/);
-  assert.throws(() => runMigrations(upgraded, upgradedPath, steps, 3), /future failure/);
+  assert.throws(() => runMigrations(fresh, undefined, steps, 4), /future failure/);
+  assert.throws(() => runMigrations(upgraded, upgradedPath, steps, 4), /future failure/);
   assert.equal(fs.readdirSync(path.dirname(upgradedPath)).filter((name) => name.includes("-backup-")).length, 1, "one backup for the whole failed chain");
   assert.equal(tdo.schemaVersion(fresh), 0);
   assert.deepEqual(fresh.prepare("SELECT name FROM sqlite_schema").all(), []);
   assert.equal(tdo.schemaVersion(upgraded), 1);
   assert.deepEqual(upgraded.prepare("SELECT * FROM items ORDER BY id").all(), before);
-  assert.deepEqual(calls, [0, 2, 2]);
-  steps[2].apply = (db) => {
-    assert.equal(tdo.schemaVersion(db), 2);
+  assert.deepEqual(calls, [0, 2, 3, 2, 3]);
+  steps[3].apply = (db) => {
+    assert.equal(tdo.schemaVersion(db), 3);
     db.exec("ALTER TABLE projects ADD COLUMN future TEXT");
   };
   const preview = tdo.planMigration(upgraded);
-  runMigrations(fresh, undefined, steps, 3);
-  assert.deepEqual(runMigrations(upgraded, undefined, steps, 3).changes, preview);
-  assert.equal(tdo.schemaVersion(upgraded), 3);
-  assert.equal(tdo.schemaVersion(fresh), 3);
+  runMigrations(fresh, undefined, steps, 4);
+  assert.deepEqual(runMigrations(upgraded, undefined, steps, 4).changes, preview);
+  assert.equal(tdo.schemaVersion(upgraded), 4);
+  assert.equal(tdo.schemaVersion(fresh), 4);
   const schema = (db) => db.prepare("SELECT type, name, sql FROM sqlite_schema ORDER BY type, name").all();
   assert.deepEqual(schema(fresh), schema(upgraded));
-  assert.equal(tdo.SCHEMA, 2, "test registry does not bump production schema");
+  assert.equal(tdo.SCHEMA, 3, "test registry does not bump production schema");
 });
 
 test("missing registry steps roll back earlier steps", async (t) => {
@@ -315,7 +333,7 @@ test("missing registry steps roll back earlier steps", async (t) => {
   t.after(() => db.close());
   assert.throws(() => runMigrations(db, undefined, [
     { from: 0, to: 1, apply: (db) => db.exec("CREATE TABLE partial (id)") },
-  ], 3), /No migration from schema v1/);
+  ], 4), /No migration from schema v1/);
   assert.equal(tdo.schemaVersion(db), 0);
   assert.deepEqual(db.prepare("SELECT name FROM sqlite_schema").all(), []);
 });
@@ -338,9 +356,9 @@ test("migration rechecks a newer schema under lock instead of downgrading it", a
   const db = tdo.openDb(dbPath, { migrate: false });
   const other = tdo.openDb(dbPath, { migrate: false });
   t.after(() => { db.close(); other.close(); });
-  beforeMigrationLock(db, () => other.exec("PRAGMA user_version = 3"));
-  assert.throws(() => tdo.migrateDb(db, dbPath), /schema v3 is newer/);
-  assert.equal(tdo.schemaVersion(db), 3);
+  beforeMigrationLock(db, () => other.exec("PRAGMA user_version = 4"));
+  assert.throws(() => tdo.migrateDb(db, dbPath), /schema v4 is newer/);
+  assert.equal(tdo.schemaVersion(db), 4);
   assert.equal(db.prepare("SELECT count(*) AS n FROM items").get().n, 3);
 });
 
@@ -351,7 +369,7 @@ test("migration cleans up its redundant backup when another writer finishes firs
   t.after(() => { db.close(); other.close(); });
   beforeMigrationLock(db, () => tdo.migrateDb(other));
   const result = tdo.migrateDb(db, dbPath);
-  assert.deepEqual(result, { from: 2, to: 2, backup: undefined, changes: [] });
+  assert.deepEqual(result, { from: 3, to: 3, backup: undefined, changes: [] });
   assert.deepEqual(fs.readdirSync(path.dirname(dbPath)).filter((name) => name.includes("-backup-")), []);
 });
 
@@ -371,12 +389,12 @@ test("migration computes id changes from data read under the write lock", async 
 test("newer databases are rejected without a backup and failed openDb closes its handle", async (t) => {
   const dbPath = path.join(tempDir(), "newer.db");
   const db = tdo.openDb(dbPath, { migrate: false });
-  db.exec("PRAGMA user_version = 3");
-  assert.throws(() => tdo.migrateDb(db, dbPath), /schema v3 is newer/);
+  db.exec("PRAGMA user_version = 4");
+  assert.throws(() => tdo.migrateDb(db, dbPath), /schema v4 is newer/);
   db.close();
   const { DatabaseSync } = await import("node:sqlite");
   const close = t.mock.method(DatabaseSync.prototype, "close");
-  assert.throws(() => tdo.openDb(dbPath), /schema v3 is newer/);
+  assert.throws(() => tdo.openDb(dbPath), /schema v4 is newer/);
   assert.equal(close.mock.callCount(), 1);
   assert.deepEqual(fs.readdirSync(path.dirname(dbPath)).filter((name) => name.includes("-backup-")), []);
 });
@@ -398,9 +416,7 @@ test("status notes from two handles on one file both survive", () => {
   const item = tdo.addItem(a, { project: "local:~/code/widgets", title: "Shared" });
   tdo.setStatus(a, item, "done", "note A");
   tdo.setStatus(b, item, "done", "note B");
-  const body = tdo.getItem(a, item).body;
-  assert.match(body, /\[done \S+\] note A/);
-  assert.match(body, /\[done \S+\] note B/);
+  assert.deepEqual(tdo.getItem(a, item).notes.map((note) => note.body), ["note A", "note B"]);
   a.close();
   b.close();
 });
@@ -428,7 +444,7 @@ test("writes take the write lock before reading the item", () => {
   const after = tdo.getItem(db, item);
   assert.equal(after.status, "doing");
   assert.equal(after.title, "Locked still");
-  assert.doesNotMatch(after.body, /blocked/);
+  assert.deepEqual(after.notes.map((note) => note.body), ["started"]);
 
   const removed = tdo.deleteItem(db, item);
   assert.equal(removed.title, "Locked still");
@@ -446,6 +462,14 @@ test("formatters render lines, detail, and markdown", () => {
   assert.equal(tdo.formatItemLine(item, { showProject: true }), "widgets#1  high    Fix it  #ci  @ a.ts:1");
   assert.match(tdo.formatItemDetail(item), /priority: high[\s\S]*\n\nwhy$/);
   assert.equal(tdo.formatMarkdown([item]), `## github.com/example/widgets\n\n- [ ] #${item.id} Fix it (high #ci \`a.ts:1\`)\n`);
+  const notes = [
+    { seq: 1, createdAt: "2026-11-05T12:00:00.000Z", status: null, body: "first line\nsecond line" },
+    { seq: 2, createdAt: "2026-11-06T12:00:00.000Z", status: "done", body: "fixed it" },
+  ];
+  assert.equal(tdo.formatMarkdown([{ ...item, notes }]), `## github.com/example/widgets\n\n- [ ] #${item.id} Fix it (high #ci \`a.ts:1\`)\n  - 2026-11-05: first line second line\n  - 2026-11-06 done: fixed it\n`);
+  assert.equal(tdo.formatMarkdown([{ ...item, notes: undefined }]), tdo.formatMarkdown([item]));
+  assert.equal(tdo.formatMarkdown([]), "");
+  db.close();
 });
 
 test("grouped list renders bold project headers and per-project caps", () => {

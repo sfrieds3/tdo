@@ -27,6 +27,8 @@ tdo show <id> --json
 tdo edit <id> -p high -t +newtag,~oldtag -b "<new body>" --json
 tdo start <id>                     # mark as doing
 tdo done <id> -m "<what fixed it>" # also: drop <id> -m "<why>", reopen <id>
+tdo note <id> "<progress or finding>"   # add a note without changing status
+tdo tracker status --json          # is this project set up to file GitHub issues?
 ```
 
 Set `--source` to the agent you are: `claude`, `codex`, `pi`, or similar. Items record their source, host, and timestamps automatically.
@@ -48,3 +50,12 @@ A future session — possibly another agent on another machine — must understa
 - Item ids are per project: `3` / `#3` is item 3 in the current project. For another project use `NAME#3` or `--project KEY`. In JSON, `id` is that per-project number and `projectId` is the project's UUID.
 - Always pass an explicit id and `--json`. Plain `tdo` and id-less commands open an interactive fzf picker meant for humans; never rely on it.
 - Do not edit the SQLite database directly; always go through the CLI.
+- **Never put tdo ids in commit messages, PR titles or bodies, or branch names.** `#3`, `tdo#3`, and `widgets#3` are local bookkeeping; on GitHub `#3` links to an unrelated issue or PR. Describe the change itself. Reference a GitHub issue (`Fixes #42`, shown as `↗#42` in `tdo ls`) only if the user asks.
+
+## GitHub issues
+
+A project can file items as GitHub issues (`tdo push`) once the user has approved its tracker config. Filing creates a public, shared record under the user's GitHub identity, so:
+
+- **Never run `tdo push`, `tdo tracker approve`, or anything with `--yes` unless the user explicitly asks you to in this turn.** Offer instead: *"Want me to file #3 as a GitHub issue?"*
+- `tdo show <id> --json` lists an item's `links` (issue URL and state); `tdo ls --linked` shows filed items.
+- A link in state `unknown` or `error` needs the user's judgment; report it, don't retry.

@@ -41,7 +41,7 @@ test("add, list, edit, close, and export round-trip", () => {
   assert.match(tdo("done", "#1", "-m", "added retries").out, /^done #1/);
   assert.deepEqual(tdo("ls", "--json").json().map((item) => item.id), [2]);
   assert.deepEqual(tdo("ls", "-s", "all", "--json").json().map((item) => item.id), [2, 1]);
-  assert.match(tdo("show", "1").out, /\[done \d{4}-\d{2}-\d{2}\] added retries/);
+  assert.match(tdo("show", "1").out, /notes:\n {2}\d{4}-\d{2}-\d{2} done {4}added retries/);
   assert.equal(tdo("count").out, `${PROJECT}: 1 open (1 urgent)`);
   assert.equal(tdo("project").out, PROJECT);
   assert.match(tdo("export", "--md").out, /- \[x\] #1 fix flaky test/);
@@ -93,17 +93,17 @@ test("migrate previews and upgrades a v1 database", async () => {
   const tdo = (...argv) => { const out = []; run(argv, { out: (text) => out.push(text), cwd: dir, env }); return out.join("\n"); };
 
   const dry = tdo("migrate", "--dry-run");
-  assert.match(dry, /would upgrade schema v1 -> v2/);
+  assert.match(dry, /would upgrade schema v1 -> v3/);
   assert.match(dry, /b {2}#2 -> #1 {2}other/);
   assert.match(dry, /a {2}#3 -> #2 {2}second/);
   assert.doesNotMatch(dry, /#1 -> #1/);
   assert.deepEqual(fs.readdirSync(dir).filter((name) => name.includes("backup")), [], "dry run writes nothing");
 
   const done = tdo("migrate");
-  assert.match(done, /upgraded schema v1 -> v2/);
+  assert.match(done, /upgraded schema v1 -> v3/);
   assert.match(done, /backup: .*tdo\.db\.v1-backup-/);
   assert.match(tdo("show", "2"), /^#2 second/);
-  assert.match(tdo("migrate"), /already at schema v2/);
+  assert.match(tdo("migrate"), /already at schema v3/);
 });
 
 test("ls -a groups by project, most urgent first, capped per project", () => {
@@ -261,6 +261,21 @@ test("commands pick with fzf when the id is left out", () => {
   answer = [];
   assert.throws(() => tdo("show"), (error) => error.constructor.name === "Cancelled");
   assert.throws(() => harness()("show"), /needs an item id \(or install fzf/);
+});
+
+test("push recovery picker includes closed items and respects explicit status filters", () => {
+  let offered;
+  const tdo = harness({ pick: (lines) => { offered = lines.map((line) => line.split("\t")[0]); return []; } });
+  tdo("add", "active");
+  tdo("add", "closed");
+  tdo("done", "2");
+  // Detach works without a tracker config; cancelling stops before any mutation.
+  assert.throws(() => tdo("push", "--detach"), (error) => error.constructor.name === "Cancelled");
+  assert.deepEqual(offered, [`${PROJECT}#1`, `${PROJECT}#2`]);
+  assert.throws(() => tdo("push", "--detach", "-s", "active"), (error) => error.constructor.name === "Cancelled");
+  assert.deepEqual(offered, [`${PROJECT}#1`]);
+  assert.throws(() => tdo("reopen", "-s", "active"), (error) => error.constructor.name === "Cancelled");
+  assert.deepEqual(offered, [`${PROJECT}#1`]);
 });
 
 test("edit without flags round-trips title and body through the editor", () => {

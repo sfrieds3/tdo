@@ -30,7 +30,8 @@ It ships with an [agent skill](skills/tdo/SKILL.md), so Claude Code, Codex, Pi, 
 - **Scoped to the project, not the path.** Items are keyed by the repo's git remote (`github.com/owner/repo`), so a clone in `~/code` on your laptop and one in `/home/you/src` on a server share a backlog. Worktrees share their main checkout's backlog.
 - **Priorities and tags.** `urgent`, `high`, `normal`, `low`, plus free-form tags. Inline shorthand — `!high #ci` — works anywhere you type a title.
 - **Context that survives.** Each item can carry a body (the why, a repro), a `path:line`, and records where it came from: CLI, you in Pi, or the agent, with the session and host.
-- **Search.** Full-text search over titles and bodies, plus filters by tag, priority, and status.
+- **Search.** Full-text search over titles, bodies, and notes, plus filters by tag, priority, and status.
+- **File GitHub issues when you're ready.** Explicitly push an item as a snapshot using your local `gh` credentials, with per-user approval for repository-provided tracker settings.
 - **Works with any agent.** One skill teaches agents when to park, how to write an item a future session can act on, and to ask before logging what they found themselves. Every command takes `--json`, and items record which agent added them.
 - **Just SQLite, local or over SSH.** One file under `$XDG_DATA_HOME`, built-in `node:sqlite`, zero runtime dependencies. Keep it on one host and access it with your existing SSH config and agent.
 
@@ -81,12 +82,14 @@ Use `@v0.2.3` to pin an exact release, or a local path (`"~/code/tdo"`) while ha
 | `tdo add <title…> [-p PRIO] [-t TAGS] [-b BODY] [-f PATH[:LINE]]` | Add an item. `!prio` and `#tag` in the title work too. |
 | `tdo` | In a terminal with [fzf](https://github.com/junegunn/fzf): [browse and act on items](#browser). Otherwise the same as `tdo ls`. |
 | `tdo ls [-a] [-s STATUS] [-t TAGS] [-p PRIO] [-q TEXT] [-n N]` | List items. Defaults to active (`open` + `doing`) in this project. `-a` [groups by project](#all-projects). |
-| `tdo show [id]` | Full details, including the body. |
+| `tdo show [id]` | Full details, including the body, notes, and issue links. |
 | `tdo edit [id] [--title T] [-p PRIO] [-t +add,~remove] [-b BODY] [-f REF]` | Change an item. `~tag` removes a tag (quote it when it comes first: `-t '~old'`; `--tags=-old` also works). With no flags, opens the title and body in `$VISUAL` / `$EDITOR`. |
-| `tdo start` / `done` / `drop` / `reopen [id…] [-m NOTE]` | Change status; the note is appended to the body. |
+| `tdo start` / `done` / `drop` / `reopen [id…] [-m NOTE]` | Change status; save the optional note separately from the body. |
+| `tdo note [id] <text…>` | Add a note without changing status. |
+| `tdo push [id…] [--attach URL \| --force \| --detach]` | [File GitHub issues](#github-issues), recover an uncertain attempt, or remove a local link. |
+| `tdo tracker [status\|approve\|revoke] [--yes]` | Inspect tracker settings and manage approval of repository settings. |
 | `tdo rm [id]` | Delete an item outright. |
 | `tdo pick [-a] [-s STATUS]` | Pick items with fzf and print their refs, for scripting: `tdo done $(tdo pick)`. |
-
 | `tdo count` | One-line summary, e.g. `4 open (1 urgent, 1 high)`. |
 | `tdo tags [-a]` · `tdo projects` · `tdo project` | Tag counts, every project, the resolved project key. |
 | `tdo export [-a] [--md]` | Dump everything as JSON, or as a Markdown checklist. |
@@ -94,7 +97,7 @@ Use `@v0.2.3` to pin an exact release, or a local path (`"~/code/tdo"`) while ha
 
 Item ids are numbered per project, so every repo's backlog starts at `#1`. `3` or `#3` means item 3 in the current project; reach another project with `NAME#3` (`gadgets#3`, when the name is unambiguous), `KEY#3` (`github.com/example/gadgets#3`), or `--project KEY`. Cross-project listings (`ls -a`) show ids as `NAME#3`. In `--json` output, `id` is the per-project number and `projectId` is the project's UUID; together they identify an item.
 
-Leave the id out of `show`, `edit`, `start`, `done`, `drop`, `reopen`, or `rm` and tdo opens fzf to pick it (`tab` marks several for the status commands; `reopen` offers closed items). Add `-a` to pick across projects. Without fzf or a terminal, the id is required.
+Leave the id out of `show`, `edit`, `start`, `done`, `drop`, `reopen`, `note`, `push`, or `rm` and tdo opens fzf to pick it (`tab` marks several for the status commands and `push`; `reopen` offers closed items). Add `-a` to pick across projects. Without fzf or a terminal, the id is required.
 
 Global options: `--db TARGET` for a one-off local or SSH database override, `--json` for machine-readable output, `--project KEY` to target another project, `-C DIR` to resolve the project from another directory, `-a` / `--all` to span every project. `add` also takes `--source NAME` (or `TDO_SOURCE`) to record who added the item; it defaults to `cli`.
 
@@ -105,6 +108,75 @@ Global options: `--db TARGET` for a one-off local or SSH database override, `--j
 `tdo export` always includes every matching item in the current project (all statuses by default); `-a` spans all projects and `-s` selects statuses. Exports, the CLI browser, and CLI fzf pickers have no row limit. Large SSH results can still exceed the transport byte/time bounds described below; that fails explicitly rather than returning a partial export.
 
 `-p` on `ls` means "this priority or more urgent", so `tdo ls -p high` shows urgent and high items. Priorities accept prefixes (`-p u`).
+
+### Notes
+
+Status notes (`tdo done 3 -m "fixed the empty-file case"`) and standalone notes (`tdo note 3 "reproduces only on Linux"`) are stored separately from the item body. `show`, JSON and Markdown exports, and the Pi work hand-off include them. Full-text search covers notes too; replacing the body with `tdo edit -b` does not remove notes. Notes are not included in filed GitHub issue bodies.
+
+### GitHub issues
+
+This version supports **manual snapshot filing**, not ongoing sync. Install and authenticate the [GitHub CLI](https://cli.github.com/) (`gh auth login`) on the machine where you run tdo. With an SSH database, `gh` still runs locally, never through the database helper.
+
+Commit a tracker block in `.tdo/config.json` at the repository root:
+
+```json
+{
+  "tracker": {
+    "provider": "github",
+    "repo": "example/widgets",
+    "labels": ["backlog"]
+  }
+}
+```
+
+`repo` accepts `OWNER/REPO` or `HOST/OWNER/REPO` (for GitHub Enterprise). Omit it to derive the destination from a `github.com/OWNER/REPO` project key; other project keys require it explicitly. Labels must already exist on GitHub; tdo does not silently retry without them.
+
+```sh
+tdo tracker status          # settings, approval, gh health, and link counts
+tdo tracker approve         # review and approve this repository's settings
+tdo push 3                  # file one item
+tdo push 4 5                # file several; failures don't stop later items
+tdo ls --linked             # list active items with a link record
+tdo ls --linked -s all       # include closed local items
+```
+
+Repository settings require **your approval**, saved in your user config. Approval pins the normalized repository settings and resolved destination; changing either requires approval again. An interactive `push` can ask for approval, but scripts must first review `tracker status` and explicitly run `tdo tracker approve --yes`. `tdo tracker revoke` removes approval without deleting existing links or issues. `tracker status` can check `gh` health, but only an explicit `push` creates an issue.
+
+To keep tracker settings private, put them under `projects.<project-key>.tracker` in your [user config](#configuration):
+
+```json
+{
+  "projects": {
+    "github.com/example/widgets": {
+      "tracker": {
+        "provider": "github",
+        "repo": "example/widgets",
+        "labels": ["backlog"]
+      }
+    }
+  }
+}
+```
+
+User settings override individual repository settings; labels replace the whole list. A tracker defined only in your user config needs no approval. Set that project's `"tracker": false` to disable it. Defaults are `mode: "manual"`, `tag: "issue"`, `labels: []`, and `closeOnDone: true`. `mode: "auto-on-tag"`, `tag`, and `closeOnDone` are accepted for future versions, but **there is no auto-filing, comment posting, edit sync, or close/reopen sync yet**, regardless of those settings. `tracker status` calls out the inactive mode and close behavior.
+
+A new issue contains the title and body, plus the file reference if present, without tdo identifiers or notes. Later local edits, notes, and status changes are not sent to GitHub. Items already marked `done` or `dropped` cannot be newly filed in this version. Pushing an already-filed item returns its existing link rather than creating another issue. Existing links retain their original destination if configuration changes.
+
+#### Links and recovery
+
+Lists and browser rows show `↗#42` for a filed issue, `↗…` for a pending/in-progress attempt, `↗?` for an awaiting-approval link, and `↗!` for an error or unknown outcome. `tdo show` includes link details. `--linked` matches any link state, not just successfully filed issues.
+
+An interrupted, timed-out, or unrecognized failed create may have made an issue. tdo records an **unknown** outcome and does not automatically retry it. Check GitHub first:
+
+```sh
+tdo push 3 --attach https://github.com/example/widgets/issues/42  # record the existing issue
+tdo push 3 --force                                              # only after checking no issue exists
+tdo push 3 --detach                                             # remove the local link; leave GitHub untouched
+```
+
+`--attach` accepts exactly one item and checks the URL's syntax and destination, not whether the issue exists. `--force` only applies to an unknown or stale interrupted attempt, and can create a duplicate if your check was wrong. Neither attach nor detach can replace an active create attempt. Detaching makes a later plain push eligible to file a new issue, so prefer attach when recovering an existing one. Multi-item `push --json` returns a per-item result array and exits with status 1 if any item failed.
+
+Agents must only push when you explicitly ask them to. Local tdo ids are backlog references, not identifiers to include in commits, PRs, or branch names.
 
 ### Browser
 
@@ -198,9 +270,10 @@ The footer shows `☑ 4 (2!) ▸ #3 login test flakes on CI` — open items, how
 In order, the first that applies:
 
 1. `TDO_PROJECT` environment variable, or `--project KEY`.
-2. The first line of a `.tdo-project` file at the repo root — handy for monorepo subprojects, or committing a key the whole team shares.
-3. The git remote (`origin`, else the first remote), normalized: `git@github.com:Owner/repo.git` and `https://github.com/Owner/repo` both become `github.com/Owner/repo`.
-4. No remote: `local:~/path/to/repo` (home-relative, so it matches across machines with the same layout).
+2. The `project` string in `.tdo/config.json` at the repo root — a committed project key, which can sit alongside tracker settings.
+3. The first line of a `.tdo-project` file at the repo root (legacy fallback).
+4. The git remote (`origin`, else the first remote), normalized: `git@github.com:Owner/repo.git` and `https://github.com/Owner/repo` both become `github.com/Owner/repo`.
+5. No remote: `local:~/path/to/repo` (home-relative, so it matches across machines with the same layout).
 
 The result then goes through `aliases` in the [config file](#configuration), so a fork can share its upstream's backlog without touching the repo. Run `tdo project` to see what the current directory resolves to.
 
@@ -208,7 +281,21 @@ The result then goes through `aliases` in the [config file](#configuration), so 
 
 The database lives at `$XDG_DATA_HOME/tdo/tdo.db` — `~/.local/share/tdo/tdo.db` by default, on macOS too. Set `db` in the config file or `TDO_DB` to put it elsewhere. It is plain SQLite in WAL mode, so `sqlite3 ~/.local/share/tdo/tdo.db` works for ad-hoc queries.
 
-Schema: `projects` has a UUID `id` and the project `key`; `items` is keyed by `(project_id, id)`, where `id` is the per-project number; `tags` references that pair. Full-text search lives in `items_fts`, kept in sync by triggers.
+Schema: `projects` has a UUID `id` and the project `key`; `items` is keyed by `(project_id, id)`, where `id` is the per-project number; `tags`, `notes`, and `links` reference that pair. Full-text search lives in `items_fts`, kept in sync by triggers and covering notes as well as titles and bodies. Schema v3 also reserves `link_ops` for future lifecycle sync; this version does not enqueue or drain operations.
+
+### Upgrading for notes and GitHub issues
+
+**Compatibility break:** this feature uses schema v3 and SSH RPC v3. Update tdo on both the caller and database host to the same release before using an SSH database. Old helpers fail the protocol check; after updating the helper, an existing v2 remote database still requires an explicit `tdo migrate`. Local databases upgrade automatically on open, with a backup; use the commands below to preview first:
+
+```sh
+tdo migrate --dry-run
+tdo migrate
+# For a remote database, use its configured target or pass --db to both commands.
+```
+
+The v2→v3 migration preserves per-project ids, creates note/link tables, and rebuilds full-text search. It extracts recognized trailing legacy status-note blocks from item bodies into notes, leaving the remaining body intact. The dry-run reports how many notes would move. Notes now appear separately in item JSON (`notes`) rather than being appended to `body`; item JSON also includes `links`. The database records whether an item was created by a human for future auto-filing safeguards.
+
+Backups are created beside the database on the machine storing it. To roll back, restore the pre-upgrade backup and use the older tdo release; older versions cannot read schema v3. Do not point an older caller at the upgraded database.
 
 ### Upgrading from 0.1.x
 
@@ -225,7 +312,7 @@ Items are renumbered per project in their original order, so the oldest item in 
 
 ### SSH remote database
 
-Install a compatible version of `tdo` and Node 22.18+ on the server. The remote noninteractive shell must find `tdo` on `PATH`; use the same tdo release on both ends. Unlimited list/export support uses RPC protocol v2: upgrade both ends together. Older helpers are rejected rather than allowed to silently apply the old row ceiling. Configure SSH keys/agent, host keys, and any jump hosts with your normal SSH setup first. No daemon, database file synchronization, or network-mounted SQLite file is needed.
+Install a compatible version of `tdo` and Node 22.18+ on the server. The remote noninteractive shell must find `tdo` on `PATH`; use the same tdo release on both ends. Unlimited list/export support requires RPC protocol v2 or later; structured notes and tracker operations require v3: upgrade both ends together. Older helpers are rejected rather than allowed to silently apply the old row ceiling. Configure SSH keys/agent, host keys, and any jump hosts with your normal SSH setup first. No daemon, database file synchronization, or network-mounted SQLite file is needed.
 
 ```sh
 tdo db use 'ssh://you@backlog-host/home/you/.local/share/tdo/tdo.db'
@@ -276,6 +363,9 @@ Everything works without a config file. To change defaults, create `$XDG_CONFIG_
 | `floating` | Open the CLI browser in a tmux popup or Rex floating pane when available (default `false`). `--no-float` overrides it. |
 | `worktree` | Pi `/tdo` "work on it" asks the agent to work in a new git worktree and branch, which it names (default `false`). |
 | `aliases` | Maps a resolved project key to the key to use instead — e.g. your fork to its upstream, so both share one backlog. |
+| `projects` | Per-project settings, keyed by the resolved project key. `tracker` overrides repository tracker settings, or `false` disables filing. See [GitHub issues](#github-issues). |
+
+Repository config is separate: `.tdo/config.json` accepts `project` and `tracker`, not user settings such as `db`. A malformed repository file or invalid `project` fails project resolution; an invalid tracker block is reported by tracker commands without blocking ordinary backlog commands.
 
 Environment variables: `TDO_DB`, `TDO_CONFIG`, `TDO_PROJECT` (force a project key), `TDO_SOURCE` (default `--source`), `TDO_FZF_OPTS` (extra fzf flags), `NO_COLOR` / `FORCE_COLOR`.
 
@@ -296,7 +386,7 @@ Layout: [`src/core.ts`](src/core.ts) holds queries, paths, config, and project r
 
 ### Adding a schema migration
 
-Historical migrations are immutable: do not edit [`src/migrations/v2.ts`](src/migrations/v2.ts) or make it depend on current application helpers. For v3, add a self-contained `src/migrations/v3.ts` conversion, register a `2 -> 3` step in [`src/migrations/index.ts`](src/migrations/index.ts), and bump `SCHEMA` there to 3. Keep the `0 -> 2` initialization and `1 -> 2` conversion: fresh and old databases then follow the same chain to v3. Steps run inside one `BEGIN IMMEDIATE` transaction; the runner updates `user_version` after each step and takes one pre-upgrade backup for an existing file. Steps must not commit, start transactions, or set `user_version`. Add tests for the new conversion, fresh/upgraded schema equivalence, and rollback of the whole chain on failure, then run `pnpm check`. Local upgrades remain automatic; older remote databases still require `tdo migrate` explicitly.
+Historical migrations are immutable: do not edit [`src/migrations/v2.ts`](src/migrations/v2.ts) or [`src/migrations/v3.ts`](src/migrations/v3.ts), or make them depend on current application helpers. For v4, add a self-contained `src/migrations/v4.ts` conversion, register a `3 -> 4` step in [`src/migrations/index.ts`](src/migrations/index.ts), and bump `SCHEMA` there to 4. Keep the earlier steps: fresh and old databases then follow the same chain (`0 -> 2 -> 3 -> 4`, `1 -> 2 -> 3 -> 4`). Steps run inside one `BEGIN IMMEDIATE` transaction; the runner updates `user_version` after each step and takes one pre-upgrade backup for an existing file. Steps must not commit, start transactions, or set `user_version`. Add tests for the new conversion, fresh/upgraded schema equivalence, and rollback of the whole chain on failure, then run `pnpm check`. Local upgrades remain automatic; older remote databases still require `tdo migrate` explicitly.
 
 Commits and PR titles follow [Conventional Commits](https://www.conventionalcommits.org/). [release-please](https://github.com/googleapis/release-please) turns them into a release PR with a changelog; merging it tags the release, moves the `vMAJOR` / `vMAJOR.MINOR` tags, and attaches an npm tarball.
 

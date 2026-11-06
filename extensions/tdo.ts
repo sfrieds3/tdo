@@ -36,6 +36,8 @@ const FOCUS_TITLE_CHARS = 40;
 const PICKER_LIMIT = 200;
 /** Added to the hand-off when config `worktree` is true; the agent picks the names. */
 export const WORKTREE_INSTRUCTION = "Do the work in a new git worktree on a new branch (create it with `git worktree add -b <branch> <main-checkout>/.worktrees/<name>`, choosing a short descriptive branch and directory name; never put it next to the repo), not in the current checkout.";
+/** tdo ids are local bookkeeping; on GitHub `#3` links to an unrelated issue or PR. */
+export const NO_IDS_INSTRUCTION = "Don't put tdo ids (#3, tdo#3, name#3) in commit messages, PR text, or branch names; describe the change instead.";
 const ALL_ARGS = new Set(["all", "--all", "-a"]);
 const HELP = [
   "/tdo — pick an item in this project (--all or all: every project)",
@@ -228,7 +230,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
     const ref = itemRef(started, { showProject });
     const close = showProject ? `tdo done ${started.id} --project ${started.project}` : `tdo done ${started.id}`;
     const worktree = loadConfig().worktree ? ` ${WORKTREE_INSTRUCTION}` : "";
-    const message = `Let's work on tdo item ${ref} (marked as doing).${worktree} When it's fixed, close it with \`${close} -m "<what changed>"\`.\n\n${formatItemDetail(started)}`;
+    const message = `Let's work on tdo item ${ref} (marked as doing).${worktree} ${NO_IDS_INSTRUCTION} When it's fixed, close it with \`${close} -m "<what changed>"\`.\n\n${formatItemDetail(started)}`;
     if (ctx.isIdle()) pi.sendUserMessage(message);
     else pi.sendUserMessage(message, { deliverAs: "followUp" });
   }
@@ -329,7 +331,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
         const session = sessionId(ctx);
         const current = await project(ctx);
         if (stopped || epoch !== lifecycle) return;
-        const item = await callStore("addItem", { project: current, title: quick.title, priority: quick.priority, tags: quick.tags, source: "user", sessionId: session, host: hostName() });
+        const item = await callStore("addItem", { project: current, title: quick.title, priority: quick.priority, tags: quick.tags, source: "user", sessionId: session, host: hostName(), createdByHuman: true });
         if (stopped || epoch !== lifecycle) return;
         await refreshStatus(ctx);
         if (stopped || epoch !== lifecycle) return;

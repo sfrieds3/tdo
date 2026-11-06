@@ -9,7 +9,9 @@ import * as path from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { floatingBackend, launchFloatingBrowser } from "./floating.ts";
-import { createStore, parseTarget, saveDbTarget, serveRpc } from "./store.ts";
+import { createStore, parseTarget, saveDbTarget, serveRpc, type Store } from "./store.ts";
+import { INACTIVE_SETTINGS, isApproved, resolveTracker, setApproval, type EffectiveTracker, type TrackerResolution } from "./trackers/config.ts";
+import { pushItem, trackerFor, type PushResult } from "./trackers/sync.ts";
 import {
   PRIORITIES,
   STATUS_FILTERS,
@@ -28,6 +30,7 @@ import {
   getConfigPath,
   getDbPath,
   loadConfig,
+  updateConfig,
   type IdChange,
   parseQuickAdd,
   parseStatusFilter,
@@ -48,16 +51,22 @@ usage:
                             otherwise the same as tdo ls
   tdo add <title...> [-p PRIO] [-t TAGS] [-b BODY] [-f PATH[:LINE]] [--source NAME]
                             (inline !high and #tag work too)
-  tdo ls [-a] [-s STATUS] [-t TAGS] [-p PRIO] [-q TEXT] [-n N]
+  tdo ls [-a] [-s STATUS] [-t TAGS] [-p PRIO] [-q TEXT] [-n N] [--linked]
                             N items (default ${DEFAULT_LIST_LIMIT}; 0 = all, no row cap)
                             -a groups by project, N items each (default ${DEFAULT_PER_PROJECT}; 0 = all)
+                            ↗#42 filed as an issue, ↗… in progress, ↗! needs attention
                             truncated results show a notice (stderr with --json)
   tdo show [id]             ids are per project: 3 or #3 here, NAME#3 or KEY#3 elsewhere
   tdo edit [id] [--title T] [-p PRIO] [-t +tag,~tag] [-b BODY] [-f REF]
                             ~tag removes a tag (quote a leading ~: -t '~tag')
                             no flags: edit title and body in $EDITOR
   tdo start|done|drop|reopen [id...] [-m NOTE]
+  tdo note [id] <text...>   add a note without changing status
   tdo rm [id]
+  tdo push [id...] [--attach URL | --force | --detach]
+                            file items as GitHub issues (see tdo tracker)
+  tdo tracker [status|approve|revoke] [--yes]
+                            issue tracker config from .tdo/config.json and your approval
   tdo pick [-a] [-s STATUS] print the refs of items picked with fzf
                             (any command above picks with fzf when the id is left out)
   tdo count                 open-item summary for the current project
@@ -86,7 +95,8 @@ options:
 priorities: ${PRIORITIES.join(", ")} (prefixes and 0-3 accepted)
 statuses:   ${STATUS_FILTERS.join(", ")} (ls default: active = open + doing)
 files:      database $XDG_DATA_HOME/tdo/tdo.db (default ~/.local/share/tdo/tdo.db)
-            config   $XDG_CONFIG_HOME/tdo/config.json (optional; keys: db, aliases, perProject, floating, worktree)
+            config   $XDG_CONFIG_HOME/tdo/config.json (optional; keys: db, aliases, perProject, floating, worktree, projects)
+            repo     .tdo/config.json at the repo root (optional; keys: project, tracker)
 env:        TDO_DB, TDO_CONFIG, TDO_PROJECT, TDO_SOURCE (who is adding: cli, claude, codex, ...),
             TDO_FZF_OPTS (extra fzf flags), NO_COLOR / FORCE_COLOR`;
 
@@ -109,6 +119,11 @@ const OPTIONS = {
   md: { type: "boolean" },
   "dry-run": { type: "boolean" },
   source: { type: "string" },
+  linked: { type: "boolean" },
+  attach: { type: "string" },
+  force: { type: "boolean" },
+  detach: { type: "boolean" },
+  yes: { type: "boolean", short: "y" },
   help: { type: "boolean", short: "h" },
 } as const;
 
@@ -126,8 +141,12 @@ export type Interactive = {
 
 export type Io = {
   out: (text: string) => void;
-  /** Diagnostics such as truncated JSON results; defaults to stderr. */
+  /** Warnings and progress; never mixed into --json stdout. Defaults to stderr. */
   err?: (text: string) => void;
+  /** Asks a yes/no question on the terminal; undefined when there is none. Injectable for tests. */
+  confirm?: (question: string) => boolean;
+  /** stdin and stdout are a terminal; decides whether an item was added by a person. */
+  tty?: boolean;
   cwd: string;
   env: NodeJS.ProcessEnv;
   color?: boolean;
@@ -139,8 +158,9 @@ export type Io = {
   runFloat?: typeof launchFloatingBrowser;
 } & Interactive;
 
-const PICK_COMMANDS = new Set(["show", "edit", "start", "done", "drop", "reopen", "rm", "pick"]);
-const MULTI_COMMANDS = new Set(["start", "done", "drop", "reopen", "pick"]);
+const MULTI_COMMANDS = new Set(["start", "done", "drop", "reopen", "pick", "push"]);
+/** Sources that mean a person typed the command (with a terminal attached). */
+const HUMAN_SOURCES = new Set(["cli", "user"]);
 
 function shellQuote(value: string): string {
   return /^[\w@%+=:,./-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`;
@@ -247,6 +267,13 @@ function dbCommand(args: string[], dbPath: string, io: CliIO, json: boolean): nu
   throw new UsageError("usage: tdo db use <target> | tdo db check");
 }
 
+/** Recovery actions must also offer closed items; ordinary push only offers active ones. */
+function pickerDefaultStatus(command: string, values: { attach?: string; detach?: boolean }): StatusFilter {
+  if (command === "reopen") return "closed";
+  if (command === "push" && (values.detach || values.attach)) return "all";
+  return "active";
+}
+
 export function run(argv: string[], io: Io): number {
   const { values, positionals } = parseArgs({ args: argv, options: OPTIONS, allowPositionals: true, strict: true });
   const [command = io.interactive && !values.json ? "browse" : "ls", ...args] = positionals;
@@ -285,15 +312,19 @@ export function run(argv: string[], io: Io): number {
   }
 
   if (command === "db") return dbCommand(args, dbPath, io, json);
+  const warn = io.err ?? ((text: string) => console.error(text));
+  const tracker = (): TrackerResolution => resolveTracker(project(), config, { configPath: getConfigPath(io.env) });
+  if (command === "tracker") return trackerCommand(args, { io, json, emit, warn, project: project(), tracker: tracker(), yes: !!values.yes, dbPath });
   const db = createStore(dbPath, { env: io.env });
   if (command === "migrate") {
     try {
       const result = db.call("migrate", !!values["dry-run"]);
       const renamed = result.changes.filter((row: IdChange) => row.from !== row.to).map((row: IdChange) => `  ${row.project}  #${row.from} -> #${row.to}  ${row.title}`);
+      const moved = result.notesMoved ? [`${values["dry-run"] ? "would move" : "moved"} ${result.notesMoved} status note${result.notesMoved === 1 ? "" : "s"} out of item bodies.`] : [];
       emit(result, [
         result.from === result.to ? `${dbPath}: already at schema v${result.to}.` : `${dbPath}: ${values["dry-run"] ? "would upgrade" : "upgraded"} schema v${result.from} -> v${result.to}.`,
         ...(result.backup ? [`backup: ${result.backup}`] : []),
-        renamed.length ? "id changes:" : "no ids changed.", ...renamed,
+        ...(result.from === result.to ? [] : [...(renamed.length ? ["id changes:", ...renamed] : ["no ids changed."]), ...moved]),
       ].join("\n"));
       return 0;
     } finally { db.close(); }
@@ -305,11 +336,11 @@ export function run(argv: string[], io: Io): number {
   const all = !!values.all;
 
   /** Items named on the command line, or picked with fzf when there are none. */
-  const targets = (): Item[] => {
-    if (args.length) return args.map(find);
+  const targets = (refs: string[] = args): Item[] => {
+    if (refs.length) return refs.map(find);
     const pick = io.pick ?? fzfPick(io.env);
     if (!pick) throw new UsageError(`tdo ${command} needs an item id (or install fzf and run it in a terminal to pick one).`);
-    const status = parseStatusFilter(values.status ?? (command === "reopen" ? "closed" : "active"));
+    const status = parseStatusFilter(values.status ?? pickerDefaultStatus(command, values));
     const items = db.call("listItems", { project: all ? undefined : project().key, status, limit: 0 }).sort((a, b) => (all ? a.project.localeCompare(b.project) : 0) || byStatusThenPriority(a, b));
     if (!items.length) throw new Error(`nothing to pick from${all ? "" : ` in ${project().key}`}.`);
     const self = [process.execPath, ...process.execArgv, process.argv[1] ?? "tdo", "--db", dbPath, "--project", project().key].map(shellQuote).join(" ");
@@ -320,8 +351,8 @@ export function run(argv: string[], io: Io): number {
     if (!picked.length) throw new Cancelled();
     return picked.map((ref) => db.call("findItem", ref, project().key));
   };
-  const one = (): Item => {
-    const picked = targets();
+  const one = (refs: string[] = args): Item => {
+    const picked = targets(refs);
     if (picked.length > 1) throw new UsageError(`tdo ${command} takes one item.`);
     return picked[0]!;
   };
@@ -330,6 +361,7 @@ export function run(argv: string[], io: Io): number {
       case "add": {
         const quick = parseQuickAdd(args.join(" "));
         if (!quick.title) throw new UsageError("tdo add needs a title.");
+        const source = values.source || io.env.TDO_SOURCE || "cli";
         const item = db.call("addItem", {
           project: project(),
           title: quick.title,
@@ -337,9 +369,10 @@ export function run(argv: string[], io: Io): number {
           tags: [...quick.tags, ...(values.tags ?? [])],
           body: values.body,
           fileRef: values.file,
-          source: values.source || io.env.TDO_SOURCE || "cli",
+          source,
           sessionId: io.env.TDO_SESSION_ID,
           host: os.hostname().split(".")[0],
+          createdByHuman: !!io.tty && HUMAN_SOURCES.has(source),
         });
         emit(item, `added ${formatItemLine(item)}`);
         return 0;
@@ -355,6 +388,7 @@ export function run(argv: string[], io: Io): number {
           tags: values.tags,
           minPriority: values.priority ? requirePriority(values.priority) : undefined,
           query: values.query,
+          ...(values.linked ? { linked: true } : {}),
         };
         if (!all) {
           const cap = limit ?? DEFAULT_LIST_LIMIT;
@@ -469,9 +503,23 @@ export function run(argv: string[], io: Io): number {
         emit(items.length === 1 ? items[0] : items, items.map((item) => `${item.status} ${formatItemLine(item)}`).join("\n"));
         return 0;
       }
+      case "note": {
+        // `tdo note 3 text...`; without a leading id, pick the item and use every word as the note.
+        const ref = args.length && /^(?:.+#|#)?\d+$/.test(args[0]!) ? args[0] : undefined;
+        const text = (ref ? args.slice(1) : args).join(" ").trim() || values.message?.trim();
+        if (!text) throw new UsageError("tdo note needs text: tdo note <id> <text...>");
+        const target = one(ref ? [ref] : []);
+        const item = db.call("addNote", target, text);
+        emit(item, `noted ${formatItemLine(item, { color })}`);
+        return 0;
+      }
+      case "push":
+        return pushCommand(db, { targets, find, args, values, json, emit, warn, io, tracker: tracker(), projectKey: project().key });
       case "rm": {
         const item = db.call("deleteItem", one());
         emit(item, `deleted #${item.id} ${item.title}`);
+        const filed = item.links.find((link) => link.url);
+        if (filed) warn(`tdo: ${filed.url} was left open on ${filed.destination}.`);
         return 0;
       }
       case "count": {
@@ -501,6 +549,153 @@ export function run(argv: string[], io: Io): number {
   } finally {
     db.close();
   }
+}
+
+/** Asks on the controlling terminal; undefined when there's no terminal to ask on. */
+function ttyConfirm(question: string): boolean | undefined {
+  if (!process.stdin.isTTY) return undefined;
+  return /^y(es)?$/i.test(askTty(`${question} [y/N] `).trim());
+}
+
+function describeTracker(tracker: EffectiveTracker): string[] {
+  const from = (key: keyof EffectiveTracker["sources"]) => (tracker.sources[key] === "user" ? "  (your config)" : "");
+  return [
+    `provider:    ${tracker.provider}${from("provider")}`,
+    `destination: ${tracker.destination}${from("repo")}`,
+    `mode:        ${tracker.mode}${from("mode")}`,
+    `tag:         #${tracker.tag}${from("tag")}`,
+    `labels:      ${tracker.labels.length ? tracker.labels.join(", ") : "(none)"}${from("labels")}`,
+    `closeOnDone: ${tracker.closeOnDone}${from("closeOnDone")}`,
+  ];
+}
+
+const APPROVAL_TEXT: Record<EffectiveTracker["approval"], string> = {
+  approved: "approved",
+  unapproved: "not approved; run `tdo tracker approve`",
+  changed: "changed since you approved it; run `tdo tracker approve` to review",
+  "user-only": "defined in your config (no approval needed)",
+};
+
+/** Shows the effective tracker and asks to approve it; writes the approval on yes. */
+function approve(tracker: EffectiveTracker, projectKey: string, options: { io: Io; warn: (text: string) => void; yes: boolean; env: NodeJS.ProcessEnv }): boolean {
+  if (tracker.approval === "user-only" || tracker.approval === "approved") return true;
+  if (!options.yes) {
+    const ask = options.io.confirm ?? ttyConfirm;
+    options.warn([`${projectKey}: .tdo/config.json wants to file issues with your gh credentials:`, ...describeTracker(tracker).map((line) => `  ${line}`)].join("\n"));
+    const answer = ask("Approve?");
+    if (answer === undefined) throw new UsageError("no terminal to confirm on; review with `tdo tracker status` and run `tdo tracker approve --yes`.");
+    if (!answer) return false;
+  }
+  updateConfig((raw) => setApproval(raw, projectKey, tracker.hash), options.env);
+  tracker.approval = "approved";
+  return true;
+}
+
+type TrackerCommandContext = { io: Io; json: boolean; emit: (data: unknown, text: string) => void; warn: (text: string) => void; project: Project; tracker: TrackerResolution; yes: boolean; dbPath: string };
+
+function trackerCommand(args: string[], ctx: TrackerCommandContext): number {
+  const [sub = "status", ...rest] = args;
+  if (rest.length) throw new UsageError(`unexpected argument: ${rest[0]}`);
+  const { tracker } = ctx;
+  if (sub === "status") {
+    if (tracker.kind !== "ok") {
+      const text = tracker.kind === "none" ? "no tracker configured (add a \"tracker\" block to .tdo/config.json)" : tracker.kind === "disabled" ? "tracker disabled in your config" : `invalid tracker config: ${tracker.error}`;
+      ctx.emit({ project: ctx.project.key, tracker: tracker.kind, ...(tracker.kind === "invalid" ? { error: tracker.error } : {}) }, `${ctx.project.key}: ${text}`);
+      return tracker.kind === "invalid" ? 1 : 0;
+    }
+    const config = tracker.tracker;
+    const health = trackerFor(config.destination, ctx.io.env).check();
+    let links: Record<string, number[]> | undefined;
+    let linksError: string | undefined;
+    const store = createStore(ctx.dbPath, { env: ctx.io.env });
+    try { links = store.call("countLinks", ctx.project.key); } catch (error) { linksError = (error as Error).message; } finally { store.close(); }
+    const inactive = INACTIVE_SETTINGS.filter((key) => config.sources[key]);
+    ctx.emit({ project: ctx.project.key, tracker: { ...config }, gh: health.ok ? "ok" : health.message, links: links ?? null, ...(linksError ? { linksError } : {}) }, [
+      `${ctx.project.key}: ${config.provider} issues in ${config.destination}`,
+      ...describeTracker(config).map((line) => `  ${line}`),
+      `approval:    ${APPROVAL_TEXT[config.approval]}`,
+      `gh:          ${health.ok ? "ok" : health.message}`,
+      ...(inactive.length ? [`note:        ${inactive.join(", ")} not active until a later version`] : []),
+      ...(links ? Object.entries(links).map(([state, ids]) => `${`${state}:`.padEnd(13)}${ids.map((id) => `#${id}`).join(" ")}`) : [`links:       unavailable (${linksError})`]),
+    ].join("\n"));
+    return 0;
+  }
+  if (tracker.kind === "invalid") throw new Error(`invalid tracker config: ${tracker.error}`);
+  if (tracker.kind !== "ok") throw new Error(`${ctx.project.key}: no tracker configured.`);
+  const config = tracker.tracker;
+  if (sub === "approve") {
+    if (config.approval === "user-only") throw new Error("this tracker is defined in your own config; there's nothing to approve.");
+    const approved = approve(config, ctx.project.key, { io: ctx.io, warn: ctx.warn, yes: ctx.yes, env: ctx.io.env });
+    if (!approved) throw new Cancelled();
+    ctx.emit({ project: ctx.project.key, approved: true, hash: config.hash }, `approved: ${config.provider} issues in ${config.destination} for ${ctx.project.key}.`);
+    return 0;
+  }
+  if (sub === "revoke") {
+    if (config.approval === "user-only") throw new Error("this tracker is defined in your config; remove it or set \"tracker\": false.");
+    updateConfig((raw) => setApproval(raw, ctx.project.key, undefined), ctx.io.env);
+    ctx.emit({ project: ctx.project.key, approved: false }, `revoked tracker approval for ${ctx.project.key}.`);
+    return 0;
+  }
+  throw new UsageError("usage: tdo tracker [status|approve|revoke] [--yes]");
+}
+
+type PushContext = {
+  targets: () => Item[];
+  find: (ref: string) => Item;
+  args: string[];
+  values: { attach?: string; force?: boolean; detach?: boolean; yes?: boolean };
+  json: boolean;
+  emit: (data: unknown, text: string) => void;
+  warn: (text: string) => void;
+  io: Io;
+  tracker: TrackerResolution;
+  projectKey: string;
+};
+
+function pushCommand(db: Store, ctx: PushContext): number {
+  const { values } = ctx;
+  if ([values.attach !== undefined, values.force, values.detach].filter(Boolean).length > 1) throw new UsageError("--attach, --force, and --detach can't be combined.");
+  const provider = ctx.tracker.kind === "ok" ? ctx.tracker.tracker.provider : "github";
+  if (values.detach) {
+    const results = ctx.targets().map((item) => {
+      const link = db.call("detachLink", item, provider);
+      return { id: item.id, detached: !!link, url: link?.url ?? undefined };
+    });
+    ctx.emit(results, results.map((row) => (row.detached ? `#${row.id}: detached${row.url ? ` (left ${row.url} as is)` : ""}` : `#${row.id}: no link`)).join("\n"));
+    return 0;
+  }
+  if (ctx.tracker.kind === "invalid") throw new Error(`invalid tracker config: ${ctx.tracker.error}`);
+  if (ctx.tracker.kind !== "ok") throw new Error(`${ctx.projectKey}: no tracker configured; add a "tracker" block to .tdo/config.json.`);
+  const config = ctx.tracker.tracker;
+  if (!isApproved(config)) {
+    if (config.approval === "changed") ctx.warn("tdo: tracker config changed since you approved it.");
+    if (!approve(config, ctx.projectKey, { io: ctx.io, warn: ctx.warn, yes: false, env: ctx.io.env })) throw new Cancelled();
+  }
+  db.call("expireStaleClaims", ctx.projectKey);
+  if (values.attach !== undefined) {
+    if (ctx.args.length !== 1) throw new UsageError("--attach takes exactly one item id.");
+    const item = ctx.find(ctx.args[0]!);
+    if (item.project !== ctx.projectKey) throw new Error(`#${item.id} belongs to ${item.project}; run tdo push from that project.`);
+    const parsed = trackerFor(config.destination, ctx.io.env).parseIssueUrl(values.attach);
+    if (!parsed) throw new UsageError(`not an issue URL: ${values.attach}`);
+    const destination = item.links.find((link) => link.provider === provider)?.destination ?? config.destination;
+    if (parsed.destination !== destination) throw new Error(`#${item.id} files to ${destination}; ${values.attach} is in ${parsed.destination}.`);
+    const link = db.call("attachLink", item, provider, destination, parsed.id, values.attach.trim());
+    ctx.emit([{ id: item.id, state: link.state, url: link.url, ok: true }], `#${item.id}: attached ${link.url}`);
+    return 0;
+  }
+  const results: PushResult[] = [];
+  for (const item of ctx.targets()) {
+    // This project's tracker config only applies to this project's items.
+    if (item.project !== ctx.projectKey) {
+      results.push({ id: item.id, state: "skipped", error: `${item.project}#${item.id}: run tdo push from that project.`, ok: false });
+      continue;
+    }
+    // Re-read so the link reflects stale-claim expiry and concurrent pushes.
+    results.push(pushItem(db, db.call("findItem", `${item.project}#${item.id}`, ctx.projectKey), config, { force: values.force, env: ctx.io.env, warn: ctx.warn }));
+  }
+  ctx.emit(results, results.map((row) => (row.ok ? `#${row.id}: ${row.url}` : row.error ?? `#${row.id}: ${row.state}`)).join("\n"));
+  return results.every((row) => row.ok) ? 0 : 1;
 }
 
 type BrowseState = { all: boolean; status: StatusFilter };
@@ -615,7 +810,7 @@ async function main(): Promise<void> {
       return;
     }
     const tty = !!process.stdin.isTTY && !!process.stdout.isTTY;
-    process.exitCode = run(process.argv.slice(2), { out: (text) => console.log(text), cwd: process.cwd(), env: process.env, color: useColor(process.env, process.stdout.isTTY), interactive: tty && onPath("fzf", process.env) });
+    process.exitCode = run(process.argv.slice(2), { out: (text) => console.log(text), cwd: process.cwd(), env: process.env, color: useColor(process.env, process.stdout.isTTY), interactive: tty && onPath("fzf", process.env), tty });
   } catch (error) {
     if (error instanceof Cancelled) {
       process.exitCode = 130;

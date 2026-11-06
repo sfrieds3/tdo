@@ -76,7 +76,7 @@ test("SSH CLI full CRUD, FTS, metadata, project refs, tags, counts and exports u
   assert.match(h.cli("export", "--md").text, /updated/);
   h.cli("rm", "1");
   assert.equal(h.cli("ls", "--json").json().length, 0);
-  assert.equal(h.cli("db", "check", "--json").json().schema, 2);
+  assert.equal(h.cli("db", "check", "--json").json().schema, 3);
   const args = JSON.parse(fs.readFileSync(h.log, "utf8").split("\n")[0]);
   assert.deepEqual(args, ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ConnectionAttempts=1", "-p", "2222", "-l", "alice", "--", "test-alias", "tdo internal-rpc"]);
   assert.ok(!args.join(" ").includes(h.db));
@@ -281,7 +281,7 @@ test("sync and async SSH operations enforce the overall timeout", async (t) => {
 test("helper validates closed protocol and args before opening a database", (t) => {
   const h = harness(t);
   const request = { version: RPC_VERSION, path: h.db, operation: "listItems", args: [] };
-  for (const bad of ["not-json", JSON.stringify({ ...request, version: 1 }), JSON.stringify({ ...request, extra: true }), JSON.stringify({ ...request, path: "ssh://host/db" }), JSON.stringify({ ...request, operation: "exec", args: ["DROP TABLE items"] }), JSON.stringify({ ...request, args: [{ limit: "1; DROP TABLE items" }] }), JSON.stringify({ ...request, operation: "addItem", args: [{ project: {}, title: "bad" }] }), "x".repeat(MAX_RPC_BYTES + 1)]) {
+  for (const bad of ["not-json", JSON.stringify({ ...request, version: 1 }), JSON.stringify({ ...request, version: 2 }), JSON.stringify({ ...request, extra: true }), JSON.stringify({ ...request, path: "ssh://host/db" }), JSON.stringify({ ...request, operation: "exec", args: ["DROP TABLE items"] }), JSON.stringify({ ...request, args: [{ limit: "1; DROP TABLE items" }] }), JSON.stringify({ ...request, operation: "addItem", args: [{ project: {}, title: "bad" }] }), "x".repeat(MAX_RPC_BYTES + 1)]) {
     assert.equal(JSON.parse(handleRpc(bad)).ok, false);
   }
   assert.ok(!fs.existsSync(h.db));
@@ -314,7 +314,7 @@ test("remote older schema requires explicit migration and backup stays on server
   assert.ok(fs.existsSync(migrated.backup));
   assert.ok(migrated.backup.startsWith(h.db));
   assert.equal(h.cli("ls", "--json").json()[0].id, 1);
-  assert.equal(h.cli("migrate", "--json").json().from, 2);
+  assert.equal(h.cli("migrate", "--json").json().from, 3);
 });
 
 test("local operation store retains an in-memory database across calls", () => {

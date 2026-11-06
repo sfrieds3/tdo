@@ -5,7 +5,7 @@
  * Uses only erasable TypeScript syntax so Node can run it directly with type stripping.
  */
 import { execFile, execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as os from "node:os";
@@ -47,6 +47,30 @@ export type StatusFilter = (typeof STATUS_FILTERS)[number];
 /** Identifies an item: its project's UUID plus the per-project number. */
 export type ItemKey = { projectId: string; id: number };
 
+/** A note on an item: a status-change note (`done -m`) or a plain one (`tdo note`). Append-only. */
+export type Note = { seq: number; status: Status | null; body: string; createdAt: string };
+
+export const LINK_STATES = ["awaiting-approval", "creating", "unknown", "pending", "open", "closed", "error"] as const;
+export type LinkState = (typeof LINK_STATES)[number];
+
+/** An item's issue on an external tracker. The destination is fixed when the link is first claimed. */
+export type Link = {
+  provider: string;
+  /** `host/owner/repo` the issue lives in. */
+  destination: string;
+  state: LinkState;
+  /** Issue number once created. */
+  externalId: string | null;
+  url: string | null;
+  error: string | null;
+  claimedAt: string | null;
+  createdAt: string;
+  syncedAt: string | null;
+};
+
+/** A `creating` link older than this is treated as an interrupted attempt with an unknown outcome. */
+export const LINK_STALE_MS = 2 * 60_000;
+
 export type Item = {
   /** Per-project item number, as shown in `#3`. */
   id: number;
@@ -66,6 +90,9 @@ export type Item = {
   createdAt: string;
   updatedAt: string;
   closedAt: string | null;
+  /** Oldest first. */
+  notes: Note[];
+  links: Link[];
 };
 
 export type Project = { key: string; name: string; root?: string };
@@ -80,6 +107,8 @@ export type NewItem = {
   source?: string;
   sessionId?: string;
   host?: string;
+  /** Added by a person at a terminal (not an agent or script); gates automatic issue filing. */
+  createdByHuman?: boolean;
 };
 
 export type ItemPatch = {
@@ -101,6 +130,8 @@ export type ListFilter = {
   query?: string;
   /** Maximum rows (default 500); 0 returns all matching rows. */
   limit?: number;
+  /** Only items with a tracker link. */
+  linked?: boolean;
 };
 
 export const DEFAULT_LIST_LIMIT = 500;
@@ -246,7 +277,38 @@ export function projectFromKey(key: string): Project {
 /** Repo-root file whose first line overrides the project key (for example, so a fork shares upstream's backlog). */
 export const PROJECT_FILE = ".tdo-project";
 
-type ProjectRead = { kind: "git"; args: string[] } | { kind: "file" | "realpath"; path: string };
+/** Committed per-repo config, at the repo root. */
+export const REPO_CONFIG_FILE = path.join(".tdo", "config.json");
+
+/** `.tdo/config.json`: `project` is validated here; `tracker` is validated by its consumers so a bad block only breaks tracker commands. */
+export type RepoConfig = { file: string; project?: string; tracker?: unknown };
+
+export function readRepoConfig(root: string): RepoConfig | undefined {
+  const file = path.join(root, REPO_CONFIG_FILE);
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR") return undefined;
+    throw error;
+  }
+  return parseRepoConfig(file, raw);
+}
+
+function parseRepoConfig(file: string, raw: string): RepoConfig {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`invalid JSON in ${file}: ${(error as Error).message}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${file} must contain a JSON object.`);
+  const { project, tracker } = parsed as { project?: unknown; tracker?: unknown };
+  if (project !== undefined && (typeof project !== "string" || !project.trim())) throw new Error(`${file}: "project" must be a non-empty string.`);
+  return { file, ...(project !== undefined ? { project: (project as string).trim() } : {}), ...(tracker !== undefined ? { tracker } : {}) };
+}
+
+type ProjectRead = { kind: "git"; args: string[] } | { kind: "file" | "repo-config" | "realpath"; path: string };
 type ProjectOptions = { env?: NodeJS.ProcessEnv; home?: string; config?: Config };
 
 /** One set of precedence rules, driven by either synchronous or asynchronous I/O. */
@@ -255,6 +317,10 @@ function* detectProject(cwd: string, env: NodeJS.ProcessEnv, home: string): Gene
   const top = yield { kind: "git", args: ["rev-parse", "--show-toplevel"] };
   const root = top || path.resolve(cwd);
   if (top) {
+    const configFile = path.join(top, REPO_CONFIG_FILE);
+    const rawConfig = yield { kind: "repo-config", path: configFile };
+    const repoProject = rawConfig === undefined ? undefined : parseRepoConfig(configFile, rawConfig).project;
+    if (repoProject) return { ...projectFromKey(repoProject), root };
     const file = yield { kind: "file", path: path.join(top, PROJECT_FILE) };
     const override = file?.split("\n")[0]?.trim();
     if (override) return { ...projectFromKey(override), root };
@@ -278,8 +344,8 @@ function aliasProject(project: Project, config: Config): Project {
 }
 
 /**
- * Resolves the project for a directory: `TDO_PROJECT`, then a `.tdo-project` file at the repo root,
- * then the normalized git remote (origin first), then `local:<home-relative main worktree path>`.
+ * Resolves the project for a directory: `TDO_PROJECT`, then `project` in `.tdo/config.json`, then a
+ * `.tdo-project` file at the repo root, then the normalized git remote (origin first), then `local:<home-relative main worktree path>`.
  * The result is then mapped through the config's `aliases`.
  */
 export function resolveProject(cwd: string, options: ProjectOptions = {}): Project {
@@ -291,8 +357,9 @@ export function resolveProject(cwd: string, options: ProjectOptions = {}): Proje
     const read = step.value;
     let value: string | undefined;
     try {
-      value = read.kind === "git" ? git(cwd, read.args) : read.kind === "file" ? fs.readFileSync(read.path, "utf8") : fs.realpathSync(read.path);
-    } catch {
+      value = read.kind === "git" ? git(cwd, read.args) : read.kind !== "realpath" ? fs.readFileSync(read.path, "utf8") : fs.realpathSync(read.path);
+    } catch (error) {
+      if (read.kind === "repo-config" && !["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
       // Missing override files and unresolved realpaths fall back in detectProject.
     }
     step = detection.next(value);
@@ -316,9 +383,10 @@ export async function resolveProjectAsync(cwd: string, options: ProjectOptions =
         const { stdout } = await execFileAsync("git", ["-C", cwd, ...read.args], { encoding: "utf8", timeout: 5000 });
         value = stdout.trim() || undefined;
       } else {
-        value = read.kind === "file" ? await fs.promises.readFile(read.path, "utf8") : await fs.promises.realpath(read.path);
+        value = read.kind !== "realpath" ? await fs.promises.readFile(read.path, "utf8") : await fs.promises.realpath(read.path);
       }
-    } catch {
+    } catch (error) {
+      if (read.kind === "repo-config" && !["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
       // Match the sync resolver's fallback on git or filesystem errors.
     }
     step = detection.next(value);
@@ -363,9 +431,42 @@ export type Config = {
   floating?: boolean;
   /** Pi "work on it" asks the agent to do the work in a new git worktree and branch. */
   worktree?: boolean;
+  /** Per-project settings keyed by resolved project key; `tracker` is validated by its consumers. */
+  projects?: Record<string, { tracker?: unknown }>;
 };
 
 export const DEFAULT_PER_PROJECT = 5;
+
+/**
+ * Rewrites the user config atomically. `fn` gets the raw JSON object (unknown keys included) and
+ * returns the new one. The current file is validated first so a broken config is never clobbered.
+ */
+export function updateConfig(fn: (config: Record<string, unknown>) => Record<string, unknown>, env: NodeJS.ProcessEnv = process.env, home = os.homedir()): void {
+  loadConfig(env, home);
+  const file = getConfigPath(env, home);
+  const current: Record<string, unknown> = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(fn(current), null, 2) + "\n", { mode: 0o600, flag: "wx" });
+    fs.renameSync(temporary, file);
+  } finally {
+    if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+  }
+}
+
+/** JSON with object keys sorted, so equal values always serialize (and hash) the same. */
+export function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+export function sha256(text: string): string {
+  return `sha256:${createHash("sha256").update(text).digest("hex")}`;
+}
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): Config {
   const file = getConfigPath(env, home);
@@ -399,7 +500,9 @@ function parseConfig(raw: string, file: string, home: string): Config {
     throw new Error(`invalid JSON in ${file}: ${(error as Error).message}`);
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${file} must contain a JSON object.`);
-  const { db, aliases, perProject, floating, worktree } = parsed as { db?: unknown; aliases?: unknown; perProject?: unknown; floating?: unknown; worktree?: unknown };
+  const { db, aliases, perProject, floating, worktree, projects } = parsed as { db?: unknown; aliases?: unknown; perProject?: unknown; floating?: unknown; worktree?: unknown; projects?: unknown };
+  const isObject = (value: unknown) => !!value && typeof value === "object" && !Array.isArray(value);
+  if (projects !== undefined && (!isObject(projects) || !Object.values(projects as object).every(isObject))) throw new Error(`${file}: "projects" must map project keys to objects.`);
   if (floating !== undefined && typeof floating !== "boolean") throw new Error(`${file}: "floating" must be a boolean.`);
   if (worktree !== undefined && typeof worktree !== "boolean") throw new Error(`${file}: "worktree" must be a boolean.`);
   if (perProject !== undefined && !(Number.isInteger(perProject) && (perProject as number) >= 0)) throw new Error(`${file}: "perProject" must be a non-negative integer.`);
@@ -413,6 +516,7 @@ function parseConfig(raw: string, file: string, home: string): Config {
     ...(perProject !== undefined ? { perProject: perProject as number } : {}),
     ...(floating !== undefined ? { floating: floating as boolean } : {}),
     ...(worktree !== undefined ? { worktree: worktree as boolean } : {}),
+    ...(projects !== undefined ? { projects: projects as Record<string, { tracker?: unknown }> } : {}),
   };
 }
 
@@ -424,7 +528,7 @@ export function getDbPath(env: NodeJS.ProcessEnv = process.env, options: { home?
   return config.db ?? path.join(getDataDir(env, home), "tdo.db");
 }
 
-export { SCHEMA, schemaVersion, planMigration, backupDb, migrateDb } from "./migrations/index.ts";
+export { SCHEMA, schemaVersion, planMigration, planNoteExtraction, backupDb, migrateDb } from "./migrations/index.ts";
 export type { IdChange, MigrationResult } from "./migrations/index.ts";
 
 export type OpenOptions = {
@@ -503,7 +607,25 @@ type ItemRow = {
   closed_at: string | null;
 };
 
-function toItem(row: ItemRow): Item {
+type NoteRow = { seq: number; status: Status | null; body: string; created_at: string };
+type LinkRow = { provider: string; destination: string; state: LinkState; attempt: string | null; external_id: string | null; url: string | null; error: string | null; claimed_at: string | null; created_at: string; synced_at: string | null };
+
+function toLink(row: LinkRow): Link {
+  return { provider: row.provider, destination: row.destination, state: row.state, externalId: row.external_id, url: row.url, error: row.error, claimedAt: row.claimed_at, createdAt: row.created_at, syncedAt: row.synced_at };
+}
+
+/** Adds notes and links to items read from `ITEM_SELECT`. */
+function withExtras(db: DatabaseSync, rows: ItemRow[]): Item[] {
+  const notes = db.prepare("SELECT seq, status, body, created_at FROM notes WHERE project_id = ? AND item_id = ? ORDER BY seq");
+  const links = db.prepare("SELECT * FROM links WHERE project_id = ? AND item_id = ? ORDER BY provider");
+  return rows.map((row) => toItem(
+    row,
+    (notes.all(row.project_id, row.id) as NoteRow[]).map((note) => ({ seq: Number(note.seq), status: note.status, body: note.body, createdAt: note.created_at })),
+    (links.all(row.project_id, row.id) as LinkRow[]).map(toLink),
+  ));
+}
+
+function toItem(row: ItemRow, notes: Note[], links: Link[]): Item {
   return {
     id: Number(row.id),
     projectId: String(row.project_id),
@@ -520,18 +642,20 @@ function toItem(row: ItemRow): Item {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     closedAt: row.closed_at,
+    notes,
+    links,
   };
 }
 
 export function getItem(db: DatabaseSync, key: ItemKey): Item | undefined {
   const row = db.prepare(`${ITEM_SELECT} WHERE i.project_id = ? AND i.id = ?`).get(key.projectId, key.id) as ItemRow | undefined;
-  return row ? toItem(row) : undefined;
+  return row ? withExtras(db, [row])[0] : undefined;
 }
 
 /** Looks an item up by project key and per-project number. */
 export function getItemByNumber(db: DatabaseSync, project: string, id: number): Item | undefined {
   const row = db.prepare(`${ITEM_SELECT} WHERE p.key = ? AND i.id = ?`).get(project, id) as ItemRow | undefined;
-  return row ? toItem(row) : undefined;
+  return row ? withExtras(db, [row])[0] : undefined;
 }
 
 /**
@@ -570,10 +694,10 @@ export function addItem(db: DatabaseSync, input: NewItem): Item {
     const projectId = ensureProject(db, project);
     const id = Number((db.prepare("UPDATE projects SET next_item_id = next_item_id + 1 WHERE id = ? RETURNING next_item_id - 1 AS id").get(projectId) as { id: number }).id);
     const timestamp = now();
-    db.prepare(`INSERT INTO items (project_id, id, title, body, priority, file_ref, source, session_id, host, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    db.prepare(`INSERT INTO items (project_id, id, title, body, priority, file_ref, source, session_id, host, created_at, updated_at, created_by_human)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       projectId, id, title, cleanOptional(input.body), PRIORITIES.indexOf(priority), cleanOptional(input.fileRef),
-      cleanOptional(input.source), cleanOptional(input.sessionId), cleanOptional(input.host), timestamp, timestamp,
+      cleanOptional(input.source), cleanOptional(input.sessionId), cleanOptional(input.host), timestamp, timestamp, input.createdByHuman ? 1 : 0,
     );
     const insertTag = db.prepare("INSERT OR IGNORE INTO tags (project_id, item_id, tag) VALUES (?, ?, ?)");
     for (const tag of normalizeTags(input.tags)) insertTag.run(projectId, id, tag);
@@ -603,21 +727,147 @@ export function updateItem(db: DatabaseSync, key: ItemKey, patch: ItemPatch): It
   return requireItem(db, key);
 }
 
-/** Moves an item to a new status; `note` is appended to the body with the date and new status. */
+function insertNote(db: DatabaseSync, key: ItemKey, status: Status | null, body: string, timestamp: string): void {
+  const seq = Number((db.prepare("SELECT coalesce(max(seq), 0) + 1 AS seq FROM notes WHERE project_id = ? AND item_id = ?").get(key.projectId, key.id) as { seq: number }).seq);
+  db.prepare("INSERT INTO notes (project_id, item_id, seq, status, body, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(key.projectId, key.id, seq, status, body, timestamp);
+}
+
+/** Moves an item to a new status; `note` is recorded as a note tagged with the new status. */
 export function setStatus(db: DatabaseSync, key: ItemKey, status: Status, note?: string): Item {
   if (!(STATUSES as readonly string[]).includes(status)) throw new Error(`status must be one of: ${STATUSES.join(", ")}.`);
   const trimmedNote = note?.trim();
   const closed = status === "done" || status === "dropped";
-  // BEGIN IMMEDIATE takes the write lock before the read, so concurrent notes can't overwrite each other.
   transaction(db, () => {
     const item = requireItem(db, key);
     const timestamp = now();
-    const body = trimmedNote ? [item.body, `[${status} ${timestamp.slice(0, 10)}] ${trimmedNote}`].filter(Boolean).join("\n\n") : item.body;
-    db.prepare("UPDATE items SET status = ?, body = ?, closed_at = ?, updated_at = ? WHERE project_id = ? AND id = ?").run(
-      status, body, closed ? (item.closedAt && item.status === status ? item.closedAt : timestamp) : null, timestamp, item.projectId, item.id,
+    db.prepare("UPDATE items SET status = ?, closed_at = ?, updated_at = ? WHERE project_id = ? AND id = ?").run(
+      status, closed ? (item.closedAt && item.status === status ? item.closedAt : timestamp) : null, timestamp, item.projectId, item.id,
     );
+    if (trimmedNote) insertNote(db, item, status, trimmedNote, timestamp);
   });
   return requireItem(db, key);
+}
+
+/** Adds a note without changing the item's status. */
+export function addNote(db: DatabaseSync, key: ItemKey, note: string): Item {
+  const body = note.trim();
+  if (!body) throw new Error("note must not be empty.");
+  transaction(db, () => {
+    const item = requireItem(db, key);
+    const timestamp = now();
+    insertNote(db, item, null, body, timestamp);
+    db.prepare("UPDATE items SET updated_at = ? WHERE project_id = ? AND id = ?").run(timestamp, item.projectId, item.id);
+  });
+  return requireItem(db, key);
+}
+
+// ---------------------------------------------------------------------------
+// Tracker links
+
+export function getLink(db: DatabaseSync, key: ItemKey, provider: string): Link | undefined {
+  const row = db.prepare("SELECT * FROM links WHERE project_id = ? AND item_id = ? AND provider = ?").get(key.projectId, key.id, provider) as LinkRow | undefined;
+  return row ? toLink(row) : undefined;
+}
+
+export function isStaleClaim(link: Pick<Link, "state" | "claimedAt">, at = Date.now()): boolean {
+  return link.state === "creating" && (!link.claimedAt || at - Date.parse(link.claimedAt) > LINK_STALE_MS);
+}
+
+export type ClaimMode = "create" | "force";
+export type Claim = { token?: string; link: Link };
+
+/** States a plain create may claim from; `force` also takes over unknown and stale attempts. */
+const CREATABLE: readonly LinkState[] = ["awaiting-approval", "pending", "error"];
+const CLAIMABLE: Record<ClaimMode, readonly LinkState[]> = { create: CREATABLE, force: [...CREATABLE, "unknown", "creating"] };
+
+/**
+ * Atomically claims the right to create an issue for an item. Returns a token only to the one
+ * caller that wins; completion must present it. A new link fixes its destination here.
+ */
+export function claimLinkCreate(db: DatabaseSync, key: ItemKey, provider: string, destination: string, mode: ClaimMode): Claim {
+  return transaction(db, () => {
+    requireItem(db, key);
+    const token = randomUUID();
+    const timestamp = now();
+    const existing = getLink(db, key, provider);
+    if (!existing) {
+      db.prepare("INSERT INTO links (project_id, item_id, provider, destination, state, attempt, claimed_at, created_at) VALUES (?, ?, ?, ?, 'creating', ?, ?, ?)")
+        .run(key.projectId, key.id, provider, destination, token, timestamp, timestamp);
+      return { token, link: getLink(db, key, provider)! };
+    }
+    const allowed = CLAIMABLE[mode].includes(existing.state) && (existing.state !== "creating" || isStaleClaim(existing));
+    if (!allowed) return { link: existing };
+    db.prepare("UPDATE links SET state = 'creating', attempt = ?, claimed_at = ?, error = NULL, error_kind = NULL WHERE project_id = ? AND item_id = ? AND provider = ? AND state = ?")
+      .run(token, timestamp, key.projectId, key.id, provider, existing.state);
+    return { token, link: getLink(db, key, provider)! };
+  });
+}
+
+export type CreateOutcome =
+  | { ok: true; externalId: string; url: string }
+  | { ok: false; kind: "attention" | "retryable" | "uncertain"; message: string };
+
+/** Records a create attempt's result; a no-op (returns undefined) if the attempt was superseded. */
+export function finishLinkCreate(db: DatabaseSync, key: ItemKey, provider: string, token: string, outcome: CreateOutcome): Link | undefined {
+  return transaction(db, () => {
+    const timestamp = now();
+    const sql = outcome.ok
+      ? "UPDATE links SET state = 'open', external_id = ?, url = ?, error = NULL, error_kind = NULL, attempt = NULL, synced_at = ?"
+      : "UPDATE links SET state = ?, error = ?, error_kind = ?, attempt = NULL";
+    const values = outcome.ok
+      ? [outcome.externalId, outcome.url, timestamp]
+      : [outcome.kind === "uncertain" ? "unknown" : outcome.kind === "retryable" ? "pending" : "error", outcome.message, outcome.kind];
+    const changed = db.prepare(`${sql} WHERE project_id = ? AND item_id = ? AND provider = ? AND attempt = ? AND state = 'creating'`)
+      .run(...values, key.projectId, key.id, provider, token).changes;
+    return Number(changed) ? getLink(db, key, provider) : undefined;
+  });
+}
+
+/** Marks interrupted create attempts (crash, lost local write) as unknown so they are never auto-retried. */
+export function expireStaleClaims(db: DatabaseSync, project: string): number {
+  const cutoff = new Date(Date.now() - LINK_STALE_MS).toISOString();
+  return Number(db.prepare(`UPDATE links SET state = 'unknown', attempt = NULL, error = 'create was interrupted; check the tracker, then use --attach or --force'
+    WHERE state = 'creating' AND (claimed_at IS NULL OR claimed_at < ?) AND project_id IN (SELECT id FROM projects WHERE key = ?)`).run(cutoff, project).changes);
+}
+
+/** States from which a known issue URL may be attached. */
+const ATTACHABLE: readonly LinkState[] = ["awaiting-approval", "pending", "error", "unknown"];
+
+/** Records an issue the user created or found; the destination must match an existing link's. */
+export function attachLink(db: DatabaseSync, key: ItemKey, provider: string, destination: string, externalId: string, url: string): Link {
+  return transaction(db, () => {
+    requireItem(db, key);
+    const timestamp = now();
+    const existing = getLink(db, key, provider);
+    if (!existing) {
+      db.prepare("INSERT INTO links (project_id, item_id, provider, destination, state, external_id, url, created_at, synced_at) VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?)")
+        .run(key.projectId, key.id, provider, destination, externalId, url, timestamp, timestamp);
+      return getLink(db, key, provider)!;
+    }
+    if (existing.destination.toLowerCase() !== destination.toLowerCase()) throw new Error(`#${key.id} is bound to ${existing.destination}; the URL points at ${destination}.`);
+    if (!ATTACHABLE.includes(existing.state) && !isStaleClaim(existing)) throw new Error(`#${key.id} is ${existing.state}${existing.url ? ` (${existing.url})` : ""}; nothing to attach.`);
+    db.prepare("UPDATE links SET state = 'open', external_id = ?, url = ?, error = NULL, error_kind = NULL, attempt = NULL, synced_at = ? WHERE project_id = ? AND item_id = ? AND provider = ?")
+      .run(externalId, url, timestamp, key.projectId, key.id, provider);
+    return getLink(db, key, provider)!;
+  });
+}
+
+/** Forgets an item's link (the issue itself is left alone). Refuses while a create is in flight. */
+export function detachLink(db: DatabaseSync, key: ItemKey, provider: string): Link | undefined {
+  return transaction(db, () => {
+    const existing = getLink(db, key, provider);
+    if (!existing) return undefined;
+    if (existing.state === "creating" && !isStaleClaim(existing)) throw new Error(`#${key.id} is being filed right now; try again in a couple of minutes.`);
+    db.prepare("DELETE FROM links WHERE project_id = ? AND item_id = ? AND provider = ?").run(key.projectId, key.id, provider);
+    return existing;
+  });
+}
+
+export function countLinks(db: DatabaseSync, project: string): Partial<Record<LinkState, number[]>> {
+  const rows = db.prepare("SELECT l.state AS state, l.item_id AS id FROM links l JOIN projects p ON p.id = l.project_id WHERE p.key = ? ORDER BY l.item_id").all(project) as { state: LinkState; id: number }[];
+  const result: Partial<Record<LinkState, number[]>> = {};
+  for (const row of rows) (result[row.state] ??= []).push(Number(row.id));
+  return result;
 }
 
 export function deleteItem(db: DatabaseSync, key: ItemKey): Item {
@@ -652,12 +902,13 @@ export function listItems(db: DatabaseSync, filter: ListFilter = {}): Item[] {
   const query = filter.query ? ftsQuery(filter.query) : undefined;
   if (filter.query && !query) return [];
   if (query) { where.push("(i.project_id, i.id) IN (SELECT project_id, item_id FROM items_fts WHERE items_fts MATCH ?)"); values.push(query); }
+  if (filter.linked) where.push("EXISTS (SELECT 1 FROM links l WHERE l.project_id = i.project_id AND l.item_id = i.id)");
   const closedFirst = status === "closed" || status === "done" || status === "dropped";
   const order = closedFirst
     ? "i.closed_at DESC, i.created_at DESC"
     : "CASE i.status WHEN 'doing' THEN 0 WHEN 'open' THEN 1 ELSE 2 END, i.priority, i.created_at, p.key, i.id";
   const sql = `${ITEM_SELECT}${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY ${order} LIMIT ?`;
-  return (db.prepare(sql).all(...values, limit === 0 ? -1 : limit) as ItemRow[]).map(toItem);
+  return withExtras(db, db.prepare(sql).all(...values, limit === 0 ? -1 : limit) as ItemRow[]);
 }
 
 export type ActiveCounts = { total: number; doing: number } & Record<Priority, number>;
@@ -723,9 +974,29 @@ export function formatItemLine(item: Item, options: FormatOptions = {}): string 
   const parts = [paint(itemRef(item, options), color, "bold"), paint(item.priority, color, ...PRIORITY_STYLE[item.priority]) + " ".repeat(6 - item.priority.length)];
   if (item.status !== "open") parts.push(paint(`[${item.status}]`, color, item.status === "doing" ? "cyan" : "dim"));
   parts.push(item.title);
+  const marker = linkMarker(item.links);
+  if (marker) parts.push(paint(marker, color, marker.endsWith("!") ? "red" : "dim"));
   if (item.tags.length) parts.push(paint(item.tags.map((tag) => `#${tag}`).join(" "), color, "cyan"));
   if (item.fileRef) parts.push(paint(`@ ${item.fileRef}`, color, "dim"));
   return parts.join("  ");
+}
+
+/** `↗#42` filed, `↗…` in progress or pending, `↗?` awaiting approval, `↗!` needs attention. */
+export function linkMarker(links: Link[] | undefined): string | undefined {
+  const link = links?.[0];
+  if (!link) return undefined;
+  switch (link.state) {
+    case "open":
+    case "closed":
+      return `↗#${link.externalId}`;
+    case "creating":
+    case "pending":
+      return "↗…";
+    case "awaiting-approval":
+      return "↗?";
+    default:
+      return "↗!";
+  }
 }
 
 export function formatItemList(items: Item[], options: FormatOptions & { empty?: string; truncated?: boolean } = {}): string {
@@ -788,8 +1059,23 @@ export function formatItemDetail(item: Item): string {
   if (item.tags.length) lines.push(`tags:     ${item.tags.join(", ")}`);
   if (item.fileRef) lines.push(`file:     ${item.fileRef}`);
   lines.push(`created:  ${item.createdAt.slice(0, 16).replace("T", " ")}${item.host ? ` on ${item.host}` : ""}${item.source ? ` via ${item.source}` : ""}`);
+  for (const link of item.links ?? []) {
+    lines.push(`issue:    ${link.url ?? link.destination} (${link.state})`);
+    if (link.error && link.state !== "open" && link.state !== "closed") lines.push(`          ${link.error}`);
+  }
   if (item.body) lines.push("", item.body);
+  if (item.notes?.length) lines.push("", "notes:", ...item.notes.map(formatNote));
   return lines.join("\n");
+}
+
+export function formatNote(note: Note): string {
+  const [first = "", ...rest] = note.body.split("\n");
+  const head = `  ${note.createdAt.slice(0, 10)} ${(note.status ?? "note").padEnd(7)} `;
+  return [head + first, ...rest.map((line) => `${" ".repeat(head.length)}${line}`)].join("\n");
+}
+
+function formatMarkdownNotes(notes: Note[] = []): string[] {
+  return notes.map((note) => `  - ${note.createdAt.slice(0, 10)}${note.status ? ` ${note.status}` : ""}: ${note.body.replace(/\n/g, " ")}`);
 }
 
 export function formatMarkdown(items: Item[]): string {
@@ -802,6 +1088,7 @@ export function formatMarkdown(items: Item[]): string {
       const checked = item.status === "done" || item.status === "dropped" ? "x" : " ";
       const meta = [item.priority, ...item.tags.map((tag) => `#${tag}`), item.fileRef ? `\`${item.fileRef}\`` : "", item.status === "dropped" ? "dropped" : ""].filter(Boolean).join(" ");
       lines.push(`- [${checked}] #${item.id} ${item.title} (${meta})`);
+      lines.push(...formatMarkdownNotes(item.notes));
     }
     sections.push(lines.join("\n"));
   }
