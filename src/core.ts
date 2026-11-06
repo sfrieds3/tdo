@@ -11,6 +11,8 @@ import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import type * as Sqlite from "node:sqlite";
+import { transaction } from "./transaction.ts";
+import { enqueueLinked, enqueueOp, queueCounts } from "./link-ops.ts";
 import { promisify } from "node:util";
 import { migrateDb } from "./migrations/index.ts";
 
@@ -66,6 +68,9 @@ export type Link = {
   claimedAt: string | null;
   createdAt: string;
   syncedAt: string | null;
+  queued: number;
+  attention: number;
+  syncError: string | null;
 };
 
 /** A `creating` link older than this is treated as an interrupted attempt with an unknown outcome. */
@@ -551,17 +556,7 @@ export function openDb(dbPath = getDbPath(), options: OpenOptions = {}): Databas
   }
 }
 
-function transaction<T>(db: DatabaseSync, fn: () => T): T {
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    const result = fn();
-    db.exec("COMMIT");
-    return result;
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
-}
+
 
 function now(): string {
   return new Date().toISOString();
@@ -610,8 +605,8 @@ type ItemRow = {
 type NoteRow = { seq: number; status: Status | null; body: string; created_at: string };
 type LinkRow = { provider: string; destination: string; state: LinkState; attempt: string | null; external_id: string | null; url: string | null; error: string | null; claimed_at: string | null; created_at: string; synced_at: string | null };
 
-function toLink(row: LinkRow): Link {
-  return { provider: row.provider, destination: row.destination, state: row.state, externalId: row.external_id, url: row.url, error: row.error, claimedAt: row.claimed_at, createdAt: row.created_at, syncedAt: row.synced_at };
+function toLink(db: DatabaseSync, key: ItemKey, row: LinkRow): Link {
+  return { provider: row.provider, destination: row.destination, state: row.state, externalId: row.external_id, url: row.url, error: row.error, claimedAt: row.claimed_at, createdAt: row.created_at, syncedAt: row.synced_at, ...queueCounts(db, key, row.provider) };
 }
 
 /** Adds notes and links to items read from `ITEM_SELECT`. */
@@ -621,7 +616,7 @@ function withExtras(db: DatabaseSync, rows: ItemRow[]): Item[] {
   return rows.map((row) => toItem(
     row,
     (notes.all(row.project_id, row.id) as NoteRow[]).map((note) => ({ seq: Number(note.seq), status: note.status, body: note.body, createdAt: note.created_at })),
-    (links.all(row.project_id, row.id) as LinkRow[]).map(toLink),
+    (links.all(row.project_id, row.id) as LinkRow[]).map((link) => toLink(db, { projectId: row.project_id, id: row.id }, link)),
   ));
 }
 
@@ -723,17 +718,19 @@ export function updateItem(db: DatabaseSync, key: ItemKey, patch: ItemPatch): It
     sets.push("updated_at = ?");
     values.push(now());
     db.prepare(`UPDATE items SET ${sets.join(", ")} WHERE project_id = ? AND id = ?`).run(...values, projectId, id);
+    if (patch.title !== undefined || patch.body !== undefined || patch.fileRef !== undefined) enqueueLinked(db, key, "update");
   });
   return requireItem(db, key);
 }
 
-function insertNote(db: DatabaseSync, key: ItemKey, status: Status | null, body: string, timestamp: string): void {
+function insertNote(db: DatabaseSync, key: ItemKey, status: Status | null, body: string, timestamp: string): number {
   const seq = Number((db.prepare("SELECT coalesce(max(seq), 0) + 1 AS seq FROM notes WHERE project_id = ? AND item_id = ?").get(key.projectId, key.id) as { seq: number }).seq);
   db.prepare("INSERT INTO notes (project_id, item_id, seq, status, body, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(key.projectId, key.id, seq, status, body, timestamp);
+  return seq;
 }
 
 /** Moves an item to a new status; `note` is recorded as a note tagged with the new status. */
-export function setStatus(db: DatabaseSync, key: ItemKey, status: Status, note?: string): Item {
+export function setStatus(db: DatabaseSync, key: ItemKey, status: Status, note?: string, closeOnDone = true): Item {
   if (!(STATUSES as readonly string[]).includes(status)) throw new Error(`status must be one of: ${STATUSES.join(", ")}.`);
   const trimmedNote = note?.trim();
   const closed = status === "done" || status === "dropped";
@@ -743,7 +740,11 @@ export function setStatus(db: DatabaseSync, key: ItemKey, status: Status, note?:
     db.prepare("UPDATE items SET status = ?, closed_at = ?, updated_at = ? WHERE project_id = ? AND id = ?").run(
       status, closed ? (item.closedAt && item.status === status ? item.closedAt : timestamp) : null, timestamp, item.projectId, item.id,
     );
-    if (trimmedNote) insertNote(db, item, status, trimmedNote, timestamp);
+    if (trimmedNote) enqueueLinked(db, key, "comment", null, insertNote(db, item, status, trimmedNote, timestamp));
+    // Sync the transition, not the target: done -> doing reopens, doing -> open does nothing.
+    const wasClosed = item.status === "done" || item.status === "dropped";
+    if (closeOnDone && closed && item.status !== status) enqueueLinked(db, key, "close", status === "done" ? "completed" : "not planned");
+    if (closeOnDone && wasClosed && !closed) enqueueLinked(db, key, "reopen");
   });
   return requireItem(db, key);
 }
@@ -755,7 +756,7 @@ export function addNote(db: DatabaseSync, key: ItemKey, note: string): Item {
   transaction(db, () => {
     const item = requireItem(db, key);
     const timestamp = now();
-    insertNote(db, item, null, body, timestamp);
+    enqueueLinked(db, key, "comment", null, insertNote(db, item, null, body, timestamp));
     db.prepare("UPDATE items SET updated_at = ? WHERE project_id = ? AND id = ?").run(timestamp, item.projectId, item.id);
   });
   return requireItem(db, key);
@@ -766,7 +767,7 @@ export function addNote(db: DatabaseSync, key: ItemKey, note: string): Item {
 
 export function getLink(db: DatabaseSync, key: ItemKey, provider: string): Link | undefined {
   const row = db.prepare("SELECT * FROM links WHERE project_id = ? AND item_id = ? AND provider = ?").get(key.projectId, key.id, provider) as LinkRow | undefined;
-  return row ? toLink(row) : undefined;
+  return row ? toLink(db, key, row) : undefined;
 }
 
 export function isStaleClaim(link: Pick<Link, "state" | "claimedAt">, at = Date.now()): boolean {
@@ -804,11 +805,11 @@ export function claimLinkCreate(db: DatabaseSync, key: ItemKey, provider: string
 }
 
 export type CreateOutcome =
-  | { ok: true; externalId: string; url: string }
+  | { ok: true; externalId: string; url: string; snapshot?: Pick<Item, "title" | "body" | "fileRef"> }
   | { ok: false; kind: "attention" | "retryable" | "uncertain"; message: string };
 
 /** Records a create attempt's result; a no-op (returns undefined) if the attempt was superseded. */
-export function finishLinkCreate(db: DatabaseSync, key: ItemKey, provider: string, token: string, outcome: CreateOutcome): Link | undefined {
+export function finishLinkCreate(db: DatabaseSync, key: ItemKey, provider: string, token: string, outcome: CreateOutcome, closeOnDone = true): Link | undefined {
   return transaction(db, () => {
     const timestamp = now();
     const sql = outcome.ok
@@ -819,8 +820,22 @@ export function finishLinkCreate(db: DatabaseSync, key: ItemKey, provider: strin
       : [outcome.kind === "uncertain" ? "unknown" : outcome.kind === "retryable" ? "pending" : "error", outcome.message, outcome.kind];
     const changed = db.prepare(`${sql} WHERE project_id = ? AND item_id = ? AND provider = ? AND attempt = ? AND state = 'creating'`)
       .run(...values, key.projectId, key.id, provider, token).changes;
-    return Number(changed) ? getLink(db, key, provider) : undefined;
+    if (!Number(changed)) return undefined;
+    if (outcome.ok) reconcileCreatedLink(db, key, provider, closeOnDone, outcome.snapshot);
+    return getLink(db, key, provider);
   });
+}
+
+/** Reconcile under the create completion's write lock; notes preceding completion are not comments. */
+function reconcileCreatedLink(db: DatabaseSync, key: ItemKey, provider: string, closeOnDone: boolean, snapshot?: Pick<Item, "title" | "body" | "fileRef">): void {
+  const current = requireItem(db, key);
+  if (!snapshot || current.title !== snapshot.title || current.body !== snapshot.body || current.fileRef !== snapshot.fileRef) enqueueOp(db, key, provider, "update");
+  if (closeOnDone && (current.status === "done" || current.status === "dropped")) enqueueOp(db, key, provider, "close", current.status === "done" ? "completed" : "not planned");
+}
+
+/** All linked items for a project, without the interactive listing's row cap. */
+export function listLinkedItems(db: DatabaseSync, project: string): Item[] {
+  return withExtras(db, db.prepare(`${ITEM_SELECT} WHERE p.key = ? AND EXISTS (SELECT 1 FROM links l WHERE l.project_id = i.project_id AND l.item_id = i.id) ORDER BY i.id`).all(project) as ItemRow[]);
 }
 
 /** Marks interrupted create attempts (crash, lost local write) as unknown so they are never auto-retried. */
@@ -985,6 +1000,8 @@ export function formatItemLine(item: Item, options: FormatOptions = {}): string 
 export function linkMarker(links: Link[] | undefined): string | undefined {
   const link = links?.[0];
   if (!link) return undefined;
+  if (link.attention) return "↗!";
+  if (link.queued) return "↗…";
   switch (link.state) {
     case "open":
     case "closed":
@@ -1059,13 +1076,19 @@ export function formatItemDetail(item: Item): string {
   if (item.tags.length) lines.push(`tags:     ${item.tags.join(", ")}`);
   if (item.fileRef) lines.push(`file:     ${item.fileRef}`);
   lines.push(`created:  ${item.createdAt.slice(0, 16).replace("T", " ")}${item.host ? ` on ${item.host}` : ""}${item.source ? ` via ${item.source}` : ""}`);
-  for (const link of item.links ?? []) {
-    lines.push(`issue:    ${link.url ?? link.destination} (${link.state})`);
-    if (link.error && link.state !== "open" && link.state !== "closed") lines.push(`          ${link.error}`);
-  }
+  lines.push(...formatLinkDetails(item.links ?? []));
   if (item.body) lines.push("", item.body);
   if (item.notes?.length) lines.push("", "notes:", ...item.notes.map(formatNote));
   return lines.join("\n");
+}
+
+function formatLinkDetails(links: Link[]): string[] {
+  return links.flatMap((link) => [
+    `issue:    ${link.url ?? link.destination} (${link.state})`,
+    ...(link.syncError ? [`          ${link.syncError}`] : []),
+    ...(link.queued || link.attention ? [`          ${link.queued} queued, ${link.attention} need attention`] : []),
+    ...(link.error && link.state !== "open" && link.state !== "closed" ? [`          ${link.error}`] : []),
+  ]);
 }
 
 export function formatNote(note: Note): string {

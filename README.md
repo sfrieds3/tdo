@@ -31,7 +31,7 @@ It ships with an [agent skill](skills/tdo/SKILL.md), so Claude Code, Codex, Pi, 
 - **Priorities and tags.** `urgent`, `high`, `normal`, `low`, plus free-form tags. Inline shorthand — `!high #ci` — works anywhere you type a title.
 - **Context that survives.** Each item can carry a body (the why, a repro), a `path:line`, and records where it came from: CLI, you in Pi, or the agent, with the session and host.
 - **Search.** Full-text search over titles, bodies, and notes, plus filters by tag, priority, and status.
-- **File GitHub issues when you're ready.** Explicitly push an item as a snapshot using your local `gh` credentials, with per-user approval for repository-provided tracker settings.
+- **File GitHub issues when you're ready.** Explicitly push an item using your local `gh` credentials, then sync its edits, notes, and lifecycle with a durable queue and per-user approval for repository-provided tracker settings.
 - **Works with any agent.** One skill teaches agents when to park, how to write an item a future session can act on, and to ask before logging what they found themselves. Every command takes `--json`, and items record which agent added them.
 - **Just SQLite, local or over SSH.** One file under `$XDG_DATA_HOME`, built-in `node:sqlite`, zero runtime dependencies. Keep it on one host and access it with your existing SSH config and agent.
 
@@ -115,7 +115,7 @@ Status notes (`tdo done 3 -m "fixed the empty-file case"`) and standalone notes 
 
 ### GitHub issues
 
-This version supports **manual snapshot filing**, not ongoing sync. Install and authenticate the [GitHub CLI](https://cli.github.com/) (`gh auth login`) on the machine where you run tdo. With an SSH database, `gh` still runs locally, never through the database helper.
+This version supports **manual filing and one-way lifecycle sync** (tdo → GitHub). Issues are created only by an explicit push; auto-on-tag and Pi filing actions are not active yet. Install and authenticate the [GitHub CLI](https://cli.github.com/) (`gh auth login`) on the machine where you run tdo. With an SSH database, `gh` still runs locally, never through the database helper.
 
 Commit a tracker block in `.tdo/config.json` at the repository root:
 
@@ -132,12 +132,16 @@ Commit a tracker block in `.tdo/config.json` at the repository root:
 `repo` accepts `OWNER/REPO` or `HOST/OWNER/REPO` (for GitHub Enterprise). Omit it to derive the destination from a `github.com/OWNER/REPO` project key; other project keys require it explicitly. Labels must already exist on GitHub; tdo does not silently retry without them.
 
 ```sh
-tdo tracker status          # settings, approval, gh health, and link counts
+tdo tracker status          # settings, approval, gh health, link and queue counts
 tdo tracker approve         # review and approve this repository's settings
 tdo push 3                  # file one item
 tdo push 4 5                # file several; failures don't stop later items
 tdo ls --linked             # list active items with a link record
 tdo ls --linked -s all       # include closed local items
+tdo done 3 -m "fixed"        # commit locally, then post the note and close the issue
+tdo edit 3 --title "new" --no-sync # commit and queue without contacting GitHub
+tdo sync                    # drain this project
+tdo sync --retry            # explicitly reset operations needing attention
 ```
 
 Repository settings require **your approval**, saved in your user config. Approval pins the normalized repository settings and resolved destination; changing either requires approval again. An interactive `push` can ask for approval, but scripts must first review `tracker status` and explicitly run `tdo tracker approve --yes`. `tdo tracker revoke` removes approval without deleting existing links or issues. `tracker status` can check `gh` health, but only an explicit `push` creates an issue.
@@ -158,13 +162,25 @@ To keep tracker settings private, put them under `projects.<project-key>.tracker
 }
 ```
 
-User settings override individual repository settings; labels replace the whole list. A tracker defined only in your user config needs no approval. Set that project's `"tracker": false` to disable it. Defaults are `mode: "manual"`, `tag: "issue"`, `labels: []`, and `closeOnDone: true`. `mode: "auto-on-tag"`, `tag`, and `closeOnDone` are accepted for future versions, but **there is no auto-filing, comment posting, edit sync, or close/reopen sync yet**, regardless of those settings. `tracker status` calls out the inactive mode and close behavior.
+User settings override individual repository settings; labels replace the whole list. A tracker defined only in your user config needs no approval. Set that project's `"tracker": false` to disable it. Defaults are `mode: "manual"`, `tag: "issue"`, `labels: []`, and `closeOnDone: true`. `closeOnDone` controls close/reopen delivery. `mode: "auto-on-tag"` and `tag` are accepted and included in approval, but **auto-filing is not active yet**. `tracker status` calls out these inactive settings.
 
-A new issue contains the title and body, plus the file reference if present, without tdo identifiers or notes. Later local edits, notes, and status changes are not sent to GitHub. Items already marked `done` or `dropped` cannot be newly filed in this version. Pushing an already-filed item returns its existing link rather than creating another issue. Existing links retain their original destination if configuration changes.
+A new issue contains the title and body, plus the file reference if present, without tdo identifiers or notes. Notes written before creation completes are never back-posted. Concurrent edits during creation are reconciled against the current item atomically; already-done/dropped items can be filed and are then closed when `closeOnDone` is true. Pushing an already-filed item returns its existing link rather than creating another issue. Existing links retain their original destination if configuration changes; `tracker status` lists destination and last-synced status mismatches.
+
+#### Lifecycle sync
+
+- Title, body and file-reference edits queue an issue update. This is one-way, last-write-wins: a later tdo edit overwrites GitHub edits. Priority and tags are not synced.
+- Notes become separate comments. `done` and `drop` close with reasons `completed` and `not planned`; `reopen` reopens. A status note is posted before its close/reopen operation. With `closeOnDone: false`, notes still post, but close/reopen operations are not enqueued.
+- Item changes, notes and delivery intent commit together before any GitHub call. A tracker or SSH delivery failure never rolls back or fails an ordinary local mutation; warnings go to stderr, and `--json` stdout remains one document describing the committed local result.
+- Ordinary edit/status/note commands attempt at most five operations in total. `--no-sync` leaves all intent saved for later. `tdo sync [--retry]` drains only the current project, with no five-operation cap, and never auto-retries an unknown create or creates an awaiting-approval item.
+- Delivery requires a currently approved effective tracker config. Revoked, changed, invalid or disabled settings leave operations queued. Re-approval allows delivery to each link's persisted destination, even if the newly approved destination differs.
+- Cross-project `done`, `drop`, and `reopen` on filed items require a resolvable user-only tracker policy for that project (a repository approval hash alone is not enough). Otherwise the whole selection is refused before any writes: run from its project checkout or configure its project tracker in your user config. The current checkout's `closeOnDone` never applies to foreign items; unlinked items and `start` remain usable across projects.
+- Per-link leases serialize drainers; operations keep their sequence across restarts and acknowledgements. Only consecutive, unleased updates coalesce; close/reopen history is preserved. A failed operation blocks the rest of its link but not other links. Crashed drainers' leases expire after 60 seconds.
+- Network/timeouts/rate limits are retried by later commands. Permission/auth/not-found failures, or five failed attempts, need attention and block delivery until `tdo sync --retry` explicitly resets them. Fix the cause first; `show` and `tracker status` explain queued/attention counts.
+- Updates, close and reopen are idempotent and delivered at least once. **A comment may be posted twice if its response or local acknowledgement is lost.** tdo cannot cancel an already-running GitHub call when a lease expires; stale owners cannot acknowledge or reorder the saved queue.
 
 #### Links and recovery
 
-Lists and browser rows show `↗#42` for a filed issue, `↗…` for a pending/in-progress attempt, `↗?` for an awaiting-approval link, and `↗!` for an error or unknown outcome. `tdo show` includes link details. `--linked` matches any link state, not just successfully filed issues.
+Lists and browser rows show `↗#42` for a filed issue, `↗…` for queued operations or a pending/in-progress attempt, `↗?` for an awaiting-approval link, and `↗!` for an operation needing attention, an error, or an unknown outcome. `tdo show` includes link details. `--linked` matches any link state, not just successfully filed issues.
 
 An interrupted, timed-out, or unrecognized failed create may have made an issue. tdo records an **unknown** outcome and does not automatically retry it. Check GitHub first:
 
@@ -176,7 +192,7 @@ tdo push 3 --detach                                             # remove the loc
 
 `--attach` accepts exactly one item and checks the URL's syntax and destination, not whether the issue exists. `--force` only applies to an unknown or stale interrupted attempt, and can create a duplicate if your check was wrong. Neither attach nor detach can replace an active create attempt. Detaching makes a later plain push eligible to file a new issue, so prefer attach when recovering an existing one. Multi-item `push --json` returns a per-item result array and exits with status 1 if any item failed.
 
-Agents must only push when you explicitly ask them to. Local tdo ids are backlog references, not identifiers to include in commits, PRs, or branch names.
+Agents must only push or approve tracker settings when you explicitly ask them to in the current turn. This protects against cooperative agents accidentally filing issues, not adversarial processes: TTY/source provenance can be impersonated and explicit push remains available. Local tdo ids are backlog references, not identifiers to include in commits, PRs, or branch names.
 
 ### Browser
 
@@ -281,11 +297,11 @@ The result then goes through `aliases` in the [config file](#configuration), so 
 
 The database lives at `$XDG_DATA_HOME/tdo/tdo.db` — `~/.local/share/tdo/tdo.db` by default, on macOS too. Set `db` in the config file or `TDO_DB` to put it elsewhere. It is plain SQLite in WAL mode, so `sqlite3 ~/.local/share/tdo/tdo.db` works for ad-hoc queries.
 
-Schema: `projects` has a UUID `id` and the project `key`; `items` is keyed by `(project_id, id)`, where `id` is the per-project number; `tags`, `notes`, and `links` reference that pair. Full-text search lives in `items_fts`, kept in sync by triggers and covering notes as well as titles and bodies. Schema v3 also reserves `link_ops` for future lifecycle sync; this version does not enqueue or drain operations.
+Schema: `projects` has a UUID `id` and the project `key`; `items` is keyed by `(project_id, id)`, where `id` is the per-project number; `tags`, `notes`, and `links` reference that pair. Full-text search lives in `items_fts`, kept in sync by triggers and covering notes as well as titles and bodies. Schema v3 includes `link_ops`, which stores the durable lifecycle queue; item edits, notes, and status transitions enqueue operations atomically with the local change.
 
 ### Upgrading for notes and GitHub issues
 
-**Compatibility break:** this feature uses schema v3 and SSH RPC v3. Update tdo on both the caller and database host to the same release before using an SSH database. Old helpers fail the protocol check; after updating the helper, an existing v2 remote database still requires an explicit `tdo migrate`. Local databases upgrade automatically on open, with a backup; use the commands below to preview first:
+**Compatibility break:** this feature uses schema v3 and SSH RPC v4. Update tdo on both the caller and database host to the same release before using an SSH database. Old helpers fail the protocol check; after updating the helper, an existing v2 remote database still requires an explicit `tdo migrate`. Local databases upgrade automatically on open, with a backup; use the commands below to preview first:
 
 ```sh
 tdo migrate --dry-run
@@ -312,7 +328,7 @@ Items are renumbered per project in their original order, so the oldest item in 
 
 ### SSH remote database
 
-Install a compatible version of `tdo` and Node 22.18+ on the server. The remote noninteractive shell must find `tdo` on `PATH`; use the same tdo release on both ends. Unlimited list/export support requires RPC protocol v2 or later; structured notes and tracker operations require v3: upgrade both ends together. Older helpers are rejected rather than allowed to silently apply the old row ceiling. Configure SSH keys/agent, host keys, and any jump hosts with your normal SSH setup first. No daemon, database file synchronization, or network-mounted SQLite file is needed.
+Install a compatible version of `tdo` and Node 22.18+ on the server. The remote noninteractive shell must find `tdo` on `PATH`; use the same tdo release on both ends. Unlimited list/export support was introduced in RPC protocol v2, structured notes and issue filing in v3, and lifecycle queues in v4. This release requires v4: upgrade both ends together. Older helpers are rejected rather than allowed to silently apply the old row ceiling. Configure SSH keys/agent, host keys, and any jump hosts with your normal SSH setup first. No daemon, database file synchronization, or network-mounted SQLite file is needed.
 
 ```sh
 tdo db use 'ssh://you@backlog-host/home/you/.local/share/tdo/tdo.db'

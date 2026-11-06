@@ -11,7 +11,9 @@ import { fileURLToPath } from "node:url";
 import { floatingBackend, launchFloatingBrowser } from "./floating.ts";
 import { createStore, parseTarget, saveDbTarget, serveRpc, type Store } from "./store.ts";
 import { INACTIVE_SETTINGS, isApproved, resolveTracker, setApproval, type EffectiveTracker, type TrackerResolution } from "./trackers/config.ts";
-import { pushItem, trackerFor, type PushResult } from "./trackers/sync.ts";
+import { summarizeLinks, formatSyncSummary } from "./trackers/status.ts";
+import { drainItems } from "./trackers/drain.ts";
+import { pushItem, syncProject, trackerFor, type PushResult } from "./trackers/sync.ts";
 import {
   PRIORITIES,
   STATUS_FILTERS,
@@ -65,6 +67,7 @@ usage:
   tdo rm [id]
   tdo push [id...] [--attach URL | --force | --detach]
                             file items as GitHub issues (see tdo tracker)
+  tdo sync [--retry]        drain saved tracker operations for this project
   tdo tracker [status|approve|revoke] [--yes]
                             issue tracker config from .tdo/config.json and your approval
   tdo pick [-a] [-s STATUS] print the refs of items picked with fzf
@@ -89,6 +92,7 @@ options:
   --project KEY   use this project instead of resolving from the cwd
   -C DIR          resolve the project from DIR
   --json          machine-readable output (all commands)
+  --no-sync       save lifecycle intent without contacting GitHub
   --no-float      keep the browser inline even with config floating: true
   -a, --all       across all projects
 
@@ -106,6 +110,8 @@ const OPTIONS = {
   C: { type: "string", short: "C" },
   json: { type: "boolean" },
   "no-float": { type: "boolean" },
+  "no-sync": { type: "boolean" },
+  retry: { type: "boolean" },
   all: { type: "boolean", short: "a" },
   priority: { type: "string", short: "p" },
   tags: { type: "string", short: "t", multiple: true },
@@ -356,6 +362,25 @@ export function run(argv: string[], io: Io): number {
     if (picked.length > 1) throw new UsageError(`tdo ${command} takes one item.`);
     return picked[0]!;
   };
+  // Resolved lazily, inside the command's error handling, and only by commands that need it.
+  let cached: TrackerResolution | undefined;
+  const resolved = (): TrackerResolution => {
+    if (cached) return cached;
+    cached = tracker();
+    if (cached.kind === "invalid" && !["push", "sync"].includes(command)) warn(`tdo: invalid tracker config: ${cached.error}`);
+    return cached;
+  };
+  const afterMutation = (items: Item[]) => {
+    if (values["no-sync"]) return;
+    const resolution = resolved();
+    if (resolution.kind !== "ok") return;
+    if (!isApproved(resolution.tracker)) {
+      if (items.some((item) => item.links.length)) warn(`tdo: tracker ${resolution.tracker.approval}; operations remain queued; run tdo tracker approve.`);
+      return;
+    }
+    // This checkout cannot approve another project's repository configuration.
+    drainItems(db, items.filter((item) => item.project === project().key), resolution.tracker, { warn, env: io.env, limit: 5 });
+  };
   try {
     switch (command) {
       case "add": {
@@ -449,7 +474,7 @@ export function run(argv: string[], io: Io): number {
             const items = refs.map((ref) => db.call("findItem", ref, project().key));
             if (!items.length) return 0;
             const answer = askTty(`delete ${items.length === 1 ? `${itemRef(items[0]!, { showProject: true })} ${items[0]!.title}` : `${items.length} items`}? [y/N] `);
-            if (/^y(es)?$/i.test(answer.trim())) for (const item of items) db.call("deleteItem", item);
+            if (/^y(es)?$/i.test(answer.trim())) for (const item of items) deleteWithWarning(db, item, warn);
             return 0;
           }
           default:
@@ -481,6 +506,7 @@ export function run(argv: string[], io: Io): number {
           }
           const item = db.call("updateItem", target, { title, body });
           emit(item, `updated ${formatItemLine(item, { color })}`);
+          afterMutation([item]);
           return 0;
         }
         const tags = tagEdits(values.tags);
@@ -493,14 +519,19 @@ export function run(argv: string[], io: Io): number {
           removeTags: tags.remove,
         });
         emit(item, `updated ${formatItemLine(item)}`);
+        afterMutation([item]);
         return 0;
       }
       case "start":
       case "done":
       case "drop":
       case "reopen": {
-        const items = targets().map((target) => db.call("setStatus", target, STATUS_COMMANDS[command], values.message));
+        const selected = targets();
+        // Resolve every policy before the first write: a later foreign target may be unsafe.
+        const policies = selected.map((target) => statusPolicy(target, project().key, STATUS_COMMANDS[command], resolved(), config));
+        const items = selected.map((target, i) => db.call("setStatus", target, STATUS_COMMANDS[command], values.message, policies[i]));
         emit(items.length === 1 ? items[0] : items, items.map((item) => `${item.status} ${formatItemLine(item)}`).join("\n"));
+        afterMutation(items);
         return 0;
       }
       case "note": {
@@ -511,15 +542,24 @@ export function run(argv: string[], io: Io): number {
         const target = one(ref ? [ref] : []);
         const item = db.call("addNote", target, text);
         emit(item, `noted ${formatItemLine(item, { color })}`);
+        afterMutation([item]);
         return 0;
+      }
+      case "sync": {
+        if (args.length || all) throw new UsageError("usage: tdo sync [--retry] (current project only)");
+        const resolution = resolved();
+        if (resolution.kind !== "ok") throw new Error(resolution.kind === "invalid" ? resolution.error : "no tracker configured");
+        if (!isApproved(resolution.tracker)) throw new Error("tracker is not approved; run tdo tracker approve");
+        if (values["no-sync"]) throw new UsageError("sync cannot be combined with --no-sync");
+        const results = syncProject(db, project().key, resolution.tracker, { warn, env: io.env, retry: values.retry });
+        emit(results, results.length ? results.map((row) => `#${row.id}: ${row.error ?? ("sent" in row ? `${row.sent} operations sent` : row.state)}`).join("\n") : "nothing queued.");
+        return results.some((row) => row.error) ? 1 : 0;
       }
       case "push":
         return pushCommand(db, { targets, find, args, values, json, emit, warn, io, tracker: tracker(), projectKey: project().key });
       case "rm": {
-        const item = db.call("deleteItem", one());
+        const item = deleteWithWarning(db, one(), warn);
         emit(item, `deleted #${item.id} ${item.title}`);
-        const filed = item.links.find((link) => link.url);
-        if (filed) warn(`tdo: ${filed.url} was left open on ${filed.destination}.`);
         return 0;
       }
       case "count": {
@@ -549,6 +589,12 @@ export function run(argv: string[], io: Io): number {
   } finally {
     db.close();
   }
+}
+
+function deleteWithWarning(store: Store, key: Item, warn: (text: string) => void): Item {
+  const item = store.call("deleteItem", key);
+  for (const link of item.links) if (link.url) warn(`tdo: ${link.url} was left unchanged on ${link.destination}.`);
+  return item;
 }
 
 /** Asks on the controlling terminal; undefined when there's no terminal to ask on. */
@@ -607,14 +653,19 @@ function trackerCommand(args: string[], ctx: TrackerCommandContext): number {
     const health = trackerFor(config.destination, ctx.io.env).check();
     let links: Record<string, number[]> | undefined;
     let linksError: string | undefined;
+    let sync: ReturnType<typeof summarizeLinks> | undefined;
     const store = createStore(ctx.dbPath, { env: ctx.io.env });
-    try { links = store.call("countLinks", ctx.project.key); } catch (error) { linksError = (error as Error).message; } finally { store.close(); }
+    try {
+      links = store.call("countLinks", ctx.project.key);
+      sync = summarizeLinks(store.call("listLinkedItems", ctx.project.key), config);
+    } catch (error) { linksError = (error as Error).message; } finally { store.close(); }
     const inactive = INACTIVE_SETTINGS.filter((key) => config.sources[key]);
-    ctx.emit({ project: ctx.project.key, tracker: { ...config }, gh: health.ok ? "ok" : health.message, links: links ?? null, ...(linksError ? { linksError } : {}) }, [
+    ctx.emit({ project: ctx.project.key, tracker: { ...config }, gh: health.ok ? "ok" : health.message, links: links ?? null, sync: sync ?? null, ...(linksError ? { linksError } : {}) }, [
       `${ctx.project.key}: ${config.provider} issues in ${config.destination}`,
       ...describeTracker(config).map((line) => `  ${line}`),
       `approval:    ${APPROVAL_TEXT[config.approval]}`,
       `gh:          ${health.ok ? "ok" : health.message}`,
+      ...(sync ? formatSyncSummary(sync) : []),
       ...(inactive.length ? [`note:        ${inactive.join(", ")} not active until a later version`] : []),
       ...(links ? Object.entries(links).map(([state, ids]) => `${`${state}:`.padEnd(13)}${ids.map((id) => `#${id}`).join(" ")}`) : [`links:       unavailable (${linksError})`]),
     ].join("\n"));
@@ -639,11 +690,21 @@ function trackerCommand(args: string[], ctx: TrackerCommandContext): number {
   throw new UsageError("usage: tdo tracker [status|approve|revoke] [--yes]");
 }
 
+/** Foreign links need their own known user policy; approval hashes imply missing repository policy. */
+function statusPolicy(item: Item, current: string, status: Status, resolution: TrackerResolution, config: ReturnType<typeof loadConfig>): boolean {
+  if (item.project === current) return resolution.kind === "ok" ? resolution.tracker.closeOnDone : true;
+  if (status === "doing" || !item.links.some((link) => ["open", "closed"].includes(link.state))) return false;
+  const raw = config.projects?.[item.project]?.tracker;
+  const foreign = resolveTracker(projectFromKey(item.project), config);
+  if (raw && typeof raw === "object" && !("approved" in raw) && foreign.kind === "ok") return foreign.tracker.closeOnDone;
+  throw new Error(`${item.project}#${item.id}: tracker lifecycle policy is unknown; run from its project checkout or configure project tracker in your user config.`);
+}
+
 type PushContext = {
   targets: () => Item[];
   find: (ref: string) => Item;
   args: string[];
-  values: { attach?: string; force?: boolean; detach?: boolean; yes?: boolean };
+  values: { attach?: string; force?: boolean; detach?: boolean; yes?: boolean; "no-sync"?: boolean };
   json: boolean;
   emit: (data: unknown, text: string) => void;
   warn: (text: string) => void;
@@ -692,7 +753,11 @@ function pushCommand(db: Store, ctx: PushContext): number {
       continue;
     }
     // Re-read so the link reflects stale-claim expiry and concurrent pushes.
-    results.push(pushItem(db, db.call("findItem", `${item.project}#${item.id}`, ctx.projectKey), config, { force: values.force, env: ctx.io.env, warn: ctx.warn }));
+    try {
+      results.push(pushItem(db, db.call("findItem", `${item.project}#${item.id}`, ctx.projectKey), config, { force: values.force, noSync: values["no-sync"], env: ctx.io.env, warn: ctx.warn }));
+    } catch (error) {
+      results.push({ id: item.id, state: "skipped", error: `#${item.id}: ${(error as Error).message}`, ok: false });
+    }
   }
   ctx.emit(results, results.map((row) => (row.ok ? `#${row.id}: ${row.url}` : row.error ?? `#${row.id}: ${row.state}`)).join("\n"));
   return results.every((row) => row.ok) ? 0 : 1;

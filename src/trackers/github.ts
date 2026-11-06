@@ -45,7 +45,20 @@ export function githubTracker(options: GhOptions): Tracker {
     return { ok: true, value: undefined };
   }
 
+  function mutate(args: string[], body?: string): TrackerResult<void> {
+    const run = gh(["issue", ...args, "--repo", repo], options, body);
+    if (!run.error && run.status === 0) return { ok: true, value: undefined };
+    const message = describe(run);
+    const rateLimit = /rate.?limit|429/i.test(run.stderr);
+    const attention = run.error?.code === "ENOENT" || /auth|not logged|permission|forbidden|not found|could not resolve to a (?:repository|issue)|could not find (?:issue|repository)|404|401|403|transferred|deleted/i.test(run.stderr);
+    return { ok: false, kind: !rateLimit && attention ? "attention" : "retryable", message };
+  }
+
   return {
+    update: (id, issue) => mutate(["edit", id, "--title", issue.title, "--body-file", "-"], issue.body),
+    close: (id, reason) => mutate(["close", id, "--reason", reason]),
+    reopen: (id) => mutate(["reopen", id]),
+    comment: (id, body) => mutate(["comment", id, "--body-file", "-"], body),
     provider: "github",
     check,
     parseIssueUrl: parseGithubIssueUrl,

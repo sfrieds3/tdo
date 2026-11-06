@@ -5,15 +5,23 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { isIP } from "node:net";
 import * as core from "./core.ts";
+import * as queue from "./link-ops.ts";
 
-// v2 adds unbounded list limits; v3 adds structured notes and tracker operations.
-export const RPC_VERSION = 3;
+// v2 adds unbounded list limits; v3 adds structured notes and issue filing; v4 adds lifecycle queues.
+export const RPC_VERSION = 4;
 export const MAX_RPC_BYTES = 8 * 1024 * 1024;
 export const SSH_TIMEOUT_MS = 20_000;
 
 const operations = {
+  leaseLinkOps: queue.leaseLinkOps,
+  nextLinkOp: queue.nextLinkOp,
+  ackOp: queue.ackOp,
+  failOp: queue.failOp,
+  releaseLinkOps: queue.releaseLinkOps,
+  retryLinkOps: queue.retryLinkOps,
   addItem: core.addItem,
   listItems: core.listItems,
+  listLinkedItems: core.listLinkedItems,
   findItem: core.findItem,
   getItem: core.getItem,
   getItemByNumber: core.getItemByNumber,
@@ -121,11 +129,13 @@ const priority = oneOf(core.PRIORITIES);
 const newItem = object({ project: (v) => string(v) || project(v), title: string, body: optional(string), priority: optional(priority), tags: optional(strings), fileRef: optional(string), source: optional(string), sessionId: optional(string), host: optional(string), createdByHuman: optional(boolean) });
 const patch = object({ title: optional(string), body: optional(nullable(string)), priority: optional(priority), addTags: optional(strings), removeTags: optional(strings), fileRef: optional(nullable(string)) });
 const filter = object({ project: optional(string), status: optional(oneOf(core.STATUS_FILTERS)), tags: optional(strings), minPriority: optional(priority), query: optional(string), limit: optional(limit), linked: optional(boolean) });
-const outcome: Validator = (v) => object({ ok: (x) => x === true, externalId: string, url: string })(v) || object({ ok: (x) => x === false, kind: oneOf(["attention", "retryable", "uncertain"]), message: string })(v);
+const outcome: Validator = (v) => object({ ok: (x) => x === true, externalId: string, url: string, snapshot: optional(object({ title: string, body: nullable(string), fileRef: nullable(string) })) })(v) || object({ ok: (x) => x === false, kind: oneOf(["attention", "retryable", "uncertain"]), message: string })(v);
 const validators: Record<Operation, Validator[]> = {
+  leaseLinkOps: [key, string, string, optional(object({ destination: string, externalId: nullable(string), url: nullable(string), createdAt: string }))], nextLinkOp: [key, string, string], ackOp: [key, string, string, integer], failOp: [key, string, string, integer, boolean, string], releaseLinkOps: [key, string, string, optional(object({ destination: string, externalId: nullable(string), url: nullable(string), createdAt: string }))], retryLinkOps: [string],
+  listLinkedItems: [string],
   addItem: [newItem], listItems: [optional(filter)], findItem: [string, string], getItem: [key], getItemByNumber: [string, integer],
-  updateItem: [key, patch], setStatus: [key, oneOf(core.STATUSES), optional(string)], addNote: [key, string], deleteItem: [key], countActive: [string],
-  getLink: [key, string], claimLinkCreate: [key, string, string, oneOf(["create", "force"])], finishLinkCreate: [key, string, string, outcome],
+  updateItem: [key, patch], setStatus: [key, oneOf(core.STATUSES), optional(nullable(string)), optional(boolean)], addNote: [key, string], deleteItem: [key], countActive: [string],
+  getLink: [key, string], claimLinkCreate: [key, string, string, oneOf(["create", "force"])], finishLinkCreate: [key, string, string, outcome, optional(boolean)],
   expireStaleClaims: [string], attachLink: [key, string, string, string, string], detachLink: [key, string], countLinks: [string],
   listTags: [optional(string)], listProjects: [], check: [], migrate: [optional(boolean)],
 };
@@ -157,10 +167,13 @@ export function handleRpc(input: string): string {
 const number: Validator = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
 const array = (test: Validator): Validator => (v) => Array.isArray(v) && v.every(test);
 const note = object({ seq: integer, status: nullable(oneOf(core.STATUSES)), body: string, createdAt: string });
-const link = object({ provider: string, destination: string, state: oneOf(core.LINK_STATES), externalId: nullable(string), url: nullable(string), error: nullable(string), claimedAt: nullable(string), createdAt: string, syncedAt: nullable(string) });
+const link = object({ provider: string, destination: string, state: oneOf(core.LINK_STATES), externalId: nullable(string), url: nullable(string), error: nullable(string), claimedAt: nullable(string), createdAt: string, syncedAt: nullable(string), queued: number, attention: number, syncError: nullable(string) });
 const item = object({ id: integer, projectId: string, project: string, title: string, body: nullable(string), priority, status: oneOf(core.STATUSES), tags: strings, fileRef: nullable(string), source: nullable(string), sessionId: nullable(string), host: nullable(string), createdAt: string, updatedAt: string, closedAt: nullable(string), notes: array(note), links: array(link) });
 const linkCounts: Validator = (v) => !!v && typeof v === "object" && !Array.isArray(v) && Object.entries(v).every(([state, ids]) => (core.LINK_STATES as readonly string[]).includes(state) && array(integer)(ids));
+const op = object({ seq: integer, op: oneOf(["update", "close", "reopen", "comment"]), reason: nullable(string), noteSeq: nullable(integer), status: oneOf(["queued", "attention"]), attempts: number, lastError: nullable(string) });
 const resultValidators: Record<Operation, Validator> = {
+  leaseLinkOps: boolean, nextLinkOp: nullable(op), ackOp: boolean, failOp: boolean, releaseLinkOps: boolean, retryLinkOps: number,
+  listLinkedItems: array(item),
   addItem: item, listItems: array(item), findItem: item, getItem: nullable(item), getItemByNumber: nullable(item), updateItem: item, setStatus: item, addNote: item, deleteItem: item,
   getLink: nullable(link), claimLinkCreate: object({ token: optional(string), link }), finishLinkCreate: nullable(link), expireStaleClaims: (v) => typeof v === "number",
   attachLink: link, detachLink: nullable(link), countLinks: linkCounts,
@@ -191,7 +204,7 @@ function response<K extends Operation>(stdout: string, operation: K): StoreOpera
   // JSON has no undefined; optional lookups use null on the wire.
   return (reply.result === null && NULLABLE.has(operation) ? undefined : reply.result) as StoreOperations[K]["result"];
 }
-const NULLABLE = new Set<Operation>(["getItem", "getItemByNumber", "getLink", "finishLinkCreate", "detachLink"]);
+const NULLABLE = new Set<Operation>(["getItem", "getItemByNumber", "getLink", "finishLinkCreate", "detachLink", "nextLinkOp"]);
 function transportError(error: unknown, stderr: string): Error {
   return new Error(`SSH database operation failed (no local fallback; writes may have completed): ${error instanceof Error ? error.message : String(error)}${stderr.trim() ? `: ${stderr.trim()}` : ""}`);
 }
