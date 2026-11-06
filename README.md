@@ -1,5 +1,8 @@
 # tdo
 
+[![Build](https://github.com/sfrieds3/tdo/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sfrieds3/tdo/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/github/v/release/sfrieds3/tdo)](https://github.com/sfrieds3/tdo/releases/latest)
+
 <img src="assets/tdo.svg" alt="tdo — a checked box" width="64" height="64">
 
 **A per-project backlog for the things you'll fix later.**
