@@ -276,6 +276,12 @@ Everything works without a config file. To change defaults, create `$XDG_CONFIG_
 
 Environment variables: `TDO_DB`, `TDO_CONFIG`, `TDO_PROJECT` (force a project key), `TDO_SOURCE` (default `--source`), `TDO_FZF_OPTS` (extra fzf flags), `NO_COLOR` / `FORCE_COLOR`.
 
+## Release automation
+
+Release-please maintains a release PR after changes land on `main`. GitHub may show the bot-triggered `pull_request` CI run as waiting for approval; no approval of that run is needed. The `Release` workflow separately invokes the same Node 22/24/26 test matrix against the release PR's exact head commit and posts a **Release PR CI** status on that commit. Tests run with read-only permissions and no inherited secrets; a separate job reports success or failure without running PR code. Ordinary contributor PR checks and approval policies are unchanged.
+
+The conventional-title check still runs on ordinary PRs; release-please generates its own release PR title. Merging the release PR remains the manual decision that publishes the release, updates floating tags, and attaches the package tarball. Automatic validation does not approve or merge the PR.
+
 ## Development
 
 ```sh

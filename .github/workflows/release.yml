@@ -12,6 +12,7 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     outputs:
+      pr: ${{ steps.release.outputs.pr }}
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
       major: ${{ steps.release.outputs.major }}
@@ -22,6 +23,75 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+  # GITHUB_TOKEN-created PR events require approval. Call CI directly instead,
+  # then report on the exact PR commit (workflow_call keeps the caller's SHA).
+  prepare-pr-ci:
+    needs: release-please
+    if: needs.release-please.outputs.pr != ''
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+      statuses: write
+    outputs:
+      sha: ${{ steps.prepare.outputs.result }}
+    steps:
+      - uses: actions/github-script@v8
+        id: prepare
+        env:
+          RELEASE_PR: ${{ needs.release-please.outputs.pr }}
+        with:
+          result-encoding: string
+          script: |
+            const { number } = JSON.parse(process.env.RELEASE_PR);
+            const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: number });
+            if (pr.state !== 'open' || pr.base.ref !== 'main' ||
+                pr.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}` ||
+                pr.head.ref !== 'release-please--branches--main--components--tdo' ||
+                pr.user.login !== 'github-actions[bot]') {
+              throw new Error('Refusing to run release CI for an unexpected pull request.');
+            }
+            await github.rest.repos.createCommitStatus({
+              ...context.repo,
+              sha: pr.head.sha,
+              state: 'pending',
+              context: 'Release PR CI',
+              description: 'Testing release commit on Node 22, 24, and 26',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+            return pr.head.sha;
+
+  pr-ci:
+    needs: prepare-pr-ci
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      checkout_ref: ${{ needs.prepare-pr-ci.outputs.sha }}
+
+  report-pr-ci:
+    needs: [prepare-pr-ci, pr-ci]
+    if: always() && needs.prepare-pr-ci.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - uses: actions/github-script@v8
+        env:
+          RELEASE_SHA: ${{ needs.prepare-pr-ci.outputs.sha }}
+          CI_RESULT: ${{ needs.pr-ci.result }}
+        with:
+          script: |
+            const passed = process.env.CI_RESULT === 'success';
+            await github.rest.repos.createCommitStatus({
+              ...context.repo,
+              sha: process.env.RELEASE_SHA,
+              state: passed ? 'success' : 'failure',
+              context: 'Release PR CI',
+              description: passed ? 'Node 22, 24, and 26 checks passed' : `Release CI ${process.env.CI_RESULT}`,
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
 
   # Moving major and major.minor tags let Pi pin `git:github.com/sfrieds3/tdo@v0`
   # (or `@v0.1`) and still receive compatible releases on `pi update`.
