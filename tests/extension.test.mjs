@@ -532,6 +532,122 @@ test("Pi agent result prompts only verified new matching awaiting items; output 
   assert.equal(h.dialogs.length, 1);
 });
 
+for (const consent of [true, false]) {
+  test(`Pi offers consent for each CLI item in an AND-list (accept=${consent})`, async (t) => {
+    const h = trackerHarness(t, { confirm: consent });
+    fs.symlinkSync(path.resolve("src/cli.ts"), path.join(h.dir, "bin", "tdo"));
+    const command = 'tdo add "first item" -t issue -b "Keep local; ask before filing." --source pi --json && tdo add "second item" -t issue --source pi --json';
+    await h.emit("tool_call", bashCall("batch", command));
+    const output = execFileSync("bash", ["-c", command], { cwd: h.dir, env: { ...process.env }, encoding: "utf8" });
+    assert.equal(h.calls().filter((args) => args[1] === "create").length, 0);
+    await h.emit("tool_result", bashResult("batch", command, output));
+    assert.equal(h.dialogs.length, 2, JSON.stringify({ items: h.items(), notifications: h.notifications, output }));
+    for (const item of h.items()) {
+      assert.ok(h.dialogs.some((dialog) => dialog.title.includes(`File #${item.id} `) && dialog.message === item.title));
+      assert.equal(item.links[0].state, consent ? "open" : "awaiting-approval");
+    }
+    assert.equal(h.calls().filter((args) => args[1] === "create").length, consent ? 2 : 0);
+    await h.emit("tool_result", bashResult("batch", command, output));
+    assert.equal(h.dialogs.length, 2, "replayed results do not repeat prompts");
+  });
+}
+
+test("Pi verifies partial AND-list success without relying on output hints", async (t) => {
+  const h = trackerHarness(t, { confirm: false });
+  h.awaiting("existing");
+  const command = 'tdo add existing -t issue && tdo add "new item" -t issue && tdo add missing -t issue';
+  await h.emit("tool_call", bashCall("partial", command));
+  const item = h.awaiting("new item");
+  h.awaiting("unrelated");
+  await h.emit("tool_result", { ...bashResult("partial", command, "output truncated"), isError: true });
+  assert.equal(h.dialogs.length, 1);
+  assert.match(h.dialogs[0].title, new RegExp(`File #${item.id} `));
+  assert.equal(h.calls().length, 0);
+});
+
+test("Pi handles nested bash mutations from codemode exactly once", async (t) => {
+  const h = trackerHarness(t, { confirm: false });
+  const command = 'tdo add "agent item" -t issue';
+  const outer = { toolName: "codemode", toolCallId: "outer", input: { code: `await tools.bash({command: ${JSON.stringify(command)}})` } };
+  const inner = { ...bashCall("outer/1", command), parentToolCallId: "outer" };
+  await h.emit("tool_call", outer);
+  await h.emit("tool_call", inner);
+  h.awaiting();
+  await h.emit("tool_result", { ...bashResult(inner.toolCallId, command, ""), parentToolCallId: "outer" });
+  await h.emit("tool_result", { ...outer, content: [{ type: "text", text: "awaiting-approval" }], isError: false });
+  assert.equal(h.dialogs.length, 1);
+  assert.equal(h.calls().length, 0);
+});
+
+test("Pi treats quoted shell operators as literal item text", async (t) => {
+  const h = trackerHarness(t, { confirm: false });
+  const command = 'tdo add "handle && and ; literally" -t issue -b "a | b > c"';
+  await h.emit("tool_call", bashCall("quoted", command));
+  h.awaiting("handle && and ; literally");
+  await h.emit("tool_result", bashResult("quoted", command));
+  assert.equal(h.dialogs.length, 1);
+});
+
+test("Pi rejects mixed scripts, overrides, expansions, and malformed AND-lists", async (t) => {
+  const h = trackerHarness(t, { confirm: false });
+  const commands = [
+    'cd elsewhere && tdo add new', 'tdo add new && cd elsewhere',
+    'tdo add new && tdo add other --db /tmp/other', 'tdo add new --project foreign',
+    'tdo add new --config /tmp/config', 'tdo add new -C elsewhere',
+    'TDO_DB=x tdo add new', 'tdo add new && TDO_PROJECT=x tdo add other',
+    'tdo add new; tdo add other', 'tdo add new || tdo add other', 'tdo add new | cat',
+    'tdo add new > output', 'tdo add "$TITLE"', 'tdo add "`echo new`"',
+    'tdo add $(echo new)', 'tdo add ne\\w', 'tdo add ne"w"',
+    'tdo add new &&', '&& tdo add new', 'tdo add "new',
+    'tdo add new\ntdo add other', 'tdo add new # comment && tdo add other',
+    'tdo add new *', 'tdo add [ab]', 'tdo add new {a,b}', 'tdo add new & tdo add other',
+  ];
+  for (const [index, command] of commands.entries()) {
+    await h.emit("tool_call", bashCall(String(index), command));
+    h.awaiting("new");
+    await h.emit("tool_result", bashResult(String(index), command));
+    assert.equal(h.dialogs.length, 0, command);
+  }
+  assert.equal(h.calls().length, 0);
+});
+
+test("Pi rejects a result whose command differs from the captured call", async (t) => {
+  const h = trackerHarness(t, { confirm: false });
+  await h.emit("tool_call", bashCall("changed", "tdo add new -t issue"));
+  h.awaiting("new");
+  await h.emit("tool_result", bashResult("changed", "tdo add other -t issue"));
+  assert.equal(h.dialogs.length, 0);
+});
+
+test("Pi stops batch prompts after session navigation during consent", async (t) => {
+  const h = trackerHarness(t, { confirmations: [async () => {
+    await h.emit("session_tree");
+    return true;
+  }] });
+  const command = 'tdo add first -t issue && tdo add second -t issue';
+  await h.emit("tool_call", bashCall("navigate", command));
+  h.awaiting("first");
+  h.awaiting("second");
+  await h.emit("tool_result", bashResult("navigate", command));
+  assert.equal(h.dialogs.length, 1);
+  assert.equal(h.calls().length, 0);
+  assert.ok(h.items().every((item) => item.links[0].state === "awaiting-approval"));
+});
+
+test("Pi does not prompt for already-filed or untagged items", async (t) => {
+  const h = trackerHarness(t);
+  const command = 'tdo add filed -t issue && tdo add local';
+  await h.emit("tool_call", bashCall("linked", command));
+  const item = h.awaiting("filed");
+  const db = core.openDb(h.dbPath);
+  core.attachLink(db, item, "github", PROJECT, "42", "https://github.com/example/widgets/issues/42");
+  db.close();
+  h.addDirect({ title: "local", source: "pi" });
+  await h.emit("tool_result", bashResult("linked", command));
+  assert.equal(h.dialogs.length, 0);
+  assert.equal(h.calls().length, 0);
+});
+
 test("Pi ignores forged results, existing awaiting items, foreign overrides, and noninteractive adds", async (t) => {
   const h = trackerHarness(t);
   h.awaiting();
