@@ -93,17 +93,36 @@ export function needsTrackerConsent(command: string): boolean {
   return /\btdo(?:\.ts)?[\s"'][^\n;&|]*\bpush\b|\btdo(?:\.ts)?[\s"'][^\n;&|]*\btracker\b[^\n;&|]*\bapprove\b/.test(command);
 }
 
-/** Only simple same-context mutations may trigger a post-result dialog. Reject overrides and scripts. */
-export function isLocalMutation(command: string): boolean {
-  return /^\s*tdo\s+(add|edit)\s/.test(command) && !/[;&|`\n<>$]/.test(command) && !/(?:--(?:db|project|config)(?:=|\s)|(?:^|\s)-C(?:\s|\S)|\bTDO_)/.test(command);
+type MutationTarget = { title?: string; id?: number };
+
+/** A deliberately small shell subset: literal words and same-context mutations joined by &&. */
+export function mutationTargets(command: string): MutationTarget[] | undefined {
+  if (/[\n\r]/.test(command)) return undefined;
+  const input = command.trim();
+  const word = /\s*(&&|'[^'\\]*'|"[^"$`\\]*"|[^\s'";&|`<>$\\(){}\[\]*?!~]+)/y;
+  const targets: MutationTarget[] = [];
+  let args: string[] = [];
+  while (word.lastIndex < input.length) {
+    const match = word.exec(input);
+    if (!match) return undefined;
+    const token = match[1]!;
+    if (token === "&&") {
+      const target = parseMutationTarget(args);
+      if (!target) return undefined;
+      targets.push(target);
+      args = [];
+    } else {
+      // No concatenated quotes or unquoted shell comments. Quoted metacharacters stay literal.
+      if (token.startsWith("#") || (word.lastIndex < input.length && !/^\s|^&&/.test(input.slice(word.lastIndex)))) return undefined;
+      args.push(/^["']/.test(token) ? token.slice(1, -1) : token);
+    }
+  }
+  const target = parseMutationTarget(args);
+  return target ? [...targets, target] : undefined;
 }
 
-/** Conservative shell token subset: ambiguous quoting/expansion opts out, never guesses a target. */
-export function mutationTarget(command: string): { title?: string; id?: number } | undefined {
-  if (!isLocalMutation(command) || /[\\]/.test(command)) return undefined;
-  const tokens = command.match(/'[^']*'|"[^"]*"|[^\s'"]+/g) ?? [];
-  if (tokens.join(" ") !== command.trim().replace(/\s+/g, " ")) return undefined;
-  const args = tokens.map((token) => /^["']/.test(token) ? token.slice(1, -1) : token);
+function parseMutationTarget(args: string[]): MutationTarget | undefined {
+  if (args[0] !== "tdo" || !["add", "edit"].includes(args[1] ?? "")) return undefined;
   try {
     const { positionals } = parseArgs({ args: args.slice(2), allowPositionals: true, strict: true, options: {
       tags: { type: "string", short: "t", multiple: true }, priority: { type: "string", short: "p" }, body: { type: "string", short: "b" }, file: { type: "string", short: "f" }, source: { type: "string" }, title: { type: "string" }, json: { type: "boolean" }, "no-sync": { type: "boolean" },
@@ -120,7 +139,7 @@ export function trackerForItem(ctx: ExtensionContext, item: Item) {
 }
 
 export function registerTrackerEvents(pi: ExtensionAPI, trackerUi: ReturnType<typeof createTrackerUi>, active: () => boolean, epoch: () => number, refreshStatus: (ctx: ExtensionContext) => Promise<void>) {
-  const mutations = new Map<string, { baseline: Map<string, string>; context: string; epoch: number; target: { title?: string; id?: number } }>();
+  const mutations = new Map<string, { baseline: Map<string, string>; context: string; epoch: number; targets: MutationTarget[]; command: string }>();
   const keyString = (item: Item) => `${item.projectId}#${item.id}`;
   pi.on("session_shutdown", () => { mutations.clear(); });
   pi.on("tool_call", async (event, ctx) => {
@@ -133,22 +152,21 @@ export function registerTrackerEvents(pi: ExtensionAPI, trackerUi: ReturnType<ty
         if (!ok || !active() || stamp !== epoch() || ctx.signal?.aborted) return { block: true, reason: "tdo: tracker command not confirmed" };
       } catch { return { block: true, reason: "tdo: tracker confirmation unavailable" }; }
     }
-    const target = mutationTarget(command);
-    if (ctx.hasUI && target) {
+    const targets = mutationTargets(command);
+    if (ctx.hasUI && targets) {
       const stamp = epoch();
       try {
         const state = trackerContext(ctx);
         const items = await callStore("listItems", { project: state.project.key, status: "all", limit: 5000 });
-        if (active() && stamp === epoch()) mutations.set(event.toolCallId, { baseline: new Map(items.map((item) => [keyString(item), canonicalJson(item)])), context: canonicalJson(state), epoch: stamp, target });
+        if (active() && stamp === epoch()) mutations.set(event.toolCallId, { baseline: new Map(items.map((item) => [keyString(item), canonicalJson(item)])), context: canonicalJson(state), epoch: stamp, targets, command });
       } catch (error) { if (active() && stamp === epoch()) ctx.ui.notify(`tdo: cannot verify mutation: ${(error as Error).message}`, "warning"); }
     }
   });
   pi.on("tool_result", async (event, ctx) => {
     const pending = mutations.get(event.toolCallId);
     mutations.delete(event.toolCallId);
-    if (!pending || event.isError || !active() || pending.epoch !== epoch() || event.toolName !== "bash" || !isLocalMutation(String(event.input.command))) return;
-    const output = event.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
-    if (!/awaiting-approval|awaiting approval|↗\?/.test(output)) return;
+    if (!pending || !active() || pending.epoch !== epoch() || event.toolName !== "bash" || event.input.command !== pending.command) return;
+    // Inspect saved state even when output was truncated or a later && command failed.
     try {
       const state = trackerContext(ctx);
       if (canonicalJson(state) !== pending.context) return;
@@ -156,7 +174,7 @@ export function registerTrackerEvents(pi: ExtensionAPI, trackerUi: ReturnType<ty
       for (const item of items) {
         if (!active() || pending.epoch !== epoch()) return;
         const before = pending.baseline.get(keyString(item));
-        const matches = pending.target.id !== undefined ? item.id === pending.target.id : !before && item.title === pending.target.title;
+        const matches = pending.targets.some((target) => target.id !== undefined ? item.id === target.id : !before && item.title === target.title);
         if (matches && before !== canonicalJson(item)) await trackerUi.push(ctx, item, true);
       }
       await refreshStatus(ctx);
