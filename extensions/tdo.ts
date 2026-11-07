@@ -4,7 +4,8 @@
  * Agents (Pi, Claude Code, Codex, ...) use the `tdo` CLI through the bundled skill
  * (skills/tdo/SKILL.md), so this extension has no model-facing tool of its own.
  */
-import { statusPolicy } from "../src/trackers/config.ts";
+import { isApproved, normalizeDestination, statusPolicy } from "../src/trackers/config.ts";
+import { parseGithubIssueUrl } from "../src/trackers/github.ts";
 import { autoIntent, isHumanCommand } from "../src/trackers/auto.ts";
 import { createTrackerUi, registerTrackerEvents, trackerForItem, trackerContext } from "./tracker.ts";
 import * as os from "node:os";
@@ -42,6 +43,18 @@ const PICKER_LIMIT = 200;
 export const WORKTREE_INSTRUCTION = "Do the work in a new git worktree on a new branch (create it with `git worktree add -b <branch> <main-checkout>/.worktrees/<name>`, choosing a short descriptive branch and directory name; never put it next to the repo), not in the current checkout.";
 /** tdo ids are local bookkeeping; on GitHub `#3` links to an unrelated issue or PR. */
 export const NO_IDS_INSTRUCTION = "Don't put tdo ids (#3, tdo#3, name#3) in commit messages, PR text, or branch names; describe the change instead.";
+/** Read saved links only; foreign-project tracker policy cannot be verified from this checkout. */
+export function linkedIssueInstruction(ctx: ExtensionContext, item: Item): string {
+  const tracker = trackerForItem(ctx, item);
+  if (!tracker || tracker.provider !== "github" || !isApproved(tracker)) return "";
+  const link = item.links.find((link) => link.provider === "github" && ["open", "closed"].includes(link.state));
+  if (!link?.url || !link.externalId || !/^[1-9]\d*$/.test(link.externalId)) return "";
+  const parsed = parseGithubIssueUrl(link.url);
+  if (!parsed || parsed.id !== link.externalId || normalizeDestination(parsed.destination) !== parsed.destination || parsed.destination.toLowerCase() !== link.destination.toLowerCase()) return "";
+  // A saved link keeps its original destination even when the configured filing repository changes.
+  return ` If this work results in a PR, include \`Closes https://${parsed.destination}/issues/${parsed.id}\` in its description; this is the linked GitHub issue, not a local tdo id.`;
+}
+
 const ALL_ARGS = new Set(["all", "--all", "-a"]);
 const HELP = [
   "/tdo — pick an item in this project (--all or all: every project)",
@@ -292,7 +305,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
     const ref = itemRef(started, { showProject });
     const close = showProject ? `tdo done ${started.id} --project ${started.project}` : `tdo done ${started.id}`;
     const worktree = loadConfig().worktree ? ` ${WORKTREE_INSTRUCTION}` : "";
-    const message = `Let's work on tdo item ${ref} (marked as doing).${worktree} ${NO_IDS_INSTRUCTION} When it's fixed, close it with \`${close} -m "<what changed>"\`.\n\n${formatItemDetail(started)}`;
+    const message = `Let's work on tdo item ${ref} (marked as doing).${worktree} ${NO_IDS_INSTRUCTION}${linkedIssueInstruction(ctx, started)} When it's fixed, close it with \`${close} -m "<what changed>"\`.\n\n${formatItemDetail(started)}`;
     if (ctx.isIdle()) pi.sendUserMessage(message);
     else pi.sendUserMessage(message, { deliverAs: "followUp" });
   }
