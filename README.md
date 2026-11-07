@@ -115,6 +115,8 @@ Status notes (`tdo done 3 -m "fixed the empty-file case"`) and standalone notes 
 
 ### GitHub issues
 
+When Pi's `/tdo` **work on it** hands off an item with a confirmed existing open/closed GitHub link and a valid, approved tracker with issue sync enabled, it asks the agent to include `Closes https://HOST/OWNER/REPO/issues/42` in the resulting PR description. The fully qualified URL comes from the saved link, not the local tdo id or current filing destination, so cross-repository links remain unambiguous. Local tdo ids still never belong in commit messages, PR text, or branch names. Disabled, missing, invalid, unapproved/changed trackers and unlinked, awaiting, pending, creating, unknown, or malformed links produce no issue-closing instruction. Foreign-project picker items also omit the instruction because this checkout cannot verify their repository tracker policy; work from that project's checkout instead. This adds no filing, approval, or GitHub lookup.
+
 This version supports **manual filing, auto-on-tag, and one-way lifecycle sync** (tdo → GitHub). Only selected items become issues. Install and authenticate the [GitHub CLI](https://cli.github.com/) (`gh auth login`) on the machine where you run tdo. With an SSH database, `gh` still runs locally, never through the database helper.
 
 Commit a tracker block in `.tdo/config.json` at the repository root:

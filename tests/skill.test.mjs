@@ -21,6 +21,17 @@ test("skill frontmatter follows the Agent Skills format", () => {
   assert.ok(meta.description.length > 50 && meta.description.length <= 1024);
 });
 
+test("skill distinguishes approved linked GitHub issues from local bookkeeping and filing consent", () => {
+  assert.match(SKILL, /Never put tdo ids in commit messages/);
+  assert.match(SKILL, /issue sync enabled \(a valid, approved GitHub tracker\)/);
+  assert.match(SKILL, /Closes https:\/\/HOST\/OWNER\/REPO\/issues\/42/);
+  assert.match(SKILL, /confirmed existing open\/closed link/);
+  assert.match(SKILL, /never substitute the local tdo id/);
+  assert.match(SKILL, /disabled, missing, invalid, unapproved\/changed/);
+  assert.match(SKILL, /Never run `tdo push`, `tdo tracker approve`/);
+  assert.doesNotMatch(SKILL, /Reference a GitHub issue.*only if the user asks/);
+});
+
 test("every tdo command the skill documents parses", () => {
   const usage = [];
   run(["help"], { out: (text) => usage.push(text), cwd: process.cwd(), env: {} });

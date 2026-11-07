@@ -10,6 +10,7 @@ const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-codi
 const { createJiti } = requireFromPi("jiti");
 const extension = await createJiti(import.meta.url).import("../extensions/tdo.ts");
 const core = await import("../src/core.ts");
+const trackerConfig = await import("../src/trackers/config.ts");
 
 const PROJECT = "github.com/example/widgets";
 
@@ -472,6 +473,78 @@ if (process.argv[3] === 'create') console.log('https://github.com/example/widget
   };
   return h;
 }
+test("Pi work handoff references the saved issue URL, never the local id or new filing destination", async (t) => {
+  const h = trackerHarness(t, { keys: [[ENTER]] });
+  const item = h.addDirect({ title: "fix linked bug" });
+  const destination = "github.enterprise.example/other/original";
+  const url = `https://${destination}/issues/42`;
+  const db = core.openDb(h.dbPath);
+  try { core.attachLink(db, item, "github", destination, "42", url); }
+  finally { db.close(); }
+  await h.command.handler("", h.ctx);
+  assert.equal(h.sent.length, 1);
+  assert.ok(h.sent[0].text.includes(`Closes ${url}`));
+  assert.ok(h.sent[0].text.includes(extension.NO_IDS_INSTRUCTION));
+  assert.doesNotMatch(h.sent[0].text, /Closes #1|Closes https:\/\/github.com\/example\/widgets/);
+  assert.match(h.sent[0].text, /tdo done 1 -m/);
+  assert.equal(h.calls().length, 0, "handoff performs no GitHub lookup or filing");
+  assert.equal(h.dialogs.length, 0);
+});
+
+test("Pi disabled tracker handoff retains local completion and no-ids guidance without an issue instruction", async (t) => {
+  const h = trackerHarness(t, { keys: [[ENTER]] });
+  const item = h.addDirect({ title: "local fix" });
+  const db = core.openDb(h.dbPath);
+  try { core.attachLink(db, item, "github", PROJECT, "42", `https://${PROJECT}/issues/42`); }
+  finally { db.close(); }
+  fs.writeFileSync(h.config, JSON.stringify({ projects: { [PROJECT]: { tracker: false } } }));
+  await h.command.handler("", h.ctx);
+  assert.equal(h.sent.length, 1);
+  assert.doesNotMatch(h.sent[0].text, /Closes https:|If this work results in a PR/);
+  assert.ok(h.sent[0].text.includes(extension.NO_IDS_INSTRUCTION));
+  assert.match(h.sent[0].text, /tdo done 1 -m/);
+  assert.equal(h.calls().length, 0);
+});
+
+test("Pi issue instruction requires a confirmed, internally consistent saved GitHub link", (t) => {
+  const h = trackerHarness(t);
+  const item = h.addDirect({ title: "linked bug" });
+  const link = { provider: "github", destination: PROJECT, externalId: "42", url: `https://${PROJECT}/issues/42`, state: "open" };
+  const instruction = (patch = {}) => extension.linkedIssueInstruction(h.ctx, { ...item, links: [{ ...link, ...patch }] });
+  assert.match(instruction(), /Closes https:\/\/github.com\/example\/widgets\/issues\/42/);
+  assert.match(instruction({ state: "closed" }), /Closes https:/);
+  assert.equal(extension.linkedIssueInstruction(h.ctx, item), "", "unlinked");
+  for (const state of ["awaiting-approval", "pending", "creating", "unknown", "error"]) assert.equal(instruction({ state }), "", state);
+  for (const patch of [
+    { provider: "other" }, { url: null }, { externalId: null }, { externalId: "1" },
+    { externalId: "0", url: `https://${PROJECT}/issues/0` },
+    { url: `http://${PROJECT}/issues/42` }, { url: `https://${PROJECT}/pull/42` },
+    { url: `https://${PROJECT}/issues/42?query=1` }, { destination: "github.com/wrong/repo" },
+    { url: "https://github.com@evil.example/example/widgets/issues/42", destination: "github.com@evil.example/example/widgets" },
+  ]) assert.equal(instruction(patch), "", JSON.stringify(patch));
+  assert.equal(extension.linkedIssueInstruction(h.ctx, { ...item, project: "github.com/example/foreign", links: [link] }), "", "foreign project policy is not inferred from this checkout");
+  assert.equal(h.calls().length, 0);
+});
+
+test("Pi issue instruction respects missing, disabled, invalid, and unapproved/changed tracker policy", (t) => {
+  const h = trackerHarness(t);
+  const item = { ...h.addDirect({ title: "linked bug" }), links: [{ provider: "github", destination: PROJECT, externalId: "42", url: `https://${PROJECT}/issues/42`, state: "open" }] };
+  for (const tracker of [undefined, false, { provider: "invalid" }]) {
+    fs.writeFileSync(h.config, JSON.stringify({ projects: { [PROJECT]: { tracker } } }));
+    assert.equal(extension.linkedIssueInstruction(h.ctx, item), "", JSON.stringify(tracker));
+  }
+  repoTracker(h);
+  for (const tracker of [undefined, { approved: "stale-hash" }]) {
+    fs.writeFileSync(h.config, JSON.stringify({ projects: { [PROJECT]: { tracker } } }));
+    assert.equal(extension.linkedIssueInstruction(h.ctx, item), "", "repository policy must have current approval");
+  }
+  const resolution = trackerConfig.resolveTracker(core.resolveProject(h.ctx.cwd), core.loadConfig());
+  assert.equal(resolution.kind, "ok");
+  fs.writeFileSync(h.config, JSON.stringify(trackerConfig.setApproval({}, PROJECT, resolution.tracker.hash)));
+  assert.match(extension.linkedIssueInstruction(h.ctx, item), /Closes https:\/\/github.com\/example\/widgets\/issues\/42/, "current repository approval permits the reference");
+  assert.equal(h.calls().length, 0);
+});
+
 const bashCall = (id, command) => ({ toolName: "bash", toolCallId: id, input: { command } });
 const bashResult = (id, command, text = "awaiting-approval") => ({ ...bashCall(id, command), content: [{ type: "text", text }], isError: false });
 
