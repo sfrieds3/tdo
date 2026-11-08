@@ -16,6 +16,7 @@ import { transaction } from "./transaction.ts";
 import { enqueueLinked, enqueueOp, queueCounts } from "./link-ops.ts";
 import { promisify } from "node:util";
 import { migrateDb } from "./migrations/index.ts";
+import { parseGithubIssueUrl } from "./trackers/github.ts";
 
 type DatabaseSync = Sqlite.DatabaseSync;
 
@@ -465,9 +466,16 @@ export type Config = {
   floating?: boolean;
   /** Pi "work on it" asks the agent to do the work in a new git worktree and branch. */
   worktree?: boolean;
+  /** Lead list rows of filed items with their issue ref (`gh#45`); per-project `issueIds` overrides it. */
+  issueIds?: boolean;
   /** Per-project settings keyed by resolved project key; `tracker` is validated by its consumers. */
-  projects?: Record<string, { tracker?: unknown }>;
+  projects?: Record<string, { tracker?: unknown; issueIds?: boolean }>;
 };
+
+/** Whether list rows in `project` lead with issue refs. */
+export function issueIdsFor(config: Config, project: string): boolean {
+  return config.projects?.[project]?.issueIds ?? config.issueIds ?? false;
+}
 
 export const DEFAULT_PER_PROJECT = 5;
 
@@ -534,10 +542,14 @@ function parseConfig(raw: string, file: string, home: string): Config {
     throw new Error(`invalid JSON in ${file}: ${(error as Error).message}`);
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${file} must contain a JSON object.`);
-  const { db, aliases, perProject, floating, worktree, projects } = parsed as { db?: unknown; aliases?: unknown; perProject?: unknown; floating?: unknown; worktree?: unknown; projects?: unknown };
+  const { db, aliases, perProject, floating, worktree, issueIds, projects } = parsed as { db?: unknown; aliases?: unknown; perProject?: unknown; floating?: unknown; worktree?: unknown; issueIds?: unknown; projects?: unknown };
   const isObject = (value: unknown) => !!value && typeof value === "object" && !Array.isArray(value);
   if (projects !== undefined && (!isObject(projects) || !Object.values(projects as object).every(isObject))) throw new Error(`${file}: "projects" must map project keys to objects.`);
   if (floating !== undefined && typeof floating !== "boolean") throw new Error(`${file}: "floating" must be a boolean.`);
+  if (issueIds !== undefined && typeof issueIds !== "boolean") throw new Error(`${file}: "issueIds" must be a boolean.`);
+  for (const [key, entry] of Object.entries((projects ?? {}) as Record<string, { issueIds?: unknown }>)) {
+    if (entry.issueIds !== undefined && typeof entry.issueIds !== "boolean") throw new Error(`${file}: "projects.${key}.issueIds" must be a boolean.`);
+  }
   if (worktree !== undefined && typeof worktree !== "boolean") throw new Error(`${file}: "worktree" must be a boolean.`);
   if (perProject !== undefined && !(Number.isInteger(perProject) && (perProject as number) >= 0)) throw new Error(`${file}: "perProject" must be a non-negative integer.`);
   if (db !== undefined && typeof db !== "string") throw new Error(`${file}: "db" must be a string.`);
@@ -550,7 +562,8 @@ function parseConfig(raw: string, file: string, home: string): Config {
     ...(perProject !== undefined ? { perProject: perProject as number } : {}),
     ...(floating !== undefined ? { floating: floating as boolean } : {}),
     ...(worktree !== undefined ? { worktree: worktree as boolean } : {}),
-    ...(projects !== undefined ? { projects: projects as Record<string, { tracker?: unknown }> } : {}),
+    ...(issueIds !== undefined ? { issueIds: issueIds as boolean } : {}),
+    ...(projects !== undefined ? { projects: projects as Record<string, { tracker?: unknown; issueIds?: boolean }> } : {}),
   };
 }
 
@@ -684,9 +697,18 @@ export function getItemByNumber(db: DatabaseSync, project: string, id: number): 
 
 /**
  * Resolves an item reference: `3` or `#3` in `project`, or `KEY#3` / `NAME#3` in another project
- * (a bare project name must match exactly one project).
+ * (a bare project name must match exactly one project). A linked issue also names its item: `gh#45`
+ * in `project`, or the issue URL from anywhere.
  */
 export function findItem(db: DatabaseSync, ref: string, project: string): Item {
+  const issue = parseIssueRef(ref);
+  if (issue) {
+    const found = findByIssue(db, issue, project);
+    // `gh#3` could also name item 3 of a project called "gh"; that only applies when no issue matches.
+    const projectNamed = !issue.destination && db.prepare("SELECT 1 FROM projects WHERE key = ? OR display_name = ?").get(ref.split("#")[0]!, ref.split("#")[0]!);
+    if (!(found instanceof Error)) return found;
+    if (!projectNamed) throw found;
+  }
   const match = /^(?:(.+?)#|#)?(\d+)$/.exec(ref.trim());
   const number = match ? Number(match[2]) : NaN;
   if (!match || !Number.isInteger(number) || number <= 0) throw new Error(`expected an item id, got ${JSON.stringify(ref)}.`);
@@ -702,6 +724,39 @@ export function findItem(db: DatabaseSync, ref: string, project: string): Item {
   const item = getItemByNumber(db, key, number);
   if (!item) throw new Error(`No tdo item #${number} in ${key}.`);
   return item;
+}
+
+/** Short provider prefixes for issue refs; `gh#45` is GitHub issue 45. */
+const ISSUE_PREFIX: Record<string, string> = { github: "gh" };
+const PREFIX_PROVIDER = Object.fromEntries(Object.entries(ISSUE_PREFIX).map(([provider, prefix]) => [prefix, provider]));
+
+export type IssueRef = { provider: string; externalId: string; destination?: string };
+
+/** `gh#45` or a GitHub issue URL; undefined for anything else (including plain tdo ids). */
+export function parseIssueRef(ref: string): IssueRef | undefined {
+  const text = ref.trim();
+  const short = /^([a-z]+)#(\d+)$/i.exec(text);
+  const provider = short ? PREFIX_PROVIDER[short[1]!.toLowerCase()] : undefined;
+  if (short && provider && Number(short[2]) > 0) return { provider, externalId: String(Number(short[2])) };
+  const url = parseGithubIssueUrl(text);
+  return url ? { provider: "github", externalId: url.id, destination: url.destination } : undefined;
+}
+
+/** `gh#45` for a filed link; undefined while it has no issue yet. */
+export function issueRef(link: Pick<Link, "provider" | "externalId" | "state">): string | undefined {
+  if (!link.externalId || (link.state !== "open" && link.state !== "closed")) return undefined;
+  return `${ISSUE_PREFIX[link.provider] ?? link.provider}#${link.externalId}`;
+}
+
+/** URLs name their repository, so they match in any project; short refs match in `project` only. */
+function findByIssue(db: DatabaseSync, issue: IssueRef, project: string): Item | Error {
+  const rows = (issue.destination
+    ? db.prepare("SELECT l.project_id, l.item_id FROM links l WHERE l.provider = ? AND l.external_id = ? AND lower(l.destination) = lower(?) AND l.state IN ('open','closed')").all(issue.provider, issue.externalId, issue.destination)
+    : db.prepare("SELECT l.project_id, l.item_id FROM links l JOIN projects p ON p.id = l.project_id WHERE l.provider = ? AND l.external_id = ? AND p.key = ? AND l.state IN ('open','closed')").all(issue.provider, issue.externalId, project)) as { project_id: string; item_id: number }[];
+  const label = issue.destination ? `${issue.destination}#${issue.externalId}` : `${ISSUE_PREFIX[issue.provider] ?? issue.provider}#${issue.externalId}`;
+  if (!rows.length) return new Error(`No tdo item is linked to ${label}${issue.destination ? "" : ` in ${project}`}.`);
+  if (rows.length > 1) return new Error(`${label} is linked to several tdo items; use a tdo id instead.`);
+  return requireItem(db, { projectId: rows[0]!.project_id, id: Number(rows[0]!.item_id) });
 }
 
 function requireItem(db: DatabaseSync, key: ItemKey): Item {
@@ -1017,6 +1072,15 @@ export function itemRef(item: Item, options: { showProject?: boolean } = {}): st
   return options.showProject ? `${nameFromKey(item.project)}#${item.id}` : `#${item.id}`;
 }
 
+/** The item's filed issue ref (`gh#45`), if any. */
+function filedRef(item: Item): string | undefined {
+  for (const link of item.links ?? []) {
+    const ref = issueRef(link);
+    if (ref) return ref;
+  }
+  return undefined;
+}
+
 const ANSI = { bold: [1, 22], dim: [2, 22], red: [31, 39], yellow: [33, 39], cyan: [36, 39] } as const;
 type Style = keyof typeof ANSI;
 
@@ -1031,21 +1095,27 @@ export type FormatOptions = {
   showProject?: boolean;
   /** Emit ANSI colors. */
   color?: boolean;
+  /** Lead filed items with their issue ref (`gh#45`); the tdo id moves to the marker slot. */
+  issueIds?: boolean;
 };
 
 export function formatItemLine(item: Item, options: FormatOptions = {}): string {
   const { color } = options;
-  const parts = [paint(itemRef(item, options), color, "bold"), paint(item.priority, color, ...PRIORITY_STYLE[item.priority]) + " ".repeat(6 - item.priority.length)];
+  const filed = options.issueIds ? filedRef(item) : undefined;
+  const lead = filed ? (options.showProject ? `${nameFromKey(item.project)} ${filed}` : filed) : itemRef(item, options);
+  const parts = [paint(lead, color, "bold"), paint(item.priority, color, ...PRIORITY_STYLE[item.priority]) + " ".repeat(6 - item.priority.length)];
   if (item.status !== "open") parts.push(paint(`[${item.status}]`, color, item.status === "doing" ? "cyan" : "dim"));
   parts.push(item.title);
   const marker = linkMarker(item.links);
-  if (marker) parts.push(paint(marker, color, marker.endsWith("!") ? "red" : "dim"));
+  // With the issue leading, the marker slot keeps the tdo id visible; sync state still shows when it isn't settled.
+  if (filed) parts.push(paint(marker?.startsWith("↗") && marker !== `↗${filed}` ? `${marker} #${item.id}` : `#${item.id}`, color, marker && marker.endsWith("!") ? "red" : "dim"));
+  else if (marker) parts.push(paint(marker, color, marker.endsWith("!") ? "red" : "dim"));
   if (item.tags.length) parts.push(paint(item.tags.map((tag) => `#${tag}`).join(" "), color, "cyan"));
   if (item.fileRef) parts.push(paint(`@ ${item.fileRef}`, color, "dim"));
   return parts.join("  ");
 }
 
-/** `↗#42` filed, `↗…` in progress or pending, `↗?` awaiting approval, `↗!` needs attention. */
+/** `↗gh#42` filed, `↗…` in progress or pending, `↗?` awaiting approval, `↗!` needs attention. */
 export function linkMarker(links: Link[] | undefined): string | undefined {
   const link = links?.[0];
   if (!link) return undefined;
@@ -1054,7 +1124,7 @@ export function linkMarker(links: Link[] | undefined): string | undefined {
   switch (link.state) {
     case "open":
     case "closed":
-      return `↗#${link.externalId}`;
+      return `↗${issueRef(link) ?? "!"}`;
     case "creating":
     case "pending":
       return "↗…";
@@ -1084,7 +1154,7 @@ export function byPriority(a: Item, b: Item): number {
  * Renders items grouped by project under a bold header, most urgent first, showing at most
  * `perProject` items per project (0 = all). Projects with the most urgent items come first.
  */
-export function formatGroupedList(items: Item[], options: { perProject?: number; color?: boolean; empty?: string } = {}): string {
+export function formatGroupedList(items: Item[], options: { perProject?: number; color?: boolean; empty?: string; issueIds?: (project: string) => boolean } = {}): string {
   if (!items.length) return options.empty ?? "(nothing here)";
   const { color } = options;
   const perProject = options.perProject ?? DEFAULT_PER_PROJECT;
@@ -1097,7 +1167,7 @@ export function formatGroupedList(items: Item[], options: { perProject?: number;
     const summary = `${group.length} item${group.length === 1 ? "" : "s"}${urgent ? `, ${urgent}!` : ""}`;
     const header = `${paint(nameFromKey(key), color, "bold")}  ${paint(`${key} · ${summary}`, color, "dim")}`;
     const shown = perProject > 0 ? group.slice(0, perProject) : group;
-    const lines = shown.map((item) => `  ${formatItemLine(item, { color })}`);
+    const lines = shown.map((item) => `  ${formatItemLine(item, { color, issueIds: options.issueIds?.(key) })}`);
     const hidden = group.length - shown.length;
     if (hidden > 0) lines.push(paint(`  … ${hidden} more (tdo ls --project ${key} -n 0)`, color, "dim"));
     return [header, ...lines].join("\n");
@@ -1133,7 +1203,7 @@ export function formatItemDetail(item: Item): string {
 
 function formatLinkDetails(links: Link[]): string[] {
   return links.flatMap((link) => [
-    `issue:    ${link.url ?? link.destination} (${link.state})`,
+    `issue:    ${issueRef(link) ? `${issueRef(link)} ` : ""}${link.url ?? link.destination} (${link.state})`,
     ...(link.syncError ? [`          ${link.syncError}`] : []),
     ...(link.queued || link.attention ? [`          ${link.queued} queued, ${link.attention} need attention`] : []),
     ...(link.error && link.state !== "open" && link.state !== "closed" ? [`          ${link.error}`] : []),

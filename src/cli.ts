@@ -41,6 +41,8 @@ import {
   requirePriority,
   resolveProject,
   itemRef,
+  issueIdsFor,
+  parseIssueRef,
   type Item,
   type Project,
   type Status,
@@ -57,9 +59,10 @@ usage:
   tdo ls [-a] [-s STATUS] [-t TAGS] [-p PRIO] [-q TEXT] [-n N] [--linked] [--awaiting]
                             N items (default ${DEFAULT_LIST_LIMIT}; 0 = all, no row cap)
                             -a groups by project, N items each (default ${DEFAULT_PER_PROJECT}; 0 = all)
-                            ↗#42 filed as an issue, ↗… in progress, ↗! needs attention
+                            ↗gh#42 filed as an issue, ↗… in progress, ↗! needs attention
                             truncated results show a notice (stderr with --json)
-  tdo show [id]             ids are per project: 3 or #3 here, NAME#3 or KEY#3 elsewhere
+  tdo show [id]             ids are per project: 3 or #3 here, NAME#3 or KEY#3 elsewhere;
+                            a filed item also answers to gh#45 or its issue URL
   tdo edit [id] [--title T] [-p PRIO] [-t +tag,~tag] [-b BODY] [-f REF]
                             ~tag removes a tag (quote a leading ~: -t '~tag')
                             no flags: edit title and body in $EDITOR
@@ -100,7 +103,7 @@ options:
 priorities: ${PRIORITIES.join(", ")} (prefixes and 0-3 accepted)
 statuses:   ${STATUS_FILTERS.join(", ")} (ls default: active = open + doing)
 files:      database $XDG_DATA_HOME/tdo/tdo.db (default ~/.local/share/tdo/tdo.db)
-            config   $XDG_CONFIG_HOME/tdo/config.json (optional; keys: db, aliases, perProject, floating, worktree, projects)
+            config   $XDG_CONFIG_HOME/tdo/config.json (optional; keys: db, aliases, perProject, floating, worktree, issueIds, projects)
             repo     .tdo/config.json at the repo root (optional; keys: project, tracker)
 env:        TDO_DB, TDO_CONFIG, TDO_PROJECT, TDO_SOURCE (who is adding: cli, claude, codex, ...),
             TDO_FZF_OPTS (extra fzf flags), NO_COLOR / FORCE_COLOR`;
@@ -223,7 +226,13 @@ export function useColor(env: NodeJS.ProcessEnv, isTTY: boolean | undefined): bo
   return !!isTTY;
 }
 
+/** A tdo id (`3`, `#3`, `name#3`) or a linked issue (`gh#45`, an issue URL). */
+function isRef(value: string): boolean {
+  return /^(?:.+#|#)?\d+$/.test(value.trim()) || !!parseIssueRef(value);
+}
+
 function requireRef(value: string | undefined): string {
+  if (parseIssueRef(value ?? "")) return value!.trim();
   if (!/^(?:.+#|#)?\d+$/.test(value?.trim() ?? "") || /^(?:.*#|#)?0+$/.test(value!.trim())) throw new UsageError(`expected an item id, got ${JSON.stringify(value ?? "")}.`);
   return value!.trim();
 }
@@ -351,7 +360,7 @@ export function run(argv: string[], io: Io): number {
     const items = db.call("listItems", { project: all ? undefined : project().key, status, limit: 0 }).sort((a, b) => (all ? a.project.localeCompare(b.project) : 0) || byStatusThenPriority(a, b));
     if (!items.length) throw new Error(`nothing to pick from${all ? "" : ` in ${project().key}`}.`);
     const self = [process.execPath, ...process.execArgv, process.argv[1] ?? "tdo", "--db", dbPath, "--project", project().key].map(shellQuote).join(" ");
-    const lines = items.map((item) => `${item.project}#${item.id}\t${formatItemLine(item, { showProject: all, color: true })}`);
+    const lines = items.map((item) => `${item.project}#${item.id}\t${formatItemLine(item, { showProject: all, color: true, issueIds: issueIdsFor(config, item.project) })}`);
     const multi = MULTI_COMMANDS.has(command);
     const header = `tdo ${command}${all ? " (all projects)" : ` · ${project().key}`}${multi ? " · tab to mark several" : ""}`;
     const picked = pick(lines, { multi, header, preview: `${self} show {1}` });
@@ -440,7 +449,7 @@ export function run(argv: string[], io: Io): number {
           const found = db.call("listItems", { ...filter, limit: cap === 0 ? 0 : Math.min(cap + 1, Number.MAX_SAFE_INTEGER) });
           const truncated = cap > 0 && found.length > cap;
           const items = truncated ? found.slice(0, cap) : found;
-          emit(items, formatItemList(items, { color, truncated }));
+          emit(items, formatItemList(items, { color, truncated, issueIds: issueIdsFor(config, project().key) }));
           if (json && truncated) (io.err ?? console.error)(`tdo: ${LIST_TRUNCATED}`);
           return 0;
         }
@@ -458,7 +467,7 @@ export function run(argv: string[], io: Io): number {
           if (shown.length < items.length) (io.err ?? console.error)(`tdo: ${LIST_TRUNCATED}`);
           return 0;
         }
-        emit(items, formatGroupedList(items, { perProject, color }));
+        emit(items, formatGroupedList(items, { perProject, color, issueIds: (key) => issueIdsFor(config, key) }));
         return 0;
       }
       case "_fzf": {
@@ -470,7 +479,7 @@ export function run(argv: string[], io: Io): number {
         switch (action) {
           case "feed": {
             const items = db.call("listItems", { project: scope, status: state.status, limit: 0 }).sort((a, b) => (state.all ? byProjectFirst(a, b, project().key) : 0) || byStatusThenPriority(a, b));
-            io.out(items.map((item) => `${item.project}#${item.id}\t${formatItemLine(item, { showProject: state.all, color: true })}`).join("\n"));
+            io.out(items.map((item) => `${item.project}#${item.id}\t${formatItemLine(item, { showProject: state.all, color: true, issueIds: issueIdsFor(config, item.project) })}`).join("\n"));
             return 0;
           }
           case "header":
@@ -556,7 +565,7 @@ export function run(argv: string[], io: Io): number {
       }
       case "note": {
         // `tdo note 3 text...`; without a leading id, pick the item and use every word as the note.
-        const ref = args.length && /^(?:.+#|#)?\d+$/.test(args[0]!) ? args[0] : undefined;
+        const ref = args.length && isRef(args[0]!) ? args[0] : undefined;
         const text = (ref ? args.slice(1) : args).join(" ").trim() || values.message?.trim();
         if (!text) throw new UsageError("tdo note needs text: tdo note <id> <text...>");
         const target = one(ref ? [ref] : []);

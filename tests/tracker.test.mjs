@@ -192,9 +192,9 @@ test("push files a clean issue, records the link, and is idempotent", (t) => {
 
   assert.equal(h.cli("push", "1").out, "#1: https://github.com/example/widgets/issues/101");
   assert.equal(h.creates().length, 1, "second push files nothing");
-  assert.match(h.cli("ls").out, /flaky login test {2}↗#101/);
+  assert.match(h.cli("ls").out, /flaky login test {2}↗gh#101/);
   assert.deepEqual(h.cli("ls", "--linked", "--json").json().map((item) => item.id), [1]);
-  assert.match(h.cli("show", "1").out, /issue: {4}https:\/\/github\.com\/example\/widgets\/issues\/101 \(open\)/);
+  assert.match(h.cli("show", "1").out, /issue: {4}gh#101 https:\/\/github\.com\/example\/widgets\/issues\/101 \(open\)/);
 });
 
 test("uncertain create failures become unknown and are never retried automatically", (t) => {
@@ -799,4 +799,48 @@ test("v4: v3 databases gain an empty label record and match fresh databases", as
   t.after(() => fresh.close());
   const schema = (db) => db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name").all();
   assert.deepEqual(schema(v3), schema(fresh));
+});
+
+test("filed items answer to gh#N and issue URLs; tdo ids still work", (t) => {
+  const h = harness(t);
+  h.cli("tracker", "approve", "--yes");
+  h.cli("add", "first");
+  h.cli("add", "second");
+  h.cli("push", "2");
+  assert.equal(h.cli("show", "gh#101", "--json").json().id, 2);
+  assert.equal(h.cli("show", "GH#101", "--json").json().id, 2);
+  assert.equal(h.cli("show", "https://github.com/example/widgets/issues/101", "--json").json().id, 2);
+  assert.equal(h.cli("show", "#2", "--json").json().id, 2);
+  assert.match(h.cli("show", "gh#101").out, /^issue: {4}gh#101 https:\/\/github\.com\/example\/widgets\/issues\/101 \(open\)$/m);
+  assert.match(h.cli("show", "gh#7").error.message, /No tdo item is linked to gh#7 in github\.com\/example\/widgets/);
+  assert.match(h.cli("show", "https://github.com/other/repo/issues/101").error.message, /No tdo item is linked to github\.com\/other\/repo#101/);
+
+  assert.match(h.cli("note", "gh#101", "via", "issue").out, /^noted #2/);
+  assert.equal(h.cli("done", "gh#101", "--json").json().status, "done");
+  assert.equal(h.calls().filter((call) => call.args[1] === "close").at(-1).args[2], "101");
+});
+
+test("a project named like an issue prefix still resolves when no issue matches", (t) => {
+  const h = harness(t, { tracker: undefined });
+  h.cli("add", "gh item", "--project", "gh");
+  assert.equal(h.cli("show", "gh#1", "--json").json().title, "gh item");
+});
+
+test("issueIds config leads filed rows with the issue ref and keeps the tdo id visible", (t) => {
+  const h = harness(t);
+  h.cli("tracker", "approve", "--yes");
+  h.cli("add", "local only");
+  h.cli("add", "filed one");
+  h.cli("push", "2");
+  assert.match(h.cli("ls").out, /^#2 {2}normal {2}filed one {2}↗gh#101$/m, "off by default");
+  fs.mkdirSync(path.join(h.dir, "config", "tdo"), { recursive: true });
+  fs.writeFileSync(path.join(h.dir, "config", "tdo", "config.json"), JSON.stringify({ projects: { [KEY]: { issueIds: true } } }));
+  const out = h.cli("ls").out;
+  assert.match(out, /^gh#101 {2}normal {2}filed one {2}#2$/m);
+  assert.match(out, /^#1 {2}normal {2}local only$/m, "unfiled items keep their tdo id");
+  assert.match(h.cli("ls", "-a").out, /^ {2}gh#101 {2}normal {2}filed one {2}#2$/m);
+  fs.writeFileSync(path.join(h.dir, "config", "tdo", "config.json"), JSON.stringify({ issueIds: true, projects: { [KEY]: { issueIds: false } } }));
+  assert.match(h.cli("ls").out, /^#2 /m, "per-project setting overrides the global one");
+  fs.writeFileSync(path.join(h.dir, "config", "tdo", "config.json"), JSON.stringify({ issueIds: "yes" }));
+  assert.match(h.cli("ls").error.message, /"issueIds" must be a boolean/);
 });
