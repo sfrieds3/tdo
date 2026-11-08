@@ -316,3 +316,18 @@ test("successful create survives optional refresh transport failure with URL and
   assert.match(warnings[0], /known-url.*refresh.*SSH refresh unavailable/);
   assert.equal(store.call("getLink", item, "github").url, "known-url");
 });
+
+test("tag changes during a create queue a label update against the labels actually filed", (t) => {
+  const store = createStore(":memory:");
+  t.after(() => store.close());
+  const item = store.call("addItem", { project: PROJECT, title: "tagged", tags: ["bug"] });
+  const calls = [];
+  const tracker = () => ({ ...recording(calls)(), create: (issue) => {
+    assert.deepEqual(issue.labels, ["bug"]);
+    store.call("updateItem", item, { addTags: ["ci"], removeTags: ["bug"] });
+    return { ok: true, value: { id: "42", url: `https://${PROJECT}/issues/42` } };
+  } });
+  pushItem(store, store.call("getItem", item), config, { tracker, warn() {} });
+  assert.deepEqual(calls, [["update", "42", { title: "tagged", body: "", addLabels: ["ci"], removeLabels: ["bug"] }]]);
+  assert.deepEqual(store.call("getLink", item, "github").labels, ["ci"]);
+});
