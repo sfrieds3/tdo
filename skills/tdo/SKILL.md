@@ -69,3 +69,5 @@ Linked items sync one-way to GitHub: title/body/file edits update the issue, not
 ### Trigger tags and consent
 
 An approved project can enable `mode: "auto-on-tag"` with a trigger tag (default `#issue`). Adding that tag is fine: agent-created items become `awaiting-approval`, not GitHub issues. Even a human edit does not change creation provenance. Use `tdo ls --awaiting` (or `-s all --awaiting` for closed items) to inspect these. `tdo sync` never files awaiting items. The user can confirm filing in Pi or explicitly ask for `tdo push` in this turn. Do not run `tdo push`, `tdo tracker approve`, or `--yes` without that explicit request. Pi confirmations do not waive this agent rule.
+
+On an item already filed as an issue, tag edits become GitHub label changes (missing labels are created in the repository), so keep tags on filed items meaningful to outside readers.

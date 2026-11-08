@@ -4,25 +4,29 @@ import type { Item, Link } from "../core.ts";
 import type { LinkOp } from "../link-ops.ts";
 import type { Store } from "../store.ts";
 import { isApproved, type EffectiveTracker } from "./config.ts";
-import { renderIssue } from "./content.ts";
+import { issueLabels, labelDelta, renderIssue } from "./content.ts";
 import { githubTracker } from "./github.ts";
 import type { Tracker, TrackerResult } from "./types.ts";
 
 export type DrainOptions = { warn: (message: string) => void; env?: NodeJS.ProcessEnv; tracker?: (destination: string) => Tracker; limit?: number };
 export type DrainResult = { id: number; sent: number; attempted: number; error?: string };
 
-function deliver(tracker: Tracker, link: Link, item: Item, op: LinkOp): TrackerResult<void> {
+/** `labels` is the new record of tdo-applied labels after a delivered update. */
+function deliver(tracker: Tracker, link: Link, item: Item, op: LinkOp, config: EffectiveTracker): TrackerResult<{ labels?: string[] }> {
   const id = link.externalId!;
+  const done = (result: TrackerResult<void>): TrackerResult<{ labels?: string[] }> => (result.ok ? { ok: true, value: {} } : result);
   switch (op.op) {
     case "update": {
-      const { title, body } = renderIssue(item, []);
-      return tracker.update(id, { title, body });
+      const { title, body, labels } = renderIssue(item, issueLabels(item, config));
+      const delta = labelDelta(link.labels, labels);
+      const result = tracker.update(id, { title, body, ...(delta.add.length ? { addLabels: delta.add } : {}), ...(delta.remove.length ? { removeLabels: delta.remove } : {}) });
+      return result.ok ? { ok: true, value: { labels } } : result;
     }
-    case "close": return tracker.close(id, op.reason === "not planned" ? "not planned" : "completed");
-    case "reopen": return tracker.reopen(id);
+    case "close": return done(tracker.close(id, op.reason === "not planned" ? "not planned" : "completed"));
+    case "reopen": return done(tracker.reopen(id));
     case "comment": {
       const note = item.notes.find((note) => note.seq === op.noteSeq);
-      return note ? tracker.comment(id, note.body) : { ok: false, kind: "attention", message: "queued note is missing" };
+      return note ? done(tracker.comment(id, note.body)) : { ok: false, kind: "attention", message: "queued note is missing" };
     }
   }
 }
@@ -43,14 +47,16 @@ export function drainLink(store: Store, item: Item, link: Link, config: Effectiv
       if (op.status === "attention") { result.error = op.lastError ?? "queued operation needs attention; run tdo sync --retry"; break; }
       const current = store.call("getItem", item);
       if (!current) break;
+      // The saved link carries the latest record of labels tdo applied.
+      const currentLink = current.links.find((candidate) => candidate.provider === link.provider) ?? link;
       result.attempted++;
-      const delivered = deliver(tracker, link, current, op);
+      const delivered = deliver(tracker, { ...link, labels: currentLink.labels }, current, op, config);
       if (!delivered.ok) {
         store.call("failOp", item, link.provider, owner, op.seq, delivered.kind === "attention", delivered.message);
         result.error = delivered.message;
         break;
       }
-      if (!store.call("ackOp", item, link.provider, owner, op.seq)) { result.error = "sync lease lost; operation remains queued"; break; }
+      if (!store.call("ackOp", item, link.provider, owner, op.seq, delivered.value.labels)) { result.error = "sync lease lost; operation remains queued"; break; }
       result.sent++;
     }
   } catch (error) {

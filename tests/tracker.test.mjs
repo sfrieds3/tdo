@@ -35,11 +35,13 @@ const input = args.includes('-') ? fs.readFileSync(0, 'utf8') : '';
 fs.appendFileSync(process.env.GH_LOG, JSON.stringify({ args, input }) + '\\n');
 const mode = process.env.GH_MODE;
 if (args[0] === 'auth') { if (mode === 'noauth') { console.error('not logged in'); process.exit(1); } process.exit(0); }
+if (args[0] === 'label' && args[1] === 'list') { console.log(JSON.stringify((process.env.GH_LABELS ?? '').split(',').filter(Boolean).map((name) => ({ name })))); process.exit(0); }
+if (args[0] === 'label' && args[1] === 'create') { if (process.env.GH_LABEL_ERROR) { console.error(process.env.GH_LABEL_ERROR); process.exit(1); } process.exit(0); }
 if (args[0] === 'issue' && args[1] === 'create') {
   if (mode === 'fail') { console.error('HTTP 502: something broke'); process.exit(1); }
   if (mode === 'garbage') { console.log('Creating issue...'); process.exit(0); }
   if (mode === 'hang') { setInterval(() => {}, 1000); return; }
-  const n = fs.readFileSync(process.env.GH_LOG, 'utf8').split('\\n').filter((l) => l.includes('"create"')).length;
+  const n = fs.readFileSync(process.env.GH_LOG, 'utf8').split('\\n').filter((l) => l.includes('"issue","create"')).length;
   console.log('https://github.com/example/widgets/issues/' + (100 + n));
   process.exit(0);
 }
@@ -60,7 +62,7 @@ console.error('unexpected gh call'); process.exit(3);
     return { code, out: out.join("\n"), json: () => JSON.parse(out.join("\n")) };
   };
   const calls = () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : []);
-  const creates = () => calls().filter((call) => call.args[1] === "create");
+  const creates = () => calls().filter((call) => call.args[0] === "issue" && call.args[1] === "create");
   const userConfig = () => JSON.parse(fs.readFileSync(path.join(dir, "config", "tdo", "config.json"), "utf8"));
   return { dir, repo, env, cli, calls, creates, errors, answers, userConfig };
 }
@@ -413,8 +415,8 @@ but this paragraph is user text', 'open', 'x', 'x'),
 
   const env = { TDO_DB: dbPath, TDO_PROJECT: "a", XDG_CONFIG_HOME: path.join(dir, "config") };
   const tdo = (...argv) => { const out = []; run(argv, { out: (text) => out.push(text), cwd: dir, env }); return out.join("\n"); };
-  assert.match(tdo("migrate", "--dry-run"), /would upgrade schema v2 -> v3\.\nno ids changed\.\nwould move 3 status notes/);
-  assert.match(tdo("migrate"), /upgraded schema v2 -> v3\.\nbackup: .*v2-backup.*\nno ids changed\.\nmoved 3 status notes/);
+  assert.match(tdo("migrate", "--dry-run"), /would upgrade schema v2 -> v4\.\nno ids changed\.\nwould move 3 status notes/);
+  assert.match(tdo("migrate"), /upgraded schema v2 -> v4\.\nbackup: .*v2-backup.*\nno ids changed\.\nmoved 3 status notes/);
   const items = JSON.parse(tdo("export", "--json"));
   const byId = Object.fromEntries(items.map((item) => [item.id, item]));
   assert.equal(byId[1].body, "just a body");
@@ -707,4 +709,94 @@ test("ordinary multi-item mutation creates at most one pending issue before boun
   assert.equal(h.creates().length, 6);
   assert.equal(h.calls().filter((call) => call.args[1] === "close").length, 6);
   assert.equal(h.calls().filter((call) => call.args[1] === "comment").length, 0);
+});
+
+test("tags sync as labels: filed with config labels, missing labels created, filing tag excluded", (t) => {
+  const h = harness(t, { tracker: { provider: "github", labels: ["tdo"] } });
+  h.env.GH_LABELS = "tdo,Bug";
+  h.cli("tracker", "approve", "--yes");
+  h.cli("add", "crash on save #bug #ci #issue");
+  assert.equal(h.cli("push", "1", "--json").json()[0].state, "open");
+  const labelCreates = h.calls().filter((call) => call.args[0] === "label" && call.args[1] === "create").map((call) => call.args[2]);
+  assert.deepEqual(labelCreates, ["ci"], "existing labels match case-insensitively; only missing ones are created");
+  const create = h.creates()[0];
+  assert.deepEqual(create.args.slice(8), ["--label", "tdo", "--label", "bug", "--label", "ci"]);
+  assert.deepEqual(h.cli("show", "1", "--json").json().links[0].labels, ["tdo", "bug", "ci"]);
+});
+
+test("tag edits update labels, removing only labels tdo applied", (t) => {
+  const h = harness(t, { tracker: { provider: "github", labels: ["tdo"] } });
+  h.env.GH_LABELS = "tdo,bug,ci,triaged";
+  h.cli("tracker", "approve", "--yes");
+  h.cli("add", "flaky #bug");
+  h.cli("push", "1");
+  h.cli("edit", "1", "-t", "+ci,~bug");
+  const edit = h.calls().filter((call) => call.args[0] === "issue" && call.args[1] === "edit").at(-1);
+  assert.deepEqual(edit.args, ["issue", "edit", "101", "--title", "flaky", "--body-file", "-", "--add-label", "ci", "--remove-label", "bug", "--repo", KEY]);
+  assert.deepEqual(h.cli("show", "1", "--json").json().links[0].labels, ["tdo", "ci"]);
+
+  // A no-op tag edit queues nothing; removing a tag that is also a config label keeps the label.
+  const before = h.calls().length;
+  h.cli("edit", "1", "-t", "+ci");
+  assert.equal(h.calls().length, before);
+  h.cli("edit", "1", "-t", "+tdo");
+  h.cli("edit", "1", "-t", "~tdo");
+  const edits = h.calls().slice(before).filter((call) => call.args[1] === "edit");
+  assert.ok(edits.every((call) => !call.args.includes("--remove-label")), "config labels and labels added on GitHub are never removed");
+});
+
+test("attached issues have no label record, so tag sync only adds", (t) => {
+  const h = harness(t);
+  h.env.GH_LABELS = "bug";
+  h.cli("tracker", "approve", "--yes");
+  h.cli("add", "legacy #bug");
+  h.cli("push", "1", "--attach", "https://github.com/example/widgets/issues/7");
+  assert.equal(h.cli("show", "1", "--json").json().links[0].labels, null);
+  h.cli("edit", "1", "-t", "~bug,+ci");
+  const edit = h.calls().filter((call) => call.args[1] === "edit").at(-1);
+  assert.deepEqual(edit.args.slice(7), ["--add-label", "ci", "--repo", KEY]);
+  assert.deepEqual(h.cli("show", "1", "--json").json().links[0].labels, ["ci"]);
+});
+
+test("a failed label create stops before filing, so the create stays known-not-created", (t) => {
+  const h = harness(t);
+  h.env.GH_LABEL_ERROR = "HTTP 403: Resource not accessible by integration";
+  h.cli("tracker", "approve", "--yes");
+  h.cli("add", "needs label #new");
+  const [result] = h.cli("push", "1", "--json").json();
+  assert.equal(result.state, "error");
+  assert.equal(h.creates().length, 0);
+  delete h.env.GH_LABEL_ERROR;
+  assert.equal(h.cli("push", "1", "--json").json()[0].state, "open", "an error link can be pushed again");
+});
+
+test("GitHub update skips removing labels the repository no longer has", async (t) => {
+  const h = harness(t);
+  h.env.GH_LABELS = "keep";
+  const { githubTracker } = await import("../src/trackers/github.ts");
+  const gh = githubTracker({ destination: KEY, env: h.env });
+  assert.equal(gh.update("5", { title: "t", body: "b", addLabels: ["fresh"], removeLabels: ["keep", "deleted"] }).ok, true);
+  const calls = h.calls();
+  assert.deepEqual(calls.map((call) => call.args.slice(0, 2)), [["label", "list"], ["label", "create"], ["issue", "edit"]]);
+  assert.deepEqual(calls[2].args.slice(5, 11), ["--body-file", "-", "--add-label", "fresh", "--remove-label", "keep"]);
+  assert.equal(gh.update("5", { title: "t", body: "b" }).ok, true);
+  assert.equal(h.calls().length, 4, "label-free updates skip the label lookup");
+});
+
+test("v4: v3 databases gain an empty label record and match fresh databases", async (t) => {
+  const { runMigrations } = await import("../src/migrations/index.ts");
+  const { SCHEMA_V2 } = await import("../src/migrations/v2.ts");
+  const { migrateToV3 } = await import("../src/migrations/v3.ts");
+  const v3 = core.openDb(":memory:", { migrate: false });
+  t.after(() => v3.close());
+  runMigrations(v3, undefined, [{ from: 0, to: 2, apply: (db) => db.exec(SCHEMA_V2) }, { from: 2, to: 3, apply: migrateToV3 }], 3);
+  v3.exec(`INSERT INTO projects (id, key, created_at) VALUES ('p', 'a', 'x');
+    INSERT INTO items (project_id, id, title, created_at, updated_at) VALUES ('p', 1, 't', 'x', 'x');
+    INSERT INTO links (project_id, item_id, provider, destination, state, external_id, url, created_at) VALUES ('p', 1, 'github', 'github.com/o/r', 'open', '9', 'u', 'x');`);
+  assert.deepEqual(core.migrateDb(v3), { from: 3, to: 4, backup: undefined, changes: [] });
+  assert.equal(core.getItemByNumber(v3, "a", 1).links[0].labels, null);
+  const fresh = core.openDb(":memory:");
+  t.after(() => fresh.close());
+  const schema = (db) => db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name").all();
+  assert.deepEqual(schema(v3), schema(fresh));
 });

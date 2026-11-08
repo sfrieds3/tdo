@@ -8,8 +8,8 @@ import type { Item, Link } from "../core.ts";
 import type { Store } from "../store.ts";
 import type { EffectiveTracker } from "./config.ts";
 import { githubTracker } from "./github.ts";
-import { renderIssue } from "./content.ts";
-export { renderIssue } from "./content.ts";
+import { issueLabels, renderIssue } from "./content.ts";
+export { issueLabels, renderIssue } from "./content.ts";
 import type { Tracker } from "./types.ts";
 
 export type PushResult = { id: number; state: Link["state"] | "skipped"; url?: string; error?: string; ok: boolean };
@@ -55,10 +55,10 @@ export function pushItem(store: Store, item: Item, config: EffectiveTracker, opt
   const claim = store.call("claimLinkCreate", item, provider, destination, options.force ? "force" : "create");
   if (!claim.token) return report(item, claim.link);
   const tracker = (options.tracker ?? ((target) => trackerFor(target, options.env)))(destination);
-  const issue = renderIssue(item, config.labels);
+  const issue = renderIssue(item, issueLabels(item, config));
   const result = tracker.create(issue);
   const outcome = result.ok
-    ? { ok: true as const, externalId: result.value.id, url: result.value.url, snapshot: { title: item.title, body: item.body, fileRef: item.fileRef } }
+    ? { ok: true as const, externalId: result.value.id, url: result.value.url, snapshot: { title: item.title, body: item.body, fileRef: item.fileRef, tags: item.tags }, labels: issue.labels }
     : { ok: false as const, kind: result.kind, message: result.message };
   let link: Link | undefined;
   try {

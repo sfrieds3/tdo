@@ -93,17 +93,17 @@ test("migrate previews and upgrades a v1 database", async () => {
   const tdo = (...argv) => { const out = []; run(argv, { out: (text) => out.push(text), cwd: dir, env }); return out.join("\n"); };
 
   const dry = tdo("migrate", "--dry-run");
-  assert.match(dry, /would upgrade schema v1 -> v3/);
+  assert.match(dry, /would upgrade schema v1 -> v4/);
   assert.match(dry, /b {2}#2 -> #1 {2}other/);
   assert.match(dry, /a {2}#3 -> #2 {2}second/);
   assert.doesNotMatch(dry, /#1 -> #1/);
   assert.deepEqual(fs.readdirSync(dir).filter((name) => name.includes("backup")), [], "dry run writes nothing");
 
   const done = tdo("migrate");
-  assert.match(done, /upgraded schema v1 -> v3/);
+  assert.match(done, /upgraded schema v1 -> v4/);
   assert.match(done, /backup: .*tdo\.db\.v1-backup-/);
   assert.match(tdo("show", "2"), /^#2 second/);
-  assert.match(tdo("migrate"), /already at schema v3/);
+  assert.match(tdo("migrate"), /already at schema v4/);
 });
 
 test("ls -a groups by project, most urgent first, capped per project", () => {

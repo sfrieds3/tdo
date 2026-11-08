@@ -78,7 +78,7 @@ test("SSH CLI full CRUD, FTS, metadata, project refs, tags, counts and exports u
   assert.match(h.cli("export", "--md").text, /updated/);
   h.cli("rm", "1");
   assert.equal(h.cli("ls", "--json").json().length, 0);
-  assert.equal(h.cli("db", "check", "--json").json().schema, 3);
+  assert.equal(h.cli("db", "check", "--json").json().schema, 4);
   const args = JSON.parse(fs.readFileSync(h.log, "utf8").split("\n")[0]);
   assert.deepEqual(args, ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ConnectionAttempts=1", "-p", "2222", "-l", "alice", "--", "test-alias", "tdo internal-rpc"]);
   assert.ok(!args.join(" ").includes(h.db));
@@ -316,7 +316,7 @@ test("remote older schema requires explicit migration and backup stays on server
   assert.ok(fs.existsSync(migrated.backup));
   assert.ok(migrated.backup.startsWith(h.db));
   assert.equal(h.cli("ls", "--json").json()[0].id, 1);
-  assert.equal(h.cli("migrate", "--json").json().from, 3);
+  assert.equal(h.cli("migrate", "--json").json().from, 4);
 });
 
 test("local operation store retains an in-memory database across calls", () => {

@@ -50,12 +50,14 @@ function ownsHead(db: DatabaseSync, key: ItemKey, provider: string, owner: strin
     .get(...args(key, provider), owner, new Date().toISOString(), seq, ...args(key, provider));
 }
 
-export function ackOp(db: DatabaseSync, key: ItemKey, provider: string, owner: string, seq: number): boolean {
+/** `labels`, when given, replaces the record of labels tdo applied (sent with a delivered update). */
+export function ackOp(db: DatabaseSync, key: ItemKey, provider: string, owner: string, seq: number, labels?: string[]): boolean {
   return transaction(db, () => {
     if (!ownsHead(db, key, provider, owner, seq)) return false;
     const row = db.prepare(`SELECT op FROM link_ops WHERE ${WHERE} AND seq = ?`).get(...args(key, provider), seq) as { op: string };
     if (row.op === "close" || row.op === "reopen") db.prepare(`UPDATE links SET state = ? WHERE ${WHERE}`).run(row.op === "close" ? "closed" : "open", ...args(key, provider));
     db.prepare(`UPDATE links SET synced_at = ? WHERE ${WHERE}`).run(new Date().toISOString(), ...args(key, provider));
+    if (labels) db.prepare(`UPDATE links SET labels = ? WHERE ${WHERE}`).run(JSON.stringify(labels), ...args(key, provider));
     db.prepare(`DELETE FROM link_ops WHERE ${WHERE} AND seq = ?`).run(...args(key, provider), seq);
     return true;
   });

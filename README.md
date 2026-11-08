@@ -131,7 +131,7 @@ Commit a tracker block in `.tdo/config.json` at the repository root:
 }
 ```
 
-`repo` accepts `OWNER/REPO` or `HOST/OWNER/REPO` (for GitHub Enterprise). Omit it to derive the destination from a `github.com/OWNER/REPO` project key; other project keys require it explicitly. Labels must already exist on GitHub; tdo does not silently retry without them.
+`repo` accepts `OWNER/REPO` or `HOST/OWNER/REPO` (for GitHub Enterprise). Omit it to derive the destination from a `github.com/OWNER/REPO` project key; other project keys require it explicitly. `labels` are added to every filed issue, alongside the item's tags (see [Lifecycle sync](#lifecycle-sync)). Labels missing from the repository are created first; if that fails, nothing is filed and the push can be retried.
 
 ```sh
 tdo tracker status          # settings, approval, gh health, link and queue counts
@@ -168,11 +168,12 @@ User settings override individual repository settings; labels replace the whole 
 
 `tdo ls --awaiting` filters awaiting links (use `-s all` to include closed items). In Pi, the footer counts awaiting items; `/tdo` offers **g Push to GitHub** only for items in the current resolvable project. Filing requires explicit item consent, separately from project config approval. The extension immediately offers consent after verified agent adds/edits that became awaiting, including multiple `tdo add`/`tdo edit` commands joined by `&&` and bash calls nested in codemode. Each prompt names the item and destination; declining keeps it local and awaiting. Verification uses saved database state, not IDs or approval hints in command output, so truncated output or a later failed command does not hide a successfully saved item. The extension also guards bash `tdo push`/`tdo tracker approve` calls with confirmation. Without UI these guarded calls fail closed. Shell recognition is best-effort: complex scripts, expansions, mixed commands, or cwd/database/project overrides do not trigger post-result filing dialogs. Network work runs asynchronously on the caller, never in the database helper.
 
-A new issue contains the title and body, plus the file reference if present, without tdo identifiers or notes. Notes written before creation completes are never back-posted. Concurrent edits during creation are reconciled against the current item atomically; already-done/dropped items can be filed and are then closed when `closeOnDone` is true. Pushing an already-filed item returns its existing link rather than creating another issue. Existing links retain their original destination if configuration changes; `tracker status` lists destination and last-synced status mismatches.
+A new issue contains the title and body, plus the file reference if present, without tdo identifiers or notes. Its labels are the configured `labels` plus the item's tags, except the tracker `tag` itself. Notes written before creation completes are never back-posted. Concurrent edits during creation are reconciled against the current item atomically; already-done/dropped items can be filed and are then closed when `closeOnDone` is true. Pushing an already-filed item returns its existing link rather than creating another issue. Existing links retain their original destination if configuration changes; `tracker status` lists destination and last-synced status mismatches.
 
 #### Lifecycle sync
 
-- Title, body and file-reference edits queue an issue update. This is one-way, last-write-wins: a later tdo edit overwrites GitHub edits. Priority and tags are not synced.
+- Title, body, file-reference and tag edits queue an issue update. Title and body are one-way, last-write-wins: a later tdo edit overwrites GitHub edits. Priority is not synced.
+- Tags sync as labels (the tracker `tag` excepted), and missing labels are created in the repository. tdo records which labels it applied and only ever removes those, so labels added on GitHub, and configured `labels`, are left alone. Issues linked with `--attach`, or filed before tag sync, start with no record: tags are added, but nothing is removed until tdo has applied it.
 - Notes become separate comments. `done` and `drop` close with reasons `completed` and `not planned`; `reopen` reopens. A status note is posted before its close/reopen operation. With `closeOnDone: false`, notes still post, but close/reopen operations are not enqueued.
 - Item changes, notes and delivery intent commit together before any GitHub call. A tracker or SSH delivery failure never rolls back or fails an ordinary local mutation; warnings go to stderr, and `--json` stdout remains one document describing the committed local result.
 - Ordinary edit/status/note commands attempt at most five operations in total. `--no-sync` leaves all intent saved for later. `tdo sync [--retry]` drains only the current project, with no five-operation cap, and never auto-retries an unknown create or creates an awaiting-approval item.
@@ -301,11 +302,11 @@ The result then goes through `aliases` in the [config file](#configuration), so 
 
 The database lives at `$XDG_DATA_HOME/tdo/tdo.db` — `~/.local/share/tdo/tdo.db` by default, on macOS too. Set `db` in the config file or `TDO_DB` to put it elsewhere. It is plain SQLite in WAL mode, so `sqlite3 ~/.local/share/tdo/tdo.db` works for ad-hoc queries.
 
-Schema: `projects` has a UUID `id` and the project `key`; `items` is keyed by `(project_id, id)`, where `id` is the per-project number; `tags`, `notes`, and `links` reference that pair. Full-text search lives in `items_fts`, kept in sync by triggers and covering notes as well as titles and bodies. Schema v3 includes `link_ops`, which stores the durable lifecycle queue; item edits, notes, and status transitions enqueue operations atomically with the local change.
+Schema: `projects` has a UUID `id` and the project `key`; `items` is keyed by `(project_id, id)`, where `id` is the per-project number; `tags`, `notes`, and `links` reference that pair. Full-text search lives in `items_fts`, kept in sync by triggers and covering notes as well as titles and bodies. Schema v3 includes `link_ops`, which stores the durable lifecycle queue; item edits, notes, and status transitions enqueue operations atomically with the local change. Schema v4 adds `links.labels`, the labels tdo applied to each issue.
 
 ### Upgrading for notes and GitHub issues
 
-**Compatibility break:** this feature uses schema v3 and SSH RPC v5. Update tdo on both the caller and database host to the same release before using an SSH database. Old helpers fail the protocol check; after updating the helper, an existing v2 remote database still requires an explicit `tdo migrate`. Local databases upgrade automatically on open, with a backup; use the commands below to preview first:
+**Compatibility break:** this release uses schema v4 and SSH RPC v6. Update tdo on both the caller and database host to the same release before using an SSH database. Old helpers fail the protocol check; after updating the helper, an existing older remote database still requires an explicit `tdo migrate`. Local databases upgrade automatically on open, with a backup; use the commands below to preview first:
 
 ```sh
 tdo migrate --dry-run
@@ -313,9 +314,9 @@ tdo migrate
 # For a remote database, use its configured target or pass --db to both commands.
 ```
 
-The v2→v3 migration preserves per-project ids, creates note/link tables, and rebuilds full-text search. It extracts recognized trailing legacy status-note blocks from item bodies into notes, leaving the remaining body intact. The dry-run reports how many notes would move. Notes now appear separately in item JSON (`notes`) rather than being appended to `body`; item JSON also includes `links`. The database records whether an item was created by a human for future auto-filing safeguards.
+The v2→v3 migration preserves per-project ids, creates note/link tables, and rebuilds full-text search. It extracts recognized trailing legacy status-note blocks from item bodies into notes, leaving the remaining body intact. The dry-run reports how many notes would move. Notes now appear separately in item JSON (`notes`) rather than being appended to `body`; item JSON also includes `links`. The database records whether an item was created by a human for future auto-filing safeguards. The v3→v4 migration only adds the `links.labels` column; existing links start with no label record.
 
-Backups are created beside the database on the machine storing it. To roll back, restore the pre-upgrade backup and use the older tdo release; older versions cannot read schema v3. Do not point an older caller at the upgraded database.
+Backups are created beside the database on the machine storing it. To roll back, restore the pre-upgrade backup and use the older tdo release; older versions cannot read schema v3 or v4. Do not point an older caller at the upgraded database.
 
 ### Upgrading from 0.1.x
 
@@ -332,7 +333,7 @@ Items are renumbered per project in their original order, so the oldest item in 
 
 ### SSH remote database
 
-Install a compatible version of `tdo` and Node 22.18+ on the server. The remote noninteractive shell must find `tdo` on `PATH`; use the same tdo release on both ends. Unlimited list/export support was introduced in RPC protocol v2, structured notes and issue filing in v3, lifecycle queues in v4, and consent-aware automatic filing in v5. This release requires v5: upgrade both ends together. Older helpers are rejected rather than allowed to silently apply the old row ceiling. Configure SSH keys/agent, host keys, and any jump hosts with your normal SSH setup first. No daemon, database file synchronization, or network-mounted SQLite file is needed.
+Install a compatible version of `tdo` and Node 22.18+ on the server. The remote noninteractive shell must find `tdo` on `PATH`; use the same tdo release on both ends. Unlimited list/export support was introduced in RPC protocol v2, structured notes and issue filing in v3, lifecycle queues in v4, consent-aware automatic filing in v5, and tag/label sync in v6. This release requires v6: upgrade both ends together. Older helpers are rejected rather than allowed to silently apply the old row ceiling. Configure SSH keys/agent, host keys, and any jump hosts with your normal SSH setup first. No daemon, database file synchronization, or network-mounted SQLite file is needed.
 
 ```sh
 tdo db use 'ssh://you@backlog-host/home/you/.local/share/tdo/tdo.db'
@@ -406,7 +407,7 @@ Layout: [`src/core.ts`](src/core.ts) holds queries, paths, config, and project r
 
 ### Adding a schema migration
 
-Historical migrations are immutable: do not edit [`src/migrations/v2.ts`](src/migrations/v2.ts) or [`src/migrations/v3.ts`](src/migrations/v3.ts), or make them depend on current application helpers. For v4, add a self-contained `src/migrations/v4.ts` conversion, register a `3 -> 4` step in [`src/migrations/index.ts`](src/migrations/index.ts), and bump `SCHEMA` there to 4. Keep the earlier steps: fresh and old databases then follow the same chain (`0 -> 2 -> 3 -> 4`, `1 -> 2 -> 3 -> 4`). Steps run inside one `BEGIN IMMEDIATE` transaction; the runner updates `user_version` after each step and takes one pre-upgrade backup for an existing file. Steps must not commit, start transactions, or set `user_version`. Add tests for the new conversion, fresh/upgraded schema equivalence, and rollback of the whole chain on failure, then run `pnpm check`. Local upgrades remain automatic; older remote databases still require `tdo migrate` explicitly.
+Historical migrations are immutable: do not edit [`src/migrations/v2.ts`](src/migrations/v2.ts), [`src/migrations/v3.ts`](src/migrations/v3.ts), or [`src/migrations/v4.ts`](src/migrations/v4.ts), or make them depend on current application helpers. For v5, add a self-contained `src/migrations/v5.ts` conversion, register a `4 -> 5` step in [`src/migrations/index.ts`](src/migrations/index.ts), and bump `SCHEMA` there to 5. Keep the earlier steps: fresh and old databases then follow the same chain (`0 -> 2 -> 3 -> 4 -> 5`, `1 -> 2 -> 3 -> 4 -> 5`). Steps run inside one `BEGIN IMMEDIATE` transaction; the runner updates `user_version` after each step and takes one pre-upgrade backup for an existing file. Steps must not commit, start transactions, or set `user_version`. Add tests for the new conversion, fresh/upgraded schema equivalence, and rollback of the whole chain on failure, then run `pnpm check`. Local upgrades remain automatic; older remote databases still require `tdo migrate` explicitly.
 
 Commits and PR titles follow [Conventional Commits](https://www.conventionalcommits.org/). [release-please](https://github.com/googleapis/release-please) turns them into a release PR with a changelog; merging it tags the release, moves the `vMAJOR` / `vMAJOR.MINOR` tags, and attaches an npm tarball.
 

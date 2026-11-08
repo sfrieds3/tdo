@@ -69,6 +69,8 @@ export type Link = {
   claimedAt: string | null;
   createdAt: string;
   syncedAt: string | null;
+  /** Labels tdo itself applied to the issue; null when unknown (filed before tag sync or attached). */
+  labels: string[] | null;
   queued: number;
   attention: number;
   syncError: string | null;
@@ -630,10 +632,10 @@ type ItemRow = {
 };
 
 type NoteRow = { seq: number; status: Status | null; body: string; created_at: string };
-type LinkRow = { provider: string; destination: string; state: LinkState; attempt: string | null; external_id: string | null; url: string | null; error: string | null; claimed_at: string | null; created_at: string; synced_at: string | null };
+type LinkRow = { provider: string; destination: string; state: LinkState; attempt: string | null; external_id: string | null; url: string | null; error: string | null; claimed_at: string | null; created_at: string; synced_at: string | null; labels: string | null };
 
 function toLink(db: DatabaseSync, key: ItemKey, row: LinkRow): Link {
-  return { provider: row.provider, destination: row.destination, state: row.state, externalId: row.external_id, url: row.url, error: row.error, claimedAt: row.claimed_at, createdAt: row.created_at, syncedAt: row.synced_at, ...queueCounts(db, key, row.provider) };
+  return { provider: row.provider, destination: row.destination, state: row.state, externalId: row.external_id, url: row.url, error: row.error, claimedAt: row.claimed_at, createdAt: row.created_at, syncedAt: row.synced_at, labels: row.labels ? JSON.parse(row.labels) as string[] : null, ...queueCounts(db, key, row.provider) };
 }
 
 /** Adds notes and links to items read from `ITEM_SELECT`. */
@@ -740,14 +742,15 @@ export function updateItem(db: DatabaseSync, key: ItemKey, patch: ItemPatch, int
     if (patch.body !== undefined) { sets.push("body = ?"); values.push(cleanOptional(patch.body)); }
     if (patch.priority !== undefined) { sets.push("priority = ?"); values.push(PRIORITIES.indexOf(requirePriority(patch.priority))); }
     if (patch.fileRef !== undefined) { sets.push("file_ref = ?"); values.push(cleanOptional(patch.fileRef)); }
+    let tagsChanged = false;
     const removeTag = db.prepare("DELETE FROM tags WHERE project_id = ? AND item_id = ? AND tag = ?");
-    for (const tag of normalizeTags(patch.removeTags)) removeTag.run(projectId, id, tag);
+    for (const tag of normalizeTags(patch.removeTags)) tagsChanged = Number(removeTag.run(projectId, id, tag).changes) > 0 || tagsChanged;
     const insertTag = db.prepare("INSERT OR IGNORE INTO tags (project_id, item_id, tag) VALUES (?, ?, ?)");
-    for (const tag of normalizeTags(patch.addTags)) insertTag.run(projectId, id, tag);
+    for (const tag of normalizeTags(patch.addTags)) tagsChanged = Number(insertTag.run(projectId, id, tag).changes) > 0 || tagsChanged;
     sets.push("updated_at = ?");
     values.push(now());
     db.prepare(`UPDATE items SET ${sets.join(", ")} WHERE project_id = ? AND id = ?`).run(...values, projectId, id);
-    if (patch.title !== undefined || patch.body !== undefined || patch.fileRef !== undefined) enqueueLinked(db, key, "update");
+    if (patch.title !== undefined || patch.body !== undefined || patch.fileRef !== undefined || tagsChanged) enqueueLinked(db, key, "update");
     persistAutoIntent(db, key, intent);
   });
   return requireItem(db, key);
@@ -845,8 +848,11 @@ export function claimLinkCreate(db: DatabaseSync, key: ItemKey, provider: string
   });
 }
 
+/** The item content a create rendered; `tags` is optional for callers that predate tag sync. */
+export type CreateSnapshot = Pick<Item, "title" | "body" | "fileRef"> & { tags?: string[] };
+
 export type CreateOutcome =
-  | { ok: true; externalId: string; url: string; snapshot?: Pick<Item, "title" | "body" | "fileRef"> }
+  | { ok: true; externalId: string; url: string; snapshot?: CreateSnapshot; labels?: string[] }
   | { ok: false; kind: "attention" | "retryable" | "uncertain"; message: string };
 
 /** Records a create attempt's result; a no-op (returns undefined) if the attempt was superseded. */
@@ -854,10 +860,10 @@ export function finishLinkCreate(db: DatabaseSync, key: ItemKey, provider: strin
   return transaction(db, () => {
     const timestamp = now();
     const sql = outcome.ok
-      ? "UPDATE links SET state = 'open', external_id = ?, url = ?, error = NULL, error_kind = NULL, attempt = NULL, synced_at = ?"
+      ? "UPDATE links SET state = 'open', external_id = ?, url = ?, error = NULL, error_kind = NULL, attempt = NULL, synced_at = ?, labels = ?"
       : "UPDATE links SET state = ?, error = ?, error_kind = ?, attempt = NULL";
     const values = outcome.ok
-      ? [outcome.externalId, outcome.url, timestamp]
+      ? [outcome.externalId, outcome.url, timestamp, outcome.labels ? JSON.stringify(outcome.labels) : null]
       : [outcome.kind === "uncertain" ? "unknown" : outcome.kind === "retryable" ? "pending" : "error", outcome.message, outcome.kind];
     const changed = db.prepare(`${sql} WHERE project_id = ? AND item_id = ? AND provider = ? AND attempt = ? AND state = 'creating'`)
       .run(...values, key.projectId, key.id, provider, token).changes;
@@ -868,9 +874,10 @@ export function finishLinkCreate(db: DatabaseSync, key: ItemKey, provider: strin
 }
 
 /** Reconcile under the create completion's write lock; notes preceding completion are not comments. */
-function reconcileCreatedLink(db: DatabaseSync, key: ItemKey, provider: string, closeOnDone: boolean, snapshot?: Pick<Item, "title" | "body" | "fileRef">): void {
+function reconcileCreatedLink(db: DatabaseSync, key: ItemKey, provider: string, closeOnDone: boolean, snapshot?: CreateSnapshot): void {
   const current = requireItem(db, key);
-  if (!snapshot || current.title !== snapshot.title || current.body !== snapshot.body || current.fileRef !== snapshot.fileRef) enqueueOp(db, key, provider, "update");
+  const tagsChanged = snapshot?.tags !== undefined && normalizeTags(snapshot.tags).join(",") !== current.tags.join(",");
+  if (!snapshot || current.title !== snapshot.title || current.body !== snapshot.body || current.fileRef !== snapshot.fileRef || tagsChanged) enqueueOp(db, key, provider, "update");
   if (closeOnDone && (current.status === "done" || current.status === "dropped")) enqueueOp(db, key, provider, "close", current.status === "done" ? "completed" : "not planned");
 }
 

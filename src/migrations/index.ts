@@ -3,8 +3,9 @@ import * as fs from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import { SCHEMA_V2, migrateFromV1 } from "./v2.ts";
 import { migrateToV3, planNoteExtraction as countBodyNotes } from "./v3.ts";
+import { migrateToV4 } from "./v4.ts";
 
-export const SCHEMA = 3;
+export const SCHEMA = 4;
 
 /** One row per item in a v1 -> v2 id mapping (including unchanged numbers). */
 export type IdChange = { project: string; from: number; to: number; title: string };
@@ -55,6 +56,7 @@ const migrations: readonly MigrationStep[] = [
   { from: 0, to: 2, apply: (db) => db.exec(SCHEMA_V2) },
   { from: 1, to: 2, apply: migrateFromV1, preview: planMigration },
   { from: 2, to: 3, apply: migrateToV3, notes: countBodyNotes },
+  { from: 3, to: 4, apply: migrateToV4 },
 ];
 
 function rejectNewer(version: number, target: number): void {
