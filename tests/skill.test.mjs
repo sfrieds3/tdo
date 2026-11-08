@@ -32,6 +32,21 @@ test("skill distinguishes approved linked GitHub issues from local bookkeeping a
   assert.doesNotMatch(SKILL, /Reference a GitHub issue.*only if the user asks/);
 });
 
+test("skill checks for semantically similar active items before adding", () => {
+  const section = /## Check for duplicates before adding\n([\s\S]*?)\n## /.exec(SKILL);
+  assert.ok(section, "skill has a duplicate-check section");
+  const text = section[1];
+  assert.match(text, /Before every `tdo add`/);
+  assert.match(text, /tdo ls --json/);
+  assert.match(text, /semantic similarity/);
+  assert.match(text, /identical title is not required/);
+  assert.match(text, /No likely duplicate:\*\* proceed/);
+  assert.match(text, /still wants a separate item/);
+  assert.match(text, /update the existing one instead/);
+  assert.match(text, /Never merge, drop, or discard/);
+  assert.match(SKILL, /run the duplicate check below, then add it right away/);
+});
+
 test("every tdo command the skill documents parses", () => {
   const usage = [];
   run(["help"], { out: (text) => usage.push(text), cwd: process.cwd(), env: {} });

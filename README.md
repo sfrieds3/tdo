@@ -259,7 +259,7 @@ JSON.parse throws on an empty file; treat as {}
 
 ### Agents
 
-With the skill installed, ask any agent to "park that" or "add it to tdo" and it adds an item with a real title, body, and `file:line`. When it notices a problem outside the current task on its own, it asks first, proposing a title and priority. Asking "what's on the backlog?" lists open items, and it closes items it fixes, with a note.
+With the skill installed, ask any agent to "park that" or "add it to tdo" and it adds an item with a real title, body, and `file:line`. When it notices a problem outside the current task on its own, it asks first, proposing a title and priority. Before adding, it checks the project's active items for a semantically similar one; if it finds a likely duplicate, it shows the match and asks whether to update that item instead or create a separate one. Asking "what's on the backlog?" lists open items, and it closes items it fixes, with a note.
 
 ### Pi
 

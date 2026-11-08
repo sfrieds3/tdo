@@ -9,11 +9,23 @@ description: Per-project persistent backlog for things to fix later, via the `td
 
 ## When to use it
 
-- **User asks to park something** ("park that", "add it to tdo", "deal with it later"): add it right away, no confirmation needed.
-- **You notice an out-of-scope problem** (a bug, flaky test, dead code, risky pattern) while working on something else: do not fix it inline. Ask the user whether to park it, proposing a title and priority, e.g. *"Want me to park this in tdo? `config loader re-reads env on every call` (normal, #perf)"*. Add it only if they agree. Never log silently.
+- **User asks to park something** ("park that", "add it to tdo", "deal with it later"): run the duplicate check below, then add it right away; no confirmation is needed unless that check finds a likely duplicate.
+- **You notice an out-of-scope problem** (a bug, flaky test, dead code, risky pattern) while working on something else: do not fix it inline. Run the duplicate check, then ask the user whether to park it, proposing a title and priority, e.g. *"Want me to park this in tdo? `config loader re-reads env on every call` (normal, #perf)"*. If a likely duplicate exists, mention it in the same question. Add it only if they agree. Never log silently.
 - **User asks what's pending / open / on the backlog**: list items.
 - **Starting work in an area**: a quick `tdo ls -q <keyword> --json` can surface parked items worth folding in. Mention relevant ones; don't act on them unasked.
 - **You fixed something that was parked**: close it with a note.
+
+## Check for duplicates before adding
+
+Before every `tdo add`, review the project's active items for one that already covers the same request: the same underlying problem or change, even when worded differently ("login test flakes" and "auth spec intermittently fails on token refresh" are duplicates; an identical title is not required).
+
+1. Run `tdo ls --json` (active items in this project). If the output is truncated, also run `tdo ls -q "<key words>" --json` with a few distinctive words and synonyms from the new request.
+2. Judge semantic similarity yourself from titles, bodies, tags, and file refs. Related-but-different work (same file, different bug) is not a duplicate.
+3. **No likely duplicate:** proceed as normal; don't ask an extra question or mention the check.
+4. **Likely duplicate:** don't add yet. Show the matching items (id, title, status) and ask whether the user still wants a separate item, offering to update the existing one instead (`tdo note <id> "..."` or `tdo edit <id> ...`), e.g. *"#7 `Login test flakes when token refresh races` looks like the same thing. Add a note to #7 instead, or create a separate item?"*
+5. Do what the user chooses. Never merge, drop, or discard either request on your own, and don't close the existing item.
+
+Closed items (done/dropped) don't block adding; if one clearly matches, you may mention it (`tdo ls -s closed -q ... --json`) so the user can choose `tdo reopen <id>` instead.
 
 ## Commands
 
