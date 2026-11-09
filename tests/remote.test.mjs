@@ -234,6 +234,21 @@ test("target precedence and db use preserve config, while paths never connects",
   assert.equal(fs.readFileSync(h.env.TDO_CONFIG, "utf8"), before);
 });
 
+test("db use writes config.local.json when it already sets db", (t) => {
+  const h = harness(t);
+  delete h.env.TDO_DB;
+  const local = h.env.TDO_CONFIG.replace(/\.json$/, ".local.json");
+  fs.writeFileSync(h.env.TDO_CONFIG, JSON.stringify({ db: path.join(h.dir, "main.db") }));
+  fs.writeFileSync(local, JSON.stringify({ db: path.join(h.dir, "stale.db"), perProject: 1 }));
+  h.cli("db", "use", h.target);
+  assert.deepEqual(JSON.parse(fs.readFileSync(local, "utf8")), { db: h.target, perProject: 1 });
+  assert.equal(JSON.parse(fs.readFileSync(h.env.TDO_CONFIG, "utf8")).db, path.join(h.dir, "main.db"));
+  const paths = h.cli("paths", "--json").json();
+  assert.equal(paths.db, h.target);
+  assert.equal(paths.localConfig, local);
+  assert.equal(paths.localConfigExists, true);
+});
+
 test("db use checks and saves the same canonical local target", (t) => {
   const h = harness(t);
   delete h.env.TDO_DB;

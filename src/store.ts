@@ -76,10 +76,10 @@ export function parseTarget(value: string): Target {
   return { kind: "ssh", host, user, port, path: remotePath };
 }
 
-/** Atomic replacement preserves aliases and forward-compatible config keys. */
+/** Atomic replacement preserves aliases and forward-compatible config keys. Writes the local config when it already sets `db`, so the choice takes effect. */
 export function saveDbTarget(target: string, env: NodeJS.ProcessEnv = process.env): void {
   parseTarget(target);
-  core.updateConfig((config) => ({ ...config, db: target }), env);
+  core.updateConfig((config) => ({ ...config, db: target }), env, undefined, { local: core.localConfigSets("db", env) });
 }
 
 function localCall<K extends Operation>(dbPath: string, explicitMigration: boolean, operation: K, args: StoreOperations[K]["args"], sharedDb?: ReturnType<typeof core.openDb>): StoreOperations[K]["result"] {

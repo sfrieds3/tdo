@@ -778,7 +778,8 @@ test("Pi project approval and item consent are separate, with exact config detai
   assert.match(h.dialogs[0].title, /Approve project/);
   for (const detail of ["provider: github", `destination: ${PROJECT}`, "mode: auto-on-tag", "tag: #issue", "labels: none", "closeOnDone: false"]) assert.ok(h.dialogs[0].message.includes(detail), detail);
   assert.match(h.dialogs[1].title, /File #1/);
-  assert.match(JSON.parse(fs.readFileSync(h.config)).projects[PROJECT].tracker.approved, /^sha256:/);
+  assert.match(JSON.parse(fs.readFileSync(h.config.replace(/\.json$/, ".local.json"))).projects[PROJECT].tracker.approved, /^sha256:/);
+  assert.equal(JSON.parse(fs.readFileSync(h.config)).projects[PROJECT].tracker.approved, undefined, "approval stays out of the shared config");
   assert.equal(h.calls().length, 0);
   assert.equal(h.items()[0].links[0].state, "awaiting-approval");
 });
@@ -793,6 +794,7 @@ test("Pi revalidates changed repo approval and does not persist stale consent", 
   h.awaiting();
   await h.command.handler("", h.ctx);
   assert.equal(JSON.parse(fs.readFileSync(h.config)).projects[PROJECT].tracker.approved, undefined);
+  assert.equal(fs.existsSync(h.config.replace(/\.json$/, ".local.json")), false);
   assert.equal(h.dialogs.length, 1);
   assert.equal(h.calls().length, 0);
 });

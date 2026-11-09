@@ -2,10 +2,10 @@
 import { parseArgs } from "node:util";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { canonicalJson, getDbPath, loadConfig, parseQuickAdd, resolveProject, sha256, updateConfig, type Item } from "../src/core.ts";
+import { canonicalJson, getDbPath, loadConfig, parseQuickAdd, resolveProject, sha256, type Item } from "../src/core.ts";
 import { callStore } from "./store.ts";
 import { createAsyncStore, parseTarget } from "../src/store.ts";
-import { isApproved, resolveTracker, setApproval } from "../src/trackers/config.ts";
+import { isApproved, resolveTracker, saveApproval } from "../src/trackers/config.ts";
 import { runTrackerWork } from "../src/trackers/async.ts";
 
 export function trackerContext(ctx: ExtensionContext) {
@@ -52,7 +52,7 @@ export function createTrackerUi(active: () => boolean, epoch: () => number) {
         if (!await ctx.ui.confirm("Approve project tracker configuration?", details)) return;
         const fresh = await current(ctx, item);
         if (!valid() || canonicalJson(fresh) !== fingerprint || !config.hash) return;
-        updateConfig((raw) => setApproval(raw, state!.project.key, config.hash));
+        saveApproval(state!.project.key, config.hash);
         state = await current(ctx, item);
       }
       if (!valid() || !state?.item || state.resolution.kind !== "ok" || !isApproved(state.resolution.tracker)) return;

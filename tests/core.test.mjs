@@ -549,3 +549,66 @@ test("config file sets the database path and project aliases", () => {
   fs.writeFileSync(file, JSON.stringify({ aliases: { a: 1 } }));
   assert.throws(() => tdo.loadConfig(env, home), /"aliases" must map/);
 });
+
+test("config.local.json merges over config.json", async () => {
+  const home = tempDir();
+  const env = { XDG_CONFIG_HOME: path.join(home, "cfg") };
+  const dir = path.join(home, "cfg", "tdo");
+  fs.mkdirSync(dir, { recursive: true });
+  const main = path.join(dir, "config.json");
+  const local = path.join(dir, "config.local.json");
+  assert.equal(tdo.getLocalConfigPath(env, home), local);
+  assert.equal(tdo.getLocalConfigPath({ TDO_CONFIG: "/x/c.json" }, home), "/x/c.local.json");
+  assert.equal(tdo.getLocalConfigPath({ TDO_CONFIG: "/x/conf" }, home), "/x/conf.local");
+
+  // Local alone works.
+  fs.writeFileSync(local, JSON.stringify({ perProject: 2 }));
+  assert.equal(tdo.loadConfig(env, home).perProject, 2);
+
+  fs.writeFileSync(main, JSON.stringify({
+    db: "~/main.db", perProject: 5, floating: true,
+    aliases: { a: "main-a", b: "main-b" },
+    projects: { p: { issueIds: true, tracker: { provider: "github", repo: "o/r", labels: ["x"] } } },
+  }));
+  fs.writeFileSync(local, JSON.stringify({
+    db: "~/local.db", floating: false,
+    aliases: { b: "local-b", c: "local-c" },
+    projects: { p: { tracker: { labels: ["y"] } }, q: { issueIds: false } },
+  }));
+  const expected = {
+    db: path.join(home, "local.db"), perProject: 5, floating: false,
+    aliases: { a: "main-a", b: "local-b", c: "local-c" },
+    projects: { p: { issueIds: true, tracker: { provider: "github", repo: "o/r", labels: ["y"] } }, q: { issueIds: false } },
+  };
+  assert.deepEqual(tdo.loadConfig(env, home), expected);
+  assert.deepEqual(await tdo.loadConfigAsync(env, home), expected);
+
+  // A non-object replaces, e.g. `tracker: false` disables filing locally.
+  fs.writeFileSync(local, JSON.stringify({ projects: { p: { tracker: false } } }));
+  assert.equal(tdo.loadConfig(env, home).projects.p.tracker, false);
+
+  // Errors name the offending file.
+  fs.writeFileSync(local, "{ nope");
+  assert.throws(() => tdo.loadConfig(env, home), (error) => error.message.includes(local) && /invalid JSON/.test(error.message));
+  fs.writeFileSync(local, JSON.stringify({ floating: "yes" }));
+  assert.throws(() => tdo.loadConfig(env, home), (error) => error.message.startsWith(local) && /"floating" must be a boolean/.test(error.message));
+
+  // updateConfig writes the main file by default, the local file on request.
+  fs.writeFileSync(local, JSON.stringify({ worktree: true }));
+  tdo.updateConfig((raw) => ({ ...raw, issueIds: true }), env, home);
+  assert.equal(JSON.parse(fs.readFileSync(main, "utf8")).issueIds, true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(local, "utf8")), { worktree: true });
+  tdo.updateConfig((raw) => ({ ...raw, perProject: 1 }), env, home, { local: true });
+  assert.deepEqual(JSON.parse(fs.readFileSync(local, "utf8")), { worktree: true, perProject: 1 });
+  assert.equal(tdo.localConfigSets("perProject", env, home), true);
+  assert.equal(tdo.localConfigSets("db", env, home), false);
+
+  // Writes go through symlinks, including dangling ones, instead of replacing them.
+  const target = path.join(home, "dotfiles", "config.local.json");
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.rmSync(local);
+  fs.symlinkSync(target, local);
+  tdo.updateConfig((raw) => ({ ...raw, worktree: false }), env, home, { local: true });
+  assert.ok(fs.lstatSync(local).isSymbolicLink());
+  assert.deepEqual(JSON.parse(fs.readFileSync(target, "utf8")), { worktree: false });
+});
