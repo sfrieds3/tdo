@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.7.0](https://github.com/sfrieds3/tdo/compare/v0.6.0...v0.7.0) (2026-11-09)
+
+
+### Features
+
+* address items by their linked issue and show issue refs unambiguously ([#54](https://github.com/sfrieds3/tdo/issues/54)) ([6e7eb98](https://github.com/sfrieds3/tdo/commit/6e7eb98445527efc991938eddc08f52e640d8360))
+* check for similar active items before agents add a tdo ([#53](https://github.com/sfrieds3/tdo/issues/53)) ([7994f2c](https://github.com/sfrieds3/tdo/commit/7994f2ce5a942eee0e5720ccea5e0b9dfefd5105))
+* reference linked GitHub issues in work handoffs ([#50](https://github.com/sfrieds3/tdo/issues/50)) ([b9b90f5](https://github.com/sfrieds3/tdo/commit/b9b90f5eef0fcaae49a7db8eb73f5a77d1a79d94))
+* sync item tags to GitHub issue labels ([#52](https://github.com/sfrieds3/tdo/issues/52)) ([0784183](https://github.com/sfrieds3/tdo/commit/0784183de85313c0a1c6176c2535282369644e23))
+
+
+### Bug Fixes
+
+* prompt for GitHub consent after chained agent mutations ([#49](https://github.com/sfrieds3/tdo/issues/49)) ([ca8194a](https://github.com/sfrieds3/tdo/commit/ca8194a5676824b6d8cc171d15e537c871746e6a))
+
 ## [0.6.0](https://github.com/sfrieds3/tdo/compare/v0.5.0...v0.6.0) (2026-11-06)
 
 
