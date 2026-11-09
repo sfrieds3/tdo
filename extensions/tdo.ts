@@ -18,11 +18,9 @@ import {
   formatItemDetail,
   formatItemLine,
   formatItemList,
-  getDbPath,
   itemRef,
   issueIdsFor,
   loadConfig,
-  openDb,
   parseEditorText,
   parseQuickAdd,
   requirePriority,
@@ -68,19 +66,7 @@ export const PICKER_KEYS = { g: "push", e: "edit", p: "priority", x: "done", d: 
 type PickerAction = "work" | (typeof PICKER_KEYS)[keyof typeof PICKER_KEYS];
 type Picked = { action: PickerAction; item: Item };
 
-type DbHandle = ReturnType<typeof openDb>;
-
 export { parseEditorText };
-
-/** Legacy local-only helper for existing consumers; extension operations use callStore. */
-export function withDb<T>(fn: (db: DbHandle) => T, env: NodeJS.ProcessEnv = process.env): T {
-  const db = openDb(getDbPath(env));
-  try {
-    return fn(db);
-  } finally {
-    db.close();
-  }
-}
 
 function hostName(): string {
   return os.hostname().split(".")[0] ?? "";
