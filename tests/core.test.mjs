@@ -79,6 +79,24 @@ test(`${resolve.name} prefers env, repo config, override file, remote, then home
   await assert.rejects(async () => resolve(sub, { env, home, config: NO_CONFIG }), /EISDIR/);
 });
 
+test(`${resolve.name} picks origin, else the first remote alphabetically, honoring insteadOf and URL-less remotes`, async (t) => {
+  const home = tempDir();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const repo = path.join(home, "repo");
+  fs.mkdirSync(repo);
+  git(repo, "init", "-q");
+  const key = async () => (await resolve(repo, { env: {}, home, config: NO_CONFIG })).key;
+  git(repo, "remote", "add", "zeta", "https://example.com/z/zeta.git");
+  git(repo, "remote", "add", "beta", "gh:o/beta.git");
+  git(repo, "config", "remote.beta.pushurl", "https://push.example.com/other/thing.git");
+  git(repo, "config", "url.https://github.com/.insteadOf", "gh:");
+  assert.equal(await key(), "github.com/o/beta", "first remote alphabetically, fetch URL rewritten via insteadOf");
+  git(repo, "config", "remote.alpha.fetch", "+refs/heads/*:refs/remotes/alpha/*");
+  assert.equal(await key(), "local:~/repo", "a URL-less first remote falls back to the path, as before");
+  git(repo, "remote", "add", "origin", "git@github.com:example/origin.git");
+  assert.equal(await key(), "github.com/example/origin", "origin wins regardless of order");
+});
+
 test(`${resolve.name} reads aliases and shares a local backlog across worktrees`, async (t) => {
   const home = tempDir();
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));

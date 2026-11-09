@@ -37,16 +37,16 @@ It ships with an [agent skill](skills/tdo/SKILL.md), so Claude Code, Codex, Pi, 
 
 ## Install
 
-Requires **Node 22.18+** (it runs its TypeScript directly via Node's type stripping).
+Requires **Node 22.18+** (it runs its TypeScript directly via Node's type stripping, with Node's compile cache enabled so later runs skip recompiling; set `NODE_DISABLE_COMPILE_CACHE=1` to turn that off).
 
 ### CLI
 
 ```sh
 git clone git@github.com:sfrieds3/tdo.git ~/code/tdo
-cd ~/code/tdo && just link        # ~/.local/bin/tdo -> src/cli.ts, plus the skill links below
+cd ~/code/tdo && just link        # ~/.local/bin/tdo -> src/bin.mjs, plus the skill links below
 ```
 
-Without `just`: `ln -s ~/code/tdo/src/cli.ts ~/.local/bin/tdo`.
+Without `just`: `ln -s ~/code/tdo/src/bin.mjs ~/.local/bin/tdo`.
 
 ### Agent skill
 

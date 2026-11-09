@@ -25,7 +25,7 @@
   },
   "packageManager": "pnpm@12.6.0",
   "bin": {
-    "tdo": "./src/cli.ts"
+    "tdo": "./src/bin.mjs"
   },
   "files": [
     "assets",

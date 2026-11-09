@@ -120,8 +120,7 @@ if (args === 'rev-parse --show-toplevel') {
     clearInterval(poll); clearTimeout(timeout);
     console.log(${JSON.stringify(h.dir)});
   }, 10);
-} else if (args === 'remote') console.log('origin');
-else if (args === 'remote get-url origin') console.log('https://${PROJECT}.git');
+} else if (args === 'remote -v') console.log('origin\\thttps://${PROJECT}.git (fetch)\\norigin\\thttps://${PROJECT}.git (push)');
 `, { mode: 0o755 });
   delete process.env.TDO_PROJECT;
   process.env.PATH = `${bin}:${process.env.PATH}`;
@@ -151,7 +150,7 @@ else if (args === 'remote get-url origin') console.log('https://${PROJECT}.git')
   assert.ok(fs.readFileSync(calls, "utf8").split("rev-parse --show-toplevel").length > 2, "later operations resolve fresh configuration rather than retaining stale consent context");
   const beforeSession = fs.readFileSync(calls, "utf8").trim().split("\n").length;
   await h.emit("session_start");
-  assert.equal(fs.readFileSync(calls, "utf8").trim().split("\n").length, beforeSession + 3, "session start resolves fresh configuration");
+  assert.equal(fs.readFileSync(calls, "utf8").trim().split("\n").length, beforeSession + 2, "session start resolves fresh configuration");
 
   for (const transition of ["session_shutdown", "session_tree", "session_start"]) {
     fs.unlinkSync(release);
