@@ -301,7 +301,9 @@ export function run(argv: string[], io: Io): number {
   const emit = (data: unknown, text: string) => io.out(json ? JSON.stringify(data, null, 2) : text);
   const cwd = values.C ? path.resolve(io.cwd, values.C) : io.cwd;
   const config = loadConfig(io.env);
-  const project = (): Project => (values.project ? projectFromKey(values.project) : resolveProject(cwd, { env: io.env, config }));
+  // Lazy (some commands never need it) and memoized: resolution spawns git.
+  let resolvedProject: Project | undefined;
+  const project = (): Project => (resolvedProject ??= values.project ? projectFromKey(values.project) : resolveProject(cwd, { env: io.env, config }));
   const dbPath = values.db ?? getDbPath(io.env, { config });
 
   if (command === "project") {
@@ -884,7 +886,7 @@ function byStatusThenPriority(a: Item, b: Item): number {
   return STATUS_ORDER[a.status] - STATUS_ORDER[b.status] || byPriority(a, b);
 }
 
-async function main(): Promise<void> {
+export async function main(): Promise<void> {
   try {
     if (process.argv[2] === "internal-rpc") {
       if (process.argv.length !== 3) throw new UsageError("internal-rpc accepts no arguments.");

@@ -359,9 +359,11 @@ function* checkoutProject(cwd: string, top: string | undefined, home: string): G
     const file = yield { kind: "file", path: path.join(top, PROJECT_FILE) };
     const override = file?.split("\n")[0]?.trim();
     if (override) return { ...projectFromKey(override), root };
-    const remotes = ((yield { kind: "git", args: ["remote"] }) ?? "").split("\n").map((name) => name.trim()).filter(Boolean);
-    const remote = remotes.includes("origin") ? "origin" : remotes[0];
-    const key = remote ? normalizeRemote((yield { kind: "git", args: ["remote", "get-url", remote] }) ?? "") : undefined;
+    // One spawn for every remote's fetch URL (with insteadOf rewrites applied, like `remote get-url`).
+    const remotes = parseRemotes((yield { kind: "git", args: ["remote", "-v"] }) ?? "");
+    const remote = remotes.has("origin") ? "origin" : remotes.keys().next().value;
+    const url = remote ? remotes.get(remote) : undefined;
+    const key = url ? normalizeRemote(url) : undefined;
     if (key) return { ...projectFromKey(key), root };
   }
   // Worktrees share their main checkout's backlog.
@@ -371,6 +373,22 @@ function* checkoutProject(cwd: string, top: string | undefined, home: string): G
   const realRoot = (yield { kind: "realpath", path: mainRoot }) ?? path.resolve(mainRoot);
   const local = homeRelativePaths(mainRoot, realHome, realRoot);
   return { ...projectFromKey(`local:${local}`), root };
+}
+
+/**
+ * Maps each remote name to its fetch URL from `git remote -v`, in git's (alphabetical) order.
+ * Remotes without a URL map to undefined, so selection matches `git remote` + `git remote get-url`.
+ */
+function parseRemotes(output: string): Map<string, string | undefined> {
+  const remotes = new Map<string, string | undefined>();
+  for (const line of output.split("\n")) {
+    const tab = line.indexOf("\t");
+    const name = (tab < 0 ? line : line.slice(0, tab)).trim();
+    if (!name) continue;
+    const fetch = tab < 0 ? undefined : /^(.+) \(fetch\)$/.exec(line.slice(tab + 1).trim())?.[1];
+    if (!remotes.has(name) || (fetch && remotes.get(name) === undefined)) remotes.set(name, fetch);
+  }
+  return remotes;
 }
 
 function aliasProject(project: Project, config: Config): Project {
