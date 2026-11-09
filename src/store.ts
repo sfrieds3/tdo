@@ -259,7 +259,9 @@ export function createAsyncStore(target = core.getDbPath(), options: { env?: Nod
         child.stdout.on("data", collect(out));
         child.stderr.on("data", collect(err));
         child.on("error", fail);
-        child.stdin.on("error", fail);
+        // A peer that exits before reading its input closes the pipe; let the exit
+        // status (or the overall timeout) decide the outcome instead of EPIPE.
+        child.stdin.on("error", (error: NodeJS.ErrnoException) => { if (error.code !== "EPIPE") fail(error); });
         child.on("close", (code, signal) => {
           clearTimeout(timer);
           if (failure || code !== 0) reject(transportError(failure ?? `exit ${code ?? signal}`, Buffer.concat(err).toString("utf8")));
