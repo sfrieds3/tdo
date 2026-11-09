@@ -152,7 +152,8 @@ else {
   const result = spawnSync(process.execPath, [script, "browse"], { cwd: dir, env: { ...env, REX_SESSION: "s", REX_BLOCK: "b" }, encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(logged().length, 2);
-  assert.equal(fzfCalls()[0].args.filter((arg) => arg.startsWith("--height=")).at(-1), "--height=100%");
+  const browser = fzfCalls().find((call) => !call.args.includes("--version"));
+  assert.equal(browser.args.filter((arg) => arg.startsWith("--height=")).at(-1), "--height=100%");
 });
 
 test("tmux argument escaping survives its real parser, including standalone and trailing semicolons", (t) => {

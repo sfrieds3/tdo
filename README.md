@@ -208,7 +208,7 @@ Plain `tdo` opens fzf over the backlog with a preview of the highlighted item. T
 | `enter` | View the item in `$PAGER` |
 | `ctrl-e` | Edit title and body in `$VISUAL` / `$EDITOR` |
 | `ctrl-s` · `ctrl-d` · `ctrl-x` · `ctrl-r` | Start · done · drop · reopen |
-| `alt-up` · `alt-down` | Raise · lower priority |
+| `alt-up` · `alt-down` | Raise · lower priority (the cursor stays on the item as it moves; needs fzf 0.71+) |
 | `alt-d` | Delete (asks first) |
 | `alt-n` | Add the typed query as a new item |
 | `ctrl-a` | Toggle all projects |
