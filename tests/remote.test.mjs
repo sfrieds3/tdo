@@ -276,6 +276,18 @@ test("transport and protocol failures never create a local fallback or retry", a
   assert.ok(!fs.existsSync(h.db));
 });
 
+test("async SSH store reports the exit status when ssh exits without reading stdin", async (t) => {
+  const h = harness(t);
+  h.env.SSH_MODE = "fail";
+  // Larger than any pipe buffer, so the write is still pending when ssh exits.
+  const body = "x".repeat(1024 * 1024);
+  await assert.rejects(createAsyncStore(h.target, { env: h.env }).call("addItem", { project: "caller/project", title: "big", body }), (error) => {
+    assert.doesNotMatch(error.message, /EPIPE/);
+    assert.match(error.message, /exit 255: offline/);
+    return true;
+  });
+});
+
 test("sync and async SSH operations enforce the overall timeout", async (t) => {
   const h = harness(t);
   h.env.SSH_MODE = "descendant";
