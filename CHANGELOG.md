@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.0](https://github.com/sfrieds3/tdo/compare/v0.7.0...v0.8.0) (2026-11-09)
+
+
+### Features
+
+* merge a machine-local config.local.json over the user config ([#55](https://github.com/sfrieds3/tdo/issues/55)) ([cea0d48](https://github.com/sfrieds3/tdo/commit/cea0d48a075e958da3bfa8ebf664aec62bf55fc5))
+
+
+### Bug Fixes
+
+* let ssh exit status decide async store failures instead of stdin EPIPE ([#57](https://github.com/sfrieds3/tdo/issues/57)) ([52fe3a4](https://github.com/sfrieds3/tdo/commit/52fe3a46fcdd2ba9b1042c9cb71a73d70a1bd5d3))
+
 ## [0.7.0](https://github.com/sfrieds3/tdo/compare/v0.6.0...v0.7.0) (2026-11-09)
 
 
