@@ -10,7 +10,7 @@ import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { floatingBackend, launchFloatingBrowser } from "./floating.ts";
 import { createStore, parseTarget, saveDbTarget, serveRpc, type Store } from "./store.ts";
-import { isApproved, resolveTracker, setApproval, statusPolicy, type EffectiveTracker, type TrackerResolution } from "./trackers/config.ts";
+import { isApproved, resolveTracker, saveApproval, statusPolicy, type EffectiveTracker, type TrackerResolution } from "./trackers/config.ts";
 import { autoIntent, isHumanCommand } from "./trackers/auto.ts";
 import { summarizeLinks, formatSyncSummary } from "./trackers/status.ts";
 import { drainItems } from "./trackers/drain.ts";
@@ -31,9 +31,9 @@ import {
   editorText,
   parseEditorText,
   getConfigPath,
+  getLocalConfigPath,
   getDbPath,
   loadConfig,
-  updateConfig,
   type IdChange,
   parseQuickAdd,
   parseStatusFilter,
@@ -310,8 +310,8 @@ export function run(argv: string[], io: Io): number {
     return 0;
   }
   if (command === "paths") {
-    const paths = { db: dbPath, config: getConfigPath(io.env), configExists: fs.existsSync(getConfigPath(io.env)) };
-    emit(paths, `db:     ${paths.db}\nconfig: ${paths.config}${paths.configExists ? "" : " (not present)"}`);
+    const paths = { db: dbPath, config: getConfigPath(io.env), configExists: fs.existsSync(getConfigPath(io.env)), localConfig: getLocalConfigPath(io.env), localConfigExists: fs.existsSync(getLocalConfigPath(io.env)) };
+    emit(paths, `db:     ${paths.db}\nconfig: ${paths.config}${paths.configExists ? "" : " (not present)"}\nlocal:  ${paths.localConfig}${paths.localConfigExists ? "" : " (not present)"}`);
     return 0;
   }
 
@@ -661,7 +661,7 @@ function approve(tracker: EffectiveTracker, projectKey: string, options: { io: I
     if (answer === undefined) throw new UsageError("no terminal to confirm on; review with `tdo tracker status` and run `tdo tracker approve --yes`.");
     if (!answer) return false;
   }
-  updateConfig((raw) => setApproval(raw, projectKey, tracker.hash), options.env);
+  saveApproval(projectKey, tracker.hash, options.env);
   tracker.approval = "approved";
   return true;
 }
@@ -710,7 +710,7 @@ function trackerCommand(args: string[], ctx: TrackerCommandContext): number {
   }
   if (sub === "revoke") {
     if (config.approval === "user-only") throw new Error("this tracker is defined in your config; remove it or set \"tracker\": false.");
-    updateConfig((raw) => setApproval(raw, ctx.project.key, undefined), ctx.io.env);
+    saveApproval(ctx.project.key, undefined, ctx.io.env);
     ctx.emit({ project: ctx.project.key, approved: false }, `revoked tracker approval for ${ctx.project.key}.`);
     return 0;
   }

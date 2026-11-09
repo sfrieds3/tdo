@@ -2,7 +2,7 @@
  * Tracker configuration: the repo's committed `.tdo/config.json` `tracker` block, merged with the
  * user's `projects.<key>.tracker` overrides, normalized, and checked against the user's approval.
  */
-import { canonicalJson, normalizeTag, projectFromKey, readRepoConfig, sha256, type Config, type Item, type Project, type Status } from "../core.ts";
+import { canonicalJson, normalizeTag, projectFromKey, readConfigLayer, readRepoConfig, sha256, updateConfig, type Config, type Item, type Project, type Status } from "../core.ts";
 
 export const PROVIDERS = ["github"] as const;
 export type Provider = (typeof PROVIDERS)[number];
@@ -169,6 +169,19 @@ export function setApproval(raw: Record<string, unknown>, projectKey: string, ha
   else delete projects[projectKey];
   const { projects: _previous, ...rest } = raw;
   return Object.keys(projects).length ? { ...rest, projects } : rest;
+}
+
+/**
+ * Saves (`hash`) or revokes (`undefined`) an approval. Approvals are machine state, so they live in
+ * `config.local.json`; a revoke also clears any legacy approval in `config.json`, which is only
+ * rewritten when it actually holds one.
+ */
+export function saveApproval(projectKey: string, hash: string | undefined, env: NodeJS.ProcessEnv = process.env): void {
+  updateConfig((raw) => setApproval(raw, projectKey, hash), env, undefined, { local: true });
+  if (hash) return;
+  const main = readConfigLayer("main", env) as { projects?: Record<string, { tracker?: unknown }> } | undefined;
+  const tracker = main?.projects?.[projectKey]?.tracker;
+  if (tracker && typeof tracker === "object" && "approved" in tracker) updateConfig((raw) => setApproval(raw, projectKey, undefined), env);
 }
 
 /** Foreign links need their own known user policy; approval hashes imply missing repository policy. */

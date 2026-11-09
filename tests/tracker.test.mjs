@@ -64,7 +64,11 @@ console.error('unexpected gh call'); process.exit(3);
   const calls = () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : []);
   const creates = () => calls().filter((call) => call.args[0] === "issue" && call.args[1] === "create");
   const userConfig = () => JSON.parse(fs.readFileSync(path.join(dir, "config", "tdo", "config.json"), "utf8"));
-  return { dir, repo, env, cli, calls, creates, errors, answers, userConfig };
+  const localConfig = () => {
+    const file = path.join(dir, "config", "tdo", "config.local.json");
+    return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : undefined;
+  };
+  return { dir, repo, env, cli, calls, creates, errors, answers, userConfig, localConfig };
 }
 
 const project = (root) => ({ key: KEY, name: "widgets", root });
@@ -138,10 +142,16 @@ test("approval hash ignores spelling and unknown keys but pins the destination",
   assert.notEqual(approvalHash({ provider: "github" }, { ...project(h.repo), key: "github.com/example/fork" }), base, "derived destination is pinned");
 });
 
-test("push requires approval; approve/revoke write the user config and preserve other keys", (t) => {
+test("push requires approval; approve/revoke write config.local.json, leaving a symlinked config.json alone", (t) => {
   const h = harness(t);
   fs.mkdirSync(path.join(h.dir, "config", "tdo"), { recursive: true });
-  fs.writeFileSync(path.join(h.dir, "config", "tdo", "config.json"), JSON.stringify({ perProject: 7, mystery: true }));
+  // A stow-style setup: config.json is a symlink into a dotfiles checkout.
+  const dotfiles = path.join(h.dir, "dotfiles", "config.json");
+  fs.mkdirSync(path.dirname(dotfiles), { recursive: true });
+  const shared = JSON.stringify({ perProject: 7, mystery: true });
+  fs.writeFileSync(dotfiles, shared);
+  fs.symlinkSync(dotfiles, path.join(h.dir, "config", "tdo", "config.json"));
+  fs.writeFileSync(path.join(h.dir, "config", "tdo", "config.local.json"), JSON.stringify({ localKey: 1 }));
   h.cli("add", "first");
 
   h.answers.push(false);
@@ -154,10 +164,11 @@ test("push requires approval; approve/revoke write the user config and preserve 
   assert.equal(status.tracker.destination, KEY);
 
   assert.equal(h.cli("tracker", "approve", "--yes").code, 0);
-  const saved = h.userConfig();
-  assert.equal(saved.perProject, 7);
-  assert.equal(saved.mystery, true);
+  const saved = h.localConfig();
+  assert.equal(saved.localKey, 1);
   assert.match(saved.projects[KEY].tracker.approved, /^sha256:/);
+  assert.ok(fs.lstatSync(path.join(h.dir, "config", "tdo", "config.json")).isSymbolicLink(), "symlink preserved");
+  assert.equal(fs.readFileSync(dotfiles, "utf8"), shared, "shared config untouched");
   assert.equal(h.cli("tracker", "status", "--json").json().tracker.approval, "approved");
 
   // Editing the committed block invalidates approval.
@@ -166,8 +177,26 @@ test("push requires approval; approve/revoke write the user config and preserve 
   fs.writeFileSync(path.join(h.repo, ".tdo", "config.json"), JSON.stringify({ tracker: { provider: "github" } }));
 
   assert.equal(h.cli("tracker", "revoke").code, 0);
-  assert.equal(h.userConfig().projects, undefined);
-  assert.equal(h.userConfig().perProject, 7);
+  assert.deepEqual(h.localConfig(), { localKey: 1 });
+  assert.equal(fs.readFileSync(dotfiles, "utf8"), shared, "revoke does not rewrite a config.json without an approval");
+  assert.ok(fs.lstatSync(path.join(h.dir, "config", "tdo", "config.json")).isSymbolicLink());
+});
+
+test("approve overrides a stale local approval; revoke clears a legacy approval in config.json", (t) => {
+  const h = harness(t);
+  const dir = path.join(h.dir, "config", "tdo");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ perProject: 7, projects: { [KEY]: { tracker: { approved: "sha256:legacy" } } } }));
+  fs.writeFileSync(path.join(dir, "config.local.json"), JSON.stringify({ projects: { [KEY]: { tracker: { approved: "sha256:stale" } } } }));
+  assert.equal(h.cli("tracker", "status", "--json").json().tracker.approval, "changed");
+  assert.equal(h.cli("tracker", "approve", "--yes").code, 0);
+  assert.equal(h.cli("tracker", "status", "--json").json().tracker.approval, "approved");
+  assert.equal(h.userConfig().projects[KEY].tracker.approved, "sha256:legacy", "approve leaves config.json alone");
+
+  assert.equal(h.cli("tracker", "revoke").code, 0);
+  assert.equal(h.cli("tracker", "status", "--json").json().tracker.approval, "unapproved");
+  assert.deepEqual(h.userConfig(), { perProject: 7 });
+  assert.deepEqual(h.localConfig(), {});
 });
 
 test("approve without a terminal needs --yes", (t) => {

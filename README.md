@@ -146,7 +146,7 @@ tdo sync                    # drain this project
 tdo sync --retry            # explicitly reset operations needing attention
 ```
 
-Repository settings require **your approval**, saved in your user config. Approval pins the normalized repository settings and resolved destination; changing either requires approval again. An interactive `push` can ask for approval, but scripts must first review `tracker status` and explicitly run `tdo tracker approve --yes`. `tdo tracker revoke` removes approval without deleting existing links or issues. `tracker status` can check `gh` health, but only an explicit `push` creates an issue.
+Repository settings require **your approval**, saved in your local user config (`config.local.json`). Approval pins the normalized repository settings and resolved destination; changing either requires approval again. An interactive `push` can ask for approval, but scripts must first review `tracker status` and explicitly run `tdo tracker approve --yes`. `tdo tracker revoke` removes approval without deleting existing links or issues. `tracker status` can check `gh` health, but only an explicit `push` creates an issue.
 
 To keep tracker settings private, put them under `projects.<project-key>.tracker` in your [user config](#configuration):
 
@@ -387,6 +387,8 @@ Everything works without a config file. To change defaults, create `$XDG_CONFIG_
 | `issueIds` | List rows of filed items lead with the issue ref (`gh#45  normal  title  #3`) instead of the tdo id; unfiled items are unchanged (default `false`). Override per project with `projects.KEY.issueIds`. |
 | `aliases` | Maps a resolved project key to the key to use instead — e.g. your fork to its upstream, so both share one backlog. |
 | `projects` | Per-project settings, keyed by the resolved project key. `tracker` overrides repository tracker settings, or `false` disables filing; `issueIds` overrides the global setting. See [GitHub issues](#github-issues). |
+
+**Machine-local overrides:** a `config.local.json` next to the config file (`~/.config/tdo/config.local.json`, or `c.local.json` beside `TDO_CONFIG=c.json`) is merged over it, so you can keep `config.json` in your dotfiles and put per-machine settings such as `db` in the local file. Objects (`aliases`, `projects`, and their entries) merge key by key; any other value, including arrays and `tracker: false`, replaces the main file's. Each file is validated on its own, and errors name the file at fault. Tracker approvals (`tdo tracker approve`, Pi's approval prompt) are machine state and always go to `config.local.json`; `tdo tracker revoke` removes the approval from the local file and also clears any older approval left in `config.json`. `tdo db use` writes `config.json`, unless the local file already sets `db`, in which case it updates the local file so the saved choice takes effect. Writes follow symlinks, so a stow-managed config stays a link. `tdo paths` shows both locations.
 
 Repository config is separate: `.tdo/config.json` accepts `project` and `tracker`, not user settings such as `db`. A malformed repository file or invalid `project` fails project resolution; an invalid tracker block is reported by tracker commands without blocking ordinary backlog commands.
 

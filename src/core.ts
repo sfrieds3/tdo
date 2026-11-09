@@ -450,11 +450,18 @@ export function getConfigPath(env: NodeJS.ProcessEnv = process.env, home = os.ho
   return env.TDO_CONFIG?.trim() || path.join(getConfigDir(env, home), "config.json");
 }
 
+/** Machine-local overrides beside the config file: `config.json` → `config.local.json`. */
+export function getLocalConfigPath(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): string {
+  const file = getConfigPath(env, home);
+  const ext = path.extname(file);
+  return ext ? `${file.slice(0, -ext.length)}.local${ext}` : `${file}.local`;
+}
+
 function expandHome(value: string, home: string): string {
   return value === "~" ? home : value.startsWith("~/") ? path.join(home, value.slice(2)) : value;
 }
 
-/** Optional user config at `$XDG_CONFIG_HOME/tdo/config.json`. */
+/** Optional user config at `$XDG_CONFIG_HOME/tdo/config.json`, with `config.local.json` merged over it. */
 export type Config = {
   /** Database path; `TDO_DB` takes precedence. */
   db?: string;
@@ -483,9 +490,10 @@ export const DEFAULT_PER_PROJECT = 5;
  * Rewrites the user config atomically. `fn` gets the raw JSON object (unknown keys included) and
  * returns the new one. The current file is validated first so a broken config is never clobbered.
  */
-export function updateConfig(fn: (config: Record<string, unknown>) => Record<string, unknown>, env: NodeJS.ProcessEnv = process.env, home = os.homedir()): void {
+export function updateConfig(fn: (config: Record<string, unknown>) => Record<string, unknown>, env: NodeJS.ProcessEnv = process.env, home = os.homedir(), options: { local?: boolean } = {}): void {
   loadConfig(env, home);
-  const file = getConfigPath(env, home);
+  // Write through symlinks (e.g. a stow-managed config) instead of replacing the link with a file.
+  const file = realConfigFile(options.local ? getLocalConfigPath(env, home) : getConfigPath(env, home));
   const current: Record<string, unknown> = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${randomUUID()}.tmp`;
@@ -495,6 +503,27 @@ export function updateConfig(fn: (config: Record<string, unknown>) => Record<str
   } finally {
     if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
   }
+}
+
+function realConfigFile(file: string): string {
+  try {
+    return fs.realpathSync(file);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  try {
+    // A dangling link: write its target rather than replacing the link.
+    const target = fs.readlinkSync(file);
+    return path.resolve(path.dirname(file), target);
+  } catch {
+    return file;
+  }
+}
+
+/** Raw JSON of the main or local config file alone, without merging; undefined when absent. */
+export function readConfigLayer(layer: "main" | "local", env: NodeJS.ProcessEnv = process.env, home = os.homedir()): Record<string, unknown> | undefined {
+  const file = layer === "local" ? getLocalConfigPath(env, home) : getConfigPath(env, home);
+  return readConfigFile(readOptional(file), file);
 }
 
 /** JSON with object keys sorted, so equal values always serialize (and hash) the same. */
@@ -510,38 +539,77 @@ export function sha256(text: string): string {
   return `sha256:${createHash("sha256").update(text).digest("hex")}`;
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): Config {
-  const file = getConfigPath(env, home);
-  let raw: string;
-  try {
-    raw = fs.readFileSync(file, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { aliases: {} };
-    throw error;
-  }
-  return parseConfig(raw, file, home);
-}
-
-export async function loadConfigAsync(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): Promise<Config> {
-  const file = getConfigPath(env, home);
-  let raw: string;
-  try {
-    raw = await fs.promises.readFile(file, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { aliases: {} };
-    throw error;
-  }
-  return parseConfig(raw, file, home);
-}
-
-function parseConfig(raw: string, file: string, home: string): Config {
+/** Reads one config file as a raw JSON object; undefined when it does not exist. */
+function readConfigFile(raw: string | undefined, file: string): Record<string, unknown> | undefined {
+  if (raw === undefined) return undefined;
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch (error) {
     throw new Error(`invalid JSON in ${file}: ${(error as Error).message}`);
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${file} must contain a JSON object.`);
+  if (!isPlainObject(parsed)) throw new Error(`${file} must contain a JSON object.`);
+  return parsed;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Objects merge key by key; anything else in `over` (scalars, arrays, `false`) replaces. */
+function mergeConfig(base: Record<string, unknown>, over: Record<string, unknown>): Record<string, unknown> {
+  const merged = { ...base };
+  for (const [key, value] of Object.entries(over)) merged[key] = isPlainObject(value) && isPlainObject(merged[key]) ? mergeConfig(merged[key] as Record<string, unknown>, value) : value;
+  return merged;
+}
+
+/** Whether the local config file sets top-level `key`, i.e. overrides the main file's value. */
+export function localConfigSets(key: string, env: NodeJS.ProcessEnv = process.env, home = os.homedir()): boolean {
+  const file = getLocalConfigPath(env, home);
+  const raw = readConfigFile(readOptional(file), file);
+  return !!raw && Object.hasOwn(raw, key);
+}
+
+function readOptional(file: string): string | undefined {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+async function readOptionalAsync(file: string): Promise<string | undefined> {
+  try {
+    return await fs.promises.readFile(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+/** Validates each file on its own (so errors name the right file), then merges local over main. */
+function combineConfig(main: string | undefined, local: string | undefined, env: NodeJS.ProcessEnv, home: string): Config {
+  const mainFile = getConfigPath(env, home);
+  const localFile = getLocalConfigPath(env, home);
+  const mainRaw = readConfigFile(main, mainFile);
+  const localRaw = readConfigFile(local, localFile);
+  if (mainRaw) parseConfig(mainRaw, mainFile, home);
+  if (localRaw) parseConfig(localRaw, localFile, home);
+  if (!mainRaw && !localRaw) return { aliases: {} };
+  return parseConfig(mergeConfig(mainRaw ?? {}, localRaw ?? {}), localRaw ? `${mainFile} + ${localFile}` : mainFile, home);
+}
+
+export function loadConfig(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): Config {
+  return combineConfig(readOptional(getConfigPath(env, home)), readOptional(getLocalConfigPath(env, home)), env, home);
+}
+
+export async function loadConfigAsync(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): Promise<Config> {
+  const [main, local] = await Promise.all([readOptionalAsync(getConfigPath(env, home)), readOptionalAsync(getLocalConfigPath(env, home))]);
+  return combineConfig(main, local, env, home);
+}
+
+function parseConfig(parsed: Record<string, unknown>, file: string, home: string): Config {
   const { db, aliases, perProject, floating, worktree, issueIds, projects } = parsed as { db?: unknown; aliases?: unknown; perProject?: unknown; floating?: unknown; worktree?: unknown; issueIds?: unknown; projects?: unknown };
   const isObject = (value: unknown) => !!value && typeof value === "object" && !Array.isArray(value);
   if (projects !== undefined && (!isObject(projects) || !Object.values(projects as object).every(isObject))) throw new Error(`${file}: "projects" must map project keys to objects.`);
