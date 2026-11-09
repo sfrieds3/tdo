@@ -313,6 +313,26 @@ test("plain tdo opens the fzf browser with action bindings", () => {
   assert.equal(calls.length, 1);
 });
 
+test("browser keeps the cursor on an item whose priority changes, when fzf can", () => {
+  const argsFor = (version) => {
+    const calls = [];
+    const tdo = harness({ interactive: true, fzfVersion: () => version, runFzf: (args) => { calls.push(args); return 130; } });
+    tdo();
+    return calls[0];
+  };
+  const bind = (args, key) => args.find((arg) => arg.startsWith(`--bind=${key}:`));
+  const modern = argsFor([0, 71]);
+  assert.ok(modern.includes("--id-nth=1"), "items are identified by their ref across reloads");
+  assert.match(bind(modern, "alt-up"), /^--bind=alt-up:track-current\+execute-silent\(.* _fzf raise /);
+  assert.match(bind(modern, "alt-down"), /^--bind=alt-down:track-current\+execute-silent\(.* _fzf lower /);
+  assert.doesNotMatch(bind(modern, "ctrl-d"), /track-current/, "a closed item leaves the list, so there is nothing to follow");
+  for (const old of [[0, 70], undefined]) {
+    const args = argsFor(old);
+    assert.ok(!args.includes("--id-nth=1"));
+    assert.ok(!args.some((arg) => arg.includes("track-current")), "older fzf reloads as before");
+  }
+});
+
 test("browser helpers feed items, toggle scope, and change priority", () => {
   const tdo = harness();
   tdo("add", "here !high");

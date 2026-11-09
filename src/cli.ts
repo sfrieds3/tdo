@@ -165,6 +165,8 @@ export type Io = {
   interactive?: boolean;
   /** Runs fzf for the browser; injectable for tests. Returns fzf's exit status. */
   runFzf?: (args: string[], env: NodeJS.ProcessEnv) => number;
+  /** The installed fzf's [major, minor]; injectable for tests. */
+  fzfVersion?: () => number[] | undefined;
   /** Launches the browser in a separate terminal; injectable for tests. */
   runFloat?: typeof launchFloatingBrowser;
 } & Interactive;
@@ -798,7 +800,10 @@ function byProjectFirst(a: Item, b: Item, current: string): number {
   return Number(b.project === current) - Number(a.project === current) || a.project.localeCompare(b.project);
 }
 
-/** Browser key bindings: [key, label, fzf action]. `$T` is the tdo invocation, `$S` the state file. */
+/**
+ * Browser key bindings: [key, label, fzf action]. `$T` is the tdo invocation, `$S` the state file,
+ * `$F` keeps the cursor on the focused item through the reload (when fzf supports it).
+ */
 export const BROWSE_KEYS: [string, string, string][] = [
   ["enter", "view", "execute($T show {1} | ${PAGER:-less -R})"],
   ["ctrl-e", "edit", "execute($T edit {1})+reload($T _fzf feed $S)"],
@@ -806,8 +811,8 @@ export const BROWSE_KEYS: [string, string, string][] = [
   ["ctrl-d", "done", "execute-silent($T done {+1})+reload($T _fzf feed $S)"],
   ["ctrl-x", "drop", "execute-silent($T drop {+1})+reload($T _fzf feed $S)"],
   ["ctrl-r", "reopen", "execute-silent($T reopen {+1})+reload($T _fzf feed $S)"],
-  ["alt-up", "prio+", "execute-silent($T _fzf raise $S {+1})+reload($T _fzf feed $S)"],
-  ["alt-down", "prio-", "execute-silent($T _fzf lower $S {+1})+reload($T _fzf feed $S)"],
+  ["alt-up", "prio+", "$Fexecute-silent($T _fzf raise $S {+1})+reload($T _fzf feed $S)"],
+  ["alt-down", "prio-", "$Fexecute-silent($T _fzf lower $S {+1})+reload($T _fzf feed $S)"],
   ["alt-d", "delete", "execute($T _fzf delete $S {+1})+reload($T _fzf feed $S)"],
   ["alt-n", "add query", "execute-silent($T add {q})+clear-query+reload($T _fzf feed $S)"],
   ["ctrl-a", "all projects", "execute-silent($T _fzf toggle-all $S)+reload($T _fzf feed $S)+transform-header($T _fzf header $S)"],
@@ -821,10 +826,27 @@ function browseHeader(state: BrowseState, current: string): string {
   return [`tdo · ${scope} · ${shown} · tab marks several · esc quit`, keys.slice(0, 6).join(" · "), keys.slice(6, 9).join(" · "), keys.slice(9).join(" · ")].join("\n");
 }
 
-export function browseArgs(tdo: string, stateFile: string, header: string, floating = false): string[] {
-  const expand = (action: string) => action.replaceAll("$T", tdo).replaceAll("$S", shellQuote(stateFile));
+/** fzf 0.71 added --id-nth, which lets track-current find the focused item again after a reload. */
+const FOLLOW_FZF = [0, 71];
+
+/** The installed fzf's [major, minor], or undefined when it can't be read. */
+function fzfVersion(env: NodeJS.ProcessEnv): number[] | undefined {
+  const match = /^(\d+)\.(\d+)/.exec(spawnSync("fzf", ["--version"], { env, encoding: "utf8" }).stdout ?? "");
+  return match ? [Number(match[1]), Number(match[2])] : undefined;
+}
+
+export function canFollow(version: number[] | undefined): boolean {
+  if (!version) return false;
+  const [major = 0, minor = 0] = version;
+  return major > FOLLOW_FZF[0]! || (major === FOLLOW_FZF[0] && minor >= FOLLOW_FZF[1]!);
+}
+
+export function browseArgs(tdo: string, stateFile: string, header: string, floating = false, follow = false): string[] {
+  const expand = (action: string) => action.replaceAll("$T", tdo).replaceAll("$S", shellQuote(stateFile)).replaceAll("$F", follow ? "track-current+" : "");
   return [
     "--ansi", "--multi", "--delimiter=\t", "--with-nth=2..", "--no-sort", "--layout=reverse", floating ? "--height=100%" : "--height=90%",
+    // Field 1 is the item ref, so a tracked item is found again after a reload re-sorts the list.
+    ...(follow ? ["--id-nth=1"] : []),
     "--prompt=tdo> ", `--header=${header}`, "--header-first",
     `--preview=${tdo} show {1}`, "--preview-window=right,50%,wrap",
     `--bind=start:reload(${expand("$T _fzf feed $S")})`,
@@ -837,6 +859,7 @@ export function browseArgs(tdo: string, stateFile: string, header: string, float
 function browse(io: Io, options: { all: boolean; status: StatusFilter; project?: string; cwd?: string; db: string }): number {
   const runFzf = io.runFzf ?? (onPath("fzf", io.env) ? (fzfArgs: string[], env: NodeJS.ProcessEnv) => spawnSync("fzf", fzfArgs, { stdio: ["ignore", "inherit", "inherit"], env }).status ?? 1 : undefined);
   if (!runFzf) throw new UsageError("the browser needs fzf on PATH; use `tdo ls` to list.");
+  const follow = canFollow(io.fzfVersion ? io.fzfVersion() : fzfVersion(io.env));
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tdo-browse-"));
   const stateFile = path.join(dir, "state.json");
   try {
@@ -847,7 +870,7 @@ function browse(io: Io, options: { all: boolean; status: StatusFilter; project?:
     const current = options.project ?? resolveProject(options.cwd ?? io.cwd, { env: io.env }).key;
     const env: NodeJS.ProcessEnv = { ...io.env, FORCE_COLOR: "1", FZF_DEFAULT_OPTS: [io.env.FZF_DEFAULT_OPTS, io.env.TDO_FZF_OPTS].filter(Boolean).join(" ") };
     delete env.NO_COLOR;
-    const status = runFzf(browseArgs(tdo, stateFile, browseHeader(state, current), io.env.TDO_FLOATING_BROWSER === "1"), env);
+    const status = runFzf(browseArgs(tdo, stateFile, browseHeader(state, current), io.env.TDO_FLOATING_BROWSER === "1", follow), env);
     // 1 = no match, 130 = esc: both are a normal exit from the browser.
     return status === 1 || status === 130 ? 0 : status;
   } finally {
