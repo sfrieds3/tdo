@@ -20,6 +20,7 @@ import {
   formatItemList,
   getDbPath,
   itemRef,
+  issueIdsFor,
   loadConfig,
   openDb,
   parseEditorText,
@@ -250,7 +251,8 @@ export default function tdoExtension(pi: ExtensionAPI) {
   });
 
   async function pick(ctx: ExtensionContext, items: Item[], title: string, showProject: boolean, selected?: ItemKey): Promise<Picked | undefined> {
-    const entries: SelectItem[] = items.map((item) => ({ value: keyString(item), label: formatItemLine(item, { showProject }) }));
+    const config = loadConfig();
+    const entries: SelectItem[] = items.map((item) => ({ value: keyString(item), label: formatItemLine(item, { showProject, issueIds: issueIdsFor(config, item.project) }) }));
     const byKey = new Map(items.map((item) => [keyString(item), item]));
     return ctx.ui.custom<Picked | undefined>((tui, theme, _keybindings, done) => {
       const container = new Container();

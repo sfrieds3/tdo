@@ -95,7 +95,7 @@ Use `@v0.2.3` to pin an exact release, or a local path (`"~/code/tdo"`) while ha
 | `tdo export [-a] [--md]` | Dump everything as JSON, or as a Markdown checklist. |
 | `tdo migrate [--dry-run]` | Upgrade an older database: back it up, then print which ids changed. |
 
-Item ids are numbered per project, so every repo's backlog starts at `#1`. `3` or `#3` means item 3 in the current project; reach another project with `NAME#3` (`gadgets#3`, when the name is unambiguous), `KEY#3` (`github.com/example/gadgets#3`), or `--project KEY`. Cross-project listings (`ls -a`) show ids as `NAME#3`. In `--json` output, `id` is the per-project number and `projectId` is the project's UUID; together they identify an item.
+Item ids are numbered per project, so every repo's backlog starts at `#1`. `3` or `#3` means item 3 in the current project; reach another project with `NAME#3` (`gadgets#3`, when the name is unambiguous), `KEY#3` (`github.com/example/gadgets#3`), or `--project KEY`. Cross-project listings (`ls -a`) show ids as `NAME#3`. An item filed as a GitHub issue also answers to its issue number, `gh#45` (current project), or its full issue URL (any project); tdo ids stay the canonical key, so items keep their number before, during and after filing. In `--json` output, `id` is the per-project number and `projectId` is the project's UUID; together they identify an item.
 
 Leave the id out of `show`, `edit`, `start`, `done`, `drop`, `reopen`, `note`, `push`, or `rm` and tdo opens fzf to pick it (`tab` marks several for the status commands and `push`; `reopen` offers closed items). Add `-a` to pick across projects. Without fzf or a terminal, the id is required.
 
@@ -185,7 +185,7 @@ A new issue contains the title and body, plus the file reference if present, wit
 
 #### Links and recovery
 
-Lists and browser rows show `↗#42` for a filed issue, `↗…` for queued operations or a pending/in-progress attempt, `↗?` for an awaiting-approval link, and `↗!` for an operation needing attention, an error, or an unknown outcome. `tdo show` includes link details. `--linked` matches any link state, not just successfully filed issues.
+Lists and browser rows show `↗gh#42` for a filed issue (the `gh` prefix keeps GitHub numbers distinct from tdo ids), `↗…` for queued operations or a pending/in-progress attempt, `↗?` for an awaiting-approval link, and `↗!` for an operation needing attention, an error, or an unknown outcome. `tdo show` includes link details. `--linked` matches any link state, not just successfully filed issues.
 
 An interrupted, timed-out, or unrecognized failed create may have made an issue. tdo records an **unknown** outcome and does not automatically retry it. Check GitHub first:
 
@@ -371,6 +371,7 @@ Everything works without a config file. To change defaults, create `$XDG_CONFIG_
   "perProject": 10,
   "floating": true,
   "worktree": true,
+  "issueIds": true,
   "aliases": {
     "github.com/me/widgets": "github.com/example/widgets"
   }
@@ -383,8 +384,9 @@ Everything works without a config file. To change defaults, create `$XDG_CONFIG_
 | `perProject` | Items per project in `tdo ls -a` (default 5; 0 shows all). |
 | `floating` | Open the CLI browser in a tmux popup or Rex floating pane when available (default `false`). `--no-float` overrides it. |
 | `worktree` | Pi `/tdo` "work on it" asks the agent to work in a new git worktree and branch, which it names (default `false`). |
+| `issueIds` | List rows of filed items lead with the issue ref (`gh#45  normal  title  #3`) instead of the tdo id; unfiled items are unchanged (default `false`). Override per project with `projects.KEY.issueIds`. |
 | `aliases` | Maps a resolved project key to the key to use instead — e.g. your fork to its upstream, so both share one backlog. |
-| `projects` | Per-project settings, keyed by the resolved project key. `tracker` overrides repository tracker settings, or `false` disables filing. See [GitHub issues](#github-issues). |
+| `projects` | Per-project settings, keyed by the resolved project key. `tracker` overrides repository tracker settings, or `false` disables filing; `issueIds` overrides the global setting. See [GitHub issues](#github-issues). |
 
 Repository config is separate: `.tdo/config.json` accepts `project` and `tracker`, not user settings such as `db`. A malformed repository file or invalid `project` fails project resolution; an invalid tracker block is reported by tracker commands without blocking ordinary backlog commands.
 
