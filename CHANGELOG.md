@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.9.0](https://github.com/sfrieds3/tdo/compare/v0.8.0...v0.9.0) (2026-11-09)
+
+
+### ⚠ BREAKING CHANGES
+
+* remove the local-only withDb export from the pi extension ([#58](https://github.com/sfrieds3/tdo/issues/58))
+
+### Features
+
+* remove the local-only withDb export from the pi extension ([#58](https://github.com/sfrieds3/tdo/issues/58)) ([e95530b](https://github.com/sfrieds3/tdo/commit/e95530b420473d85f3a9de4c8c070d2b2e63e8e5))
+
+
+### Bug Fixes
+
+* keep the browser cursor on an item when its priority changes ([#62](https://github.com/sfrieds3/tdo/issues/62)) ([eaf31d1](https://github.com/sfrieds3/tdo/commit/eaf31d1f2e53636deb2b235084b595a2ff5e1dd7))
+
+
+### Performance
+
+* cut CLI startup by ~65ms with the compile cache and fewer git spawns ([#60](https://github.com/sfrieds3/tdo/issues/60)) ([76b1976](https://github.com/sfrieds3/tdo/commit/76b1976fe429fde87a0438d6c140a5ed5c1adcee))
+
 ## [0.8.0](https://github.com/sfrieds3/tdo/compare/v0.7.0...v0.8.0) (2026-11-09)
 
 
