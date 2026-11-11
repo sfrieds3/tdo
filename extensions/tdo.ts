@@ -1,5 +1,6 @@
 /**
- * Pi front-end for tdo: the `/tdo` picker, quick-add, and a footer with the open count and focused item.
+ * Pi front-end for tdo: the `/tdo` picker, quick-add, and a footer with the focused item (plus open counts when
+ * the user opts in with `"statusline": true`).
  *
  * Agents (Pi, Claude Code, Codex, ...) use the `tdo` CLI through the bundled skill
  * (skills/tdo/SKILL.md), so this extension has no model-facing tool of its own.
@@ -185,24 +186,43 @@ export default function tdoExtension(pi: ExtensionAPI) {
     }
   }
 
+  /** Counts are opt-in (`"statusline": true`); without it the footer shows only the item being worked on. */
+  function fullStatus(): boolean {
+    try {
+      return loadConfig().statusline === true;
+    } catch {
+      return false;
+    }
+  }
+
   async function refreshStatus(ctx: ExtensionContext): Promise<void> {
     if (!ctx.hasUI || stopped) return;
     const current = ++generation;
     const key = focus;
+    const full = fullStatus();
+    // Not opted in and not working on anything: never touch the footer or the store.
+    if (!full && !key) {
+      ctx.ui.setStatus(STATUS_KEY, undefined);
+      return;
+    }
     try {
       const projectKey = (await project(ctx)).key;
-      const counts = await callStore("countActive", projectKey);
-      const links = await callStore("countLinks", projectKey);
+      const counts = full ? await callStore("countActive", projectKey) : undefined;
+      const links = full ? await callStore("countLinks", projectKey) : undefined;
       const focused = key ? await callStore("getItem", key) : undefined;
       if (current !== generation || stopped) return;
       // Only a successful lookup can invalidate the saved focus, never a transport error.
       if (key && focused?.status !== "doing" && focused?.status !== "open") setFocus(undefined);
       const parts: string[] = [];
-      const urgent = counts.urgent + counts.high;
-      if (counts.total) parts.push(ctx.ui.theme.fg("muted", `${TDO_ICON} ${counts.total}${urgent ? ` (${urgent}!)` : ""}`));
-      if (links["awaiting-approval"]?.length) parts.push(ctx.ui.theme.fg("muted", `${links["awaiting-approval"]!.length} awaiting`));
+      if (counts) {
+        const urgent = counts.urgent + counts.high;
+        if (counts.total) parts.push(ctx.ui.theme.fg("muted", `${TDO_ICON} ${counts.total}${urgent ? ` (${urgent}!)` : ""}`));
+      }
+      if (links?.["awaiting-approval"]?.length) parts.push(ctx.ui.theme.fg("muted", `${links["awaiting-approval"]!.length} awaiting`));
       if (focus && focused) {
         const ref = itemRef(focused, { showProject: focused.project !== projectKey });
+        // Lead with the icon when there are no counts, so the focus still reads as tdo.
+        if (!parts.length) parts.push(ctx.ui.theme.fg("muted", TDO_ICON));
         parts.push(ctx.ui.theme.fg("accent", `▸ ${ref} ${truncate(focused.title, FOCUS_TITLE_CHARS)}`));
       }
       ctx.ui.setStatus(STATUS_KEY, parts.length ? parts.join(" ") : undefined);

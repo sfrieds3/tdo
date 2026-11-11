@@ -23,7 +23,7 @@ $ tdo done 1 -m "added retry around token refresh"
 done #1  high    [done]  login test flakes on CI  #ci  @ src/auth/login.test.ts:88
 ```
 
-It ships with an [agent skill](skills/tdo/SKILL.md), so Claude Code, Codex, Pi, or any agent that reads `SKILL.md` files can park the issues it trips over mid-task — after asking you — instead of derailing the work. And it's a [Pi](https://pi.dev) package with a `/tdo` picker and a footer that shows the open count and the item you're working on.
+It ships with an [agent skill](skills/tdo/SKILL.md), so Claude Code, Codex, Pi, or any agent that reads `SKILL.md` files can park the issues it trips over mid-task — after asking you — instead of derailing the work. And it's a [Pi](https://pi.dev) package with a `/tdo` picker and a footer that shows the item you're working on (and, if you opt in, the open count).
 
 ## Features
 
@@ -166,7 +166,7 @@ To keep tracker settings private, put them under `projects.<project-key>.tracker
 
 User settings override individual repository settings; labels replace the whole list. A tracker defined only in your user config needs no approval. Set that project's `"tracker": false` to disable it. Defaults are `mode: "manual"`, `tag: "issue"`, `labels: []`, and `closeOnDone: true`. `closeOnDone` controls close/reopen delivery. `mode: "auto-on-tag"` enables filing when an add or edit leaves the item carrying `tag` (default `#issue`). The item must have been created by a human (TTY plus source `cli`/`user`), the current command must also be human, and the effective tracker must be approved. Otherwise the link is saved as `awaiting-approval`, never created by `sync`; explicitly push it to consent. A human edit does not change an agent-created item’s provenance. Authorized `--no-sync` creates stay `pending` for a later sync. Existing awaiting/error/unknown links are never auto-promoted. Removing the tag does not detach a link.
 
-`tdo ls --awaiting` filters awaiting links (use `-s all` to include closed items). In Pi, the footer counts awaiting items; `/tdo` offers **g Push to GitHub** only for items in the current resolvable project. Filing requires explicit item consent, separately from project config approval. The extension immediately offers consent after verified agent adds/edits that became awaiting, including multiple `tdo add`/`tdo edit` commands joined by `&&` and bash calls nested in codemode. Each prompt names the item and destination; declining keeps it local and awaiting. Verification uses saved database state, not IDs or approval hints in command output, so truncated output or a later failed command does not hide a successfully saved item. The extension also guards bash `tdo push`/`tdo tracker approve` calls with confirmation. Without UI these guarded calls fail closed. Shell recognition is best-effort: complex scripts, expansions, mixed commands, or cwd/database/project overrides do not trigger post-result filing dialogs. Network work runs asynchronously on the caller, never in the database helper.
+`tdo ls --awaiting` filters awaiting links (use `-s all` to include closed items). In Pi, the footer counts awaiting items when `statusline` is on; `/tdo` offers **g Push to GitHub** only for items in the current resolvable project. Filing requires explicit item consent, separately from project config approval. The extension immediately offers consent after verified agent adds/edits that became awaiting, including multiple `tdo add`/`tdo edit` commands joined by `&&` and bash calls nested in codemode. Each prompt names the item and destination; declining keeps it local and awaiting. Verification uses saved database state, not IDs or approval hints in command output, so truncated output or a later failed command does not hide a successfully saved item. The extension also guards bash `tdo push`/`tdo tracker approve` calls with confirmation. Without UI these guarded calls fail closed. Shell recognition is best-effort: complex scripts, expansions, mixed commands, or cwd/database/project overrides do not trigger post-result filing dialogs. Network work runs asynchronously on the caller, never in the database helper.
 
 A new issue contains the title and body, plus the file reference if present, without tdo identifiers or notes. Its labels are the configured `labels` plus the item's tags, except the tracker `tag` itself. Notes written before creation completes are never back-posted. Concurrent edits during creation are reconciled against the current item atomically; already-done/dropped items can be filed and are then closed when `closeOnDone` is true. Pushing an already-filed item returns its existing link rather than creating another issue. Existing links retain their original destination if configuration changes; `tracker status` lists destination and last-synced status mismatches.
 
@@ -284,7 +284,7 @@ After `e`, `p`, `x`, or `d` the picker reopens, so you can triage several items 
 
 The Pi picker shows at most 200 active items. If more match, its title shows `200+` and a warning points to `tdo ls -n 0` (or `tdo ls -a -n 0` across projects) and the CLI browser for the complete backlog.
 
-The footer shows `☑ 4 (2!) ▸ #3 login test flakes on CI` — open items, how many are urgent or high, and the item this session is working on. The checkbox is the terminal counterpart of the [tdo icon](assets/tdo.svg): a plain Unicode glyph (U+2611), with no Nerd Font or terminal image support required. The focus survives `/reload` and session resume, and clears itself once the item is closed or deleted. It refreshes after each agent run, so items the agent adds or closes through the CLI show up right away. An empty backlog hides the status; a store error shows `☑ unavailable` instead of a stale count.
+By default the footer stays out of your statusline until you work on an item: then it shows `☑ ▸ #3 login test flakes on CI` and clears once the item is closed or deleted. Set `"statusline": true` in the [config file](#configuration) to always show the backlog too: `☑ 4 (2!) ▸ #3 login test flakes on CI` — open items, how many are urgent or high, items awaiting filing approval, and the focused item. The checkbox is the terminal counterpart of the [tdo icon](assets/tdo.svg): a plain Unicode glyph (U+2611), with no Nerd Font or terminal image support required. The focus survives `/reload` and session resume. The footer refreshes after each agent run, so items the agent adds or closes through the CLI show up right away. An empty backlog hides the counts; a store error shows `☑ unavailable` instead of a stale value. Without `statusline` and with no focused item, the extension never reads the store for the footer.
 
 ## How projects are identified
 
@@ -371,6 +371,7 @@ Everything works without a config file. To change defaults, create `$XDG_CONFIG_
   "perProject": 10,
   "floating": true,
   "worktree": true,
+  "statusline": true,
   "issueIds": true,
   "aliases": {
     "github.com/me/widgets": "github.com/example/widgets"
@@ -384,6 +385,7 @@ Everything works without a config file. To change defaults, create `$XDG_CONFIG_
 | `perProject` | Items per project in `tdo ls -a` (default 5; 0 shows all). |
 | `floating` | Open the CLI browser in a tmux popup or Rex floating pane when available (default `false`). `--no-float` overrides it. |
 | `worktree` | Pi `/tdo` "work on it" asks the agent to work in a new git worktree and branch, which it names (default `false`). |
+| `statusline` | Pi footer always shows open/urgent/awaiting counts (default `false`: it shows only the item this session is working on). |
 | `issueIds` | List rows of filed items lead with the issue ref (`gh#45  normal  title  #3`) instead of the tdo id; unfiled items are unchanged (default `false`). Override per project with `projects.KEY.issueIds`. |
 | `aliases` | Maps a resolved project key to the key to use instead — e.g. your fork to its upstream, so both share one backlog. |
 | `projects` | Per-project settings, keyed by the resolved project key. `tracker` overrides repository tracker settings, or `false` disables filing; `issueIds` overrides the global setting. See [GitHub issues](#github-issues). |

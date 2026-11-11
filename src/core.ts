@@ -491,6 +491,8 @@ export type Config = {
   floating?: boolean;
   /** Pi "work on it" asks the agent to do the work in a new git worktree and branch. */
   worktree?: boolean;
+  /** Pi footer always shows counts; otherwise it shows only the item this session is working on. */
+  statusline?: boolean;
   /** Lead list rows of filed items with their issue ref (`gh#45`); per-project `issueIds` overrides it. */
   issueIds?: boolean;
   /** Per-project settings keyed by resolved project key; `tracker` is validated by its consumers. */
@@ -628,7 +630,7 @@ export async function loadConfigAsync(env: NodeJS.ProcessEnv = process.env, home
 }
 
 function parseConfig(parsed: Record<string, unknown>, file: string, home: string): Config {
-  const { db, aliases, perProject, floating, worktree, issueIds, projects } = parsed as { db?: unknown; aliases?: unknown; perProject?: unknown; floating?: unknown; worktree?: unknown; issueIds?: unknown; projects?: unknown };
+  const { db, aliases, perProject, floating, worktree, statusline, issueIds, projects } = parsed as { db?: unknown; aliases?: unknown; perProject?: unknown; floating?: unknown; worktree?: unknown; statusline?: unknown; issueIds?: unknown; projects?: unknown };
   const isObject = (value: unknown) => !!value && typeof value === "object" && !Array.isArray(value);
   if (projects !== undefined && (!isObject(projects) || !Object.values(projects as object).every(isObject))) throw new Error(`${file}: "projects" must map project keys to objects.`);
   if (floating !== undefined && typeof floating !== "boolean") throw new Error(`${file}: "floating" must be a boolean.`);
@@ -637,6 +639,7 @@ function parseConfig(parsed: Record<string, unknown>, file: string, home: string
     if (entry.issueIds !== undefined && typeof entry.issueIds !== "boolean") throw new Error(`${file}: "projects.${key}.issueIds" must be a boolean.`);
   }
   if (worktree !== undefined && typeof worktree !== "boolean") throw new Error(`${file}: "worktree" must be a boolean.`);
+  if (statusline !== undefined && typeof statusline !== "boolean") throw new Error(`${file}: "statusline" must be a boolean.`);
   if (perProject !== undefined && !(Number.isInteger(perProject) && (perProject as number) >= 0)) throw new Error(`${file}: "perProject" must be a non-negative integer.`);
   if (db !== undefined && typeof db !== "string") throw new Error(`${file}: "db" must be a string.`);
   if (aliases !== undefined && (!aliases || typeof aliases !== "object" || Array.isArray(aliases) || Object.values(aliases).some((value) => typeof value !== "string" || !value.trim()))) {
@@ -648,6 +651,7 @@ function parseConfig(parsed: Record<string, unknown>, file: string, home: string
     ...(perProject !== undefined ? { perProject: perProject as number } : {}),
     ...(floating !== undefined ? { floating: floating as boolean } : {}),
     ...(worktree !== undefined ? { worktree: worktree as boolean } : {}),
+    ...(statusline !== undefined ? { statusline: statusline as boolean } : {}),
     ...(issueIds !== undefined ? { issueIds: issueIds as boolean } : {}),
     ...(projects !== undefined ? { projects: projects as Record<string, { tracker?: unknown; issueIds?: boolean }> } : {}),
   };

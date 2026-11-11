@@ -14,12 +14,17 @@ const trackerConfig = await import("../src/trackers/config.ts");
 
 const PROJECT = "github.com/example/widgets";
 
-function harness({ selections = [], keys = [], editorText, confirm = true, confirmations = [] } = {}) {
+function harness({ selections = [], keys = [], editorText, confirm = true, confirmations = [], statusline = true } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tdo-ext-"));
   const dbPath = path.join(dir, "tdo.db");
   process.env.TDO_DB = dbPath;
   process.env.TDO_PROJECT = PROJECT;
   process.env.XDG_CONFIG_HOME = path.join(dir, "config");
+  // Most tests exercise the full footer; the opt-out default has its own tests.
+  if (statusline !== null) {
+    fs.mkdirSync(path.join(dir, "config", "tdo"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "config", "tdo", "config.json"), JSON.stringify({ statusline }));
+  }
   const handlers = new Map();
   const notifications = [];
   const dialogs = [];
@@ -180,6 +185,42 @@ test("failed project resolution is evicted so commands can retry after config re
   fs.writeFileSync(config, "{}");
   await h.command.handler("saved after repair", h.ctx);
   assert.equal(h.byTitle("saved after repair").project, PROJECT);
+});
+
+test("footer is opt-in: without statusline it stays empty and never queries the store", async () => {
+  const h = harness({ statusline: null }); // no config file at all
+  h.addDirect({ title: "parked", priority: "urgent" });
+  fs.writeFileSync(path.join(h.dir, "blocker"), "");
+  process.env.TDO_DB = path.join(h.dir, "blocker", "tdo.db"); // any store access would fail
+  await h.emit("session_start");
+  await h.emit("agent_end");
+  assert.equal(h.statuses.get("tdo"), undefined, "no counts and no 'unavailable' for users who did not opt in");
+  assert.equal(h.statuses.has("tdo"), true, "only ever cleared");
+  process.env.TDO_DB = h.dbPath;
+  assert.equal(h.items().length, 1);
+});
+
+test("statusline false still shows the item being worked on, then clears when it closes", async () => {
+  const h = harness({ statusline: false, keys: [[ENTER]] });
+  h.addDirect({ title: "rename helpers", priority: "high" });
+  h.addDirect({ title: "other", priority: "low" });
+  await h.emit("session_start");
+  assert.equal(h.statuses.get("tdo"), undefined);
+  await h.command.handler("", h.ctx);
+  assert.equal(h.statuses.get("tdo"), "☑ ▸ #1 rename helpers");
+  await h.emit("agent_end");
+  assert.equal(h.statuses.get("tdo"), "☑ ▸ #1 rename helpers");
+  const db = core.openDb(h.dbPath); core.setStatus(db, h.byTitle("rename helpers"), "done"); db.close();
+  await h.emit("agent_end");
+  assert.equal(h.statuses.get("tdo"), undefined);
+  assert.equal(h.entries.at(-1).data, null);
+});
+
+test("config rejects a non-boolean statusline", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tdo-cfg-"));
+  fs.mkdirSync(path.join(dir, "tdo"));
+  fs.writeFileSync(path.join(dir, "tdo", "config.json"), JSON.stringify({ statusline: "yes" }));
+  assert.throws(() => core.loadConfig({ XDG_CONFIG_HOME: dir }), /"statusline" must be a boolean/);
 });
 
 test("/tdo quick-adds with inline priority and tags", async () => {
@@ -452,7 +493,7 @@ function trackerHarness(t, options = {}) {
   t.after(() => { process.env = saved; fs.rmSync(h.dir, { recursive: true, force: true }); });
   h.config = path.join(process.env.XDG_CONFIG_HOME, "tdo", "config.json");
   fs.mkdirSync(path.dirname(h.config), { recursive: true });
-  fs.writeFileSync(h.config, JSON.stringify({ projects: { [PROJECT]: { tracker: { provider: "github", mode: "auto-on-tag", closeOnDone: false } } } }));
+  fs.writeFileSync(h.config, JSON.stringify({ statusline: true, projects: { [PROJECT]: { tracker: { provider: "github", mode: "auto-on-tag", closeOnDone: false } } } }));
   const bin = path.join(h.dir, "bin");
   fs.mkdirSync(bin);
   h.log = path.join(h.dir, "gh.log");
