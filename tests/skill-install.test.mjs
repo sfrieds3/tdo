@@ -148,3 +148,58 @@ test("skill --local uses the actual working directory when -C is omitted", (t) =
   assert.equal(result.installations[0].destination, path.join(fs.realpathSync(repo), ".pi", "skills", "tdo"));
   assert.equal(fs.existsSync(path.join(home, ".pi")), false);
 });
+
+for (const kind of ["file", "directory", "link", "dangling link"]) {
+  test(`skill --overwrite replaces an existing ${kind} without touching other targets`, (t) => {
+    const { home, destination, invoke } = harness(t);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    const oldTarget = path.join(home, "old-skill");
+    fs.mkdirSync(oldTarget);
+    fs.writeFileSync(path.join(oldTarget, "SKILL.md"), "keep old target");
+    if (kind === "file") fs.writeFileSync(destination, "old file");
+    else if (kind === "directory") {
+      fs.mkdirSync(destination);
+      fs.writeFileSync(path.join(destination, "SKILL.md"), "old skill");
+      fs.symlinkSync(oldTarget, path.join(destination, "external"), "dir");
+    } else fs.symlinkSync(kind === "link" ? oldTarget : path.join(home, "missing"), destination, "dir");
+    const unselected = path.join(home, ".claude", "skills", "tdo");
+    fs.mkdirSync(path.dirname(unselected), { recursive: true });
+    fs.writeFileSync(unselected, "keep unselected");
+    const result = JSON.parse(invoke("skill", "--agents", "--overwrite", "--json").text);
+    assert.equal(result.installations[0].status, "updated");
+    assert.equal(fs.realpathSync(destination), fs.realpathSync(source));
+    assert.equal(fs.readFileSync(path.join(oldTarget, "SKILL.md"), "utf8"), "keep old target");
+    assert.equal(fs.readFileSync(unselected, "utf8"), "keep unselected");
+    const again = JSON.parse(invoke("skill", "--overwrite", "--json").text);
+    assert.equal(again.installations[0].status, "already-installed");
+  });
+}
+
+test("skill --overwrite installs absent targets normally", (t) => {
+  const { invoke } = harness(t);
+  const result = JSON.parse(invoke("skill", "--all", "--overwrite", "--json").text);
+  assert.equal(result.installations.length, 3);
+  assert.ok(result.installations.every((entry) => entry.status === "installed"));
+});
+
+test("skill --overwrite updates a repository-local skill without changing user-wide skills", (t) => {
+  const { home, destination, invoke } = harness(t);
+  const repo = path.join(home, "repo");
+  assert.equal(spawnSync("git", ["init", repo]).status, 0);
+  const local = path.join(repo, ".claude", "skills", "tdo");
+  fs.mkdirSync(local, { recursive: true });
+  fs.writeFileSync(path.join(local, "SKILL.md"), "old skill");
+  const result = invoke("skill", "--claude", "--local", "-C", repo, "--overwrite");
+  assert.match(result.text, /^updated:/);
+  assert.equal(fs.realpathSync(local), fs.realpathSync(source));
+  assert.equal(fs.existsSync(destination), false);
+});
+
+test("skill --overwrite refuses to remove its own bundled skill through a parent symlink", (t) => {
+  const { home, invoke } = harness(t);
+  fs.mkdirSync(path.join(home, ".agents"));
+  fs.symlinkSync(path.dirname(path.resolve(source)), path.join(home, ".agents", "skills"), "dir");
+  assert.throws(() => invoke("skill", "--all", "--overwrite"), /contains the bundled tdo skill/);
+  assert.ok(fs.readFileSync(path.join(source, "SKILL.md"), "utf8").startsWith("---\n"));
+  assert.equal(fs.existsSync(path.join(home, ".claude")), false);
+});

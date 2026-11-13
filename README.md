@@ -59,6 +59,7 @@ tdo skill --pi                   # Pi only
 tdo skill --agents               # shared Agent Skills directory
 tdo skill --all --local          # all targets in the current Git repo
 tdo skill --claude --local       # Claude Code in this repo only
+tdo skill --all --overwrite      # replace existing skills at selected destinations
 ```
 
 | Target | User-wide (default, or `--global` / `-g`) | Repository (`--local`) |
@@ -70,7 +71,7 @@ tdo skill --claude --local       # Claude Code in this repo only
 
 With no target, `tdo skill` defaults to `--agents`; `tdo skill install` is also accepted. You can combine target flags, such as `--claude --pi`. Pi also reads the shared `--agents` location, so its dedicated target is optional. `--local` uses the current Git repository root even when invoked from a subdirectory; `-C DIR` selects another checkout. Local installation requires Git and a checkout; user-wide installation works from any directory. Neither scope needs a database or network access.
 
-The installer creates missing parent directories, is safe to repeat, and checks all selected destinations before making changes, refusing to overwrite an existing file, directory, or link to another location. Restart your agent or reload its skills afterward. These are symlinks to this tdo installation, not portable copies to commit to a repository. Keep the installation in place, or move the old links aside and rerun the command after relocating tdo. Use `--json` for machine-readable scope and status for each destination.
+The installer creates missing parent directories, is safe to repeat, and checks all selected destinations before making changes. By default it refuses to overwrite an existing file, directory, or link to another location. Add `--overwrite` to replace those entries with links to the current bundled skill; real directories and their contents are removed, while old symlink targets are left untouched. Already-correct links are unchanged, and the installer refuses to remove a directory containing the bundled skill itself. JSON reports replaced entries as `updated`. Restart your agent or reload its skills afterward. These are symlinks to this tdo installation, not portable copies to commit to a repository. Keep the installation in place, or move the old links aside and rerun the command after relocating tdo. Use `--json` for machine-readable scope and status for each destination.
 
 For manual linking:
 

@@ -81,7 +81,7 @@ usage:
   tdo projects              all projects with active counts
   tdo project               show the resolved project key
   tdo paths                 show the database and config file locations
-  tdo skill [--all | --claude | --pi | --agents] [--local | --global]
+  tdo skill [--all | --claude | --pi | --agents] [--local | --global] [--overwrite]
                             install the agent skill (default: --agents --global)
   tdo db use <target>        validate and save a local path or ssh:// URI
   tdo db check               check connection and schema
@@ -108,6 +108,7 @@ skill options:
   --agents        shared Agent Skills directory (default)
   --local         install at the Git repository root (honors -C DIR)
   -g, --global    install user-wide (default); cannot combine with --local
+  --overwrite     replace existing skills at the selected destinations (including directory contents)
 
 priorities: ${PRIORITIES.join(", ")} (prefixes and 0-3 accepted)
 statuses:   ${STATUS_FILTERS.join(", ")} (ls default: active = open + doing)
@@ -129,6 +130,7 @@ const OPTIONS = {
   claude: { type: "boolean" },
   pi: { type: "boolean" },
   agents: { type: "boolean" },
+  overwrite: { type: "boolean" },
   local: { type: "boolean" },
   global: { type: "boolean", short: "g" },
   priority: { type: "string", short: "p" },
@@ -299,19 +301,27 @@ function dbCommand(args: string[], dbPath: string, io: CliIO, json: boolean): nu
   throw new UsageError("usage: tdo db use <target> | tdo db check");
 }
 
-/** Existing links are reusable only when they point to this installation's bundle. */
-function skillLinkExists(source: string, destination: string): boolean {
+/** Preflight replacements, including guarding against deleting the bundle itself. */
+function skillLinkStatus(source: string, destination: string, overwrite: boolean): "installed" | "already-installed" | "updated" {
+  let existing: fs.Stats;
   try {
-    const existing = fs.lstatSync(destination);
-    if (existing.isSymbolicLink() && path.resolve(path.dirname(destination), fs.readlinkSync(destination)) === path.resolve(source)) return true;
+    existing = fs.lstatSync(destination);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "installed";
     throw error;
   }
-  throw new Error(`Refusing to replace ${destination}; it already exists. Move it aside if you want to install the bundled tdo skill.`);
+  if (existing.isSymbolicLink() && path.resolve(path.dirname(destination), fs.readlinkSync(destination)) === path.resolve(source)) return "already-installed";
+  if (!overwrite) throw new Error(`Refusing to replace ${destination}; it already exists. Move it aside or use --overwrite to replace it with the bundled tdo skill.`);
+  if (existing.isDirectory()) {
+    const relative = path.relative(fs.realpathSync(destination), fs.realpathSync(source));
+    if (!relative || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))) {
+      throw new Error(`Refusing to overwrite ${destination}; it contains the bundled tdo skill.`);
+    }
+  }
+  return "updated";
 }
 
-type SkillOptions = { all?: boolean; claude?: boolean; pi?: boolean; agents?: boolean; local?: boolean; global?: boolean; C?: string };
+type SkillOptions = { all?: boolean; claude?: boolean; pi?: boolean; agents?: boolean; local?: boolean; global?: boolean; overwrite?: boolean; C?: string };
 
 /** Resolve local installs from the Git root, not whichever subdirectory was used. */
 function skillRoot(io: CliIO, options: SkillOptions): string {
@@ -322,9 +332,9 @@ function skillRoot(io: CliIO, options: SkillOptions): string {
   return git.stdout.trim();
 }
 
-/** Link selected agent locations without replacing existing user-managed content. */
+/** Link selected agent locations, replacing existing content only with explicit opt-in. */
 function skillCommand(args: string[], io: CliIO, json: boolean, options: SkillOptions): number {
-  if (args.length && (args.length !== 1 || args[0] !== "install")) throw new UsageError("usage: tdo skill [--all | --claude | --pi | --agents] [--local | --global]");
+  if (args.length && (args.length !== 1 || args[0] !== "install")) throw new UsageError("usage: tdo skill [--all | --claude | --pi | --agents] [--local | --global] [--overwrite]");
   if (options.local && options.global) throw new UsageError("Choose either --local or --global, not both.");
   const source = fileURLToPath(new URL("../skills/tdo/", import.meta.url));
   // Validate the bundle and every destination before creating anything.
@@ -339,16 +349,17 @@ function skillCommand(args: string[], io: CliIO, json: boolean, options: SkillOp
   if (!selected.length) selected.push("agents");
   const installations = selected.map((target) => {
     const destination = path.join(root, targets[target], "tdo");
-    return { target, destination, status: skillLinkExists(source, destination) ? "already-installed" : "installed" };
+    return { target, destination, status: skillLinkStatus(source, destination, !!options.overwrite) };
   });
   for (const installation of installations) {
     if (installation.status === "already-installed") continue;
     fs.mkdirSync(path.dirname(installation.destination), { recursive: true });
-    // symlinkSync refuses replacement even if something appears after preflight.
+    if (installation.status === "updated") fs.rmSync(installation.destination, { recursive: true });
+    // Without --overwrite, symlinkSync refuses replacement even after preflight.
     fs.symlinkSync(source, installation.destination, "dir");
   }
   io.out(json ? JSON.stringify({ source, scope: options.local ? "local" : "global", installations }, null, 2) : [
-    ...installations.map(({ status, destination }) => `${status === "installed" ? "installed" : "already installed"}: ${destination}`),
+    ...installations.map(({ status, destination }) => `${status === "already-installed" ? "already installed" : status}: ${destination}`),
     "Restart your agent or reload its skills to pick it up.",
   ].join("\n"));
   return 0;
