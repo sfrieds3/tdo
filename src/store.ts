@@ -210,12 +210,15 @@ function transportError(error: unknown, stderr: string): Error {
   return new Error(`SSH database operation failed (no local fallback; writes may have completed): ${error instanceof Error ? error.message : String(error)}${stderr.trim() ? `: ${stderr.trim()}` : ""}`);
 }
 
-export function createStore(target = core.getDbPath(), options: { env?: NodeJS.ProcessEnv } = {}): Store {
+/** `timeoutMs` overrides the overall SSH deadline; tests use it to exercise the timeout without waiting 20s. */
+export interface StoreOptions { env?: NodeJS.ProcessEnv; timeoutMs?: number }
+
+export function createStore(target = core.getDbPath(), options: StoreOptions = {}): Store {
   const parsed = parseTarget(target);
   if (parsed.kind === "local") return localStore(parsed.path);
   return {
     call(operation, ...args) {
-      const child = spawnSync("ssh", sshArgs(parsed), { input: request(parsed, operation, args), encoding: "utf8", env: options.env ?? process.env, timeout: SSH_TIMEOUT_MS, maxBuffer: MAX_RPC_BYTES, killSignal: "SIGKILL" });
+      const child = spawnSync("ssh", sshArgs(parsed), { input: request(parsed, operation, args), encoding: "utf8", env: options.env ?? process.env, timeout: options.timeoutMs ?? SSH_TIMEOUT_MS, maxBuffer: MAX_RPC_BYTES, killSignal: "SIGKILL" });
       if (child.error || child.status !== 0) throw transportError(child.error ?? `exit ${child.status ?? child.signal}`, child.stderr ?? "");
       return response(child.stdout, operation);
     },
@@ -224,7 +227,7 @@ export function createStore(target = core.getDbPath(), options: { env?: NodeJS.P
 }
 
 /** Nonblocking SSH API for hosts such as Pi. No synchronous SSH is used here. */
-export function createAsyncStore(target = core.getDbPath(), options: { env?: NodeJS.ProcessEnv } = {}): AsyncStore {
+export function createAsyncStore(target = core.getDbPath(), options: StoreOptions = {}): AsyncStore {
   const parsed = parseTarget(target);
   if (parsed.kind === "local") {
     const local = localStore(parsed.path);
@@ -250,7 +253,7 @@ export function createAsyncStore(target = core.getDbPath(), options: { env?: Nod
           child.stderr.destroy();
           reject(transportError(error, Buffer.concat(err).toString("utf8")));
         };
-        const timer = setTimeout(() => fail(new Error("SSH operation timed out")), SSH_TIMEOUT_MS);
+        const timer = setTimeout(() => fail(new Error("SSH operation timed out")), options.timeoutMs ?? SSH_TIMEOUT_MS);
         const collect = (buffers: Buffer[]) => (chunk: Buffer) => {
           bytes += chunk.length;
           if (bytes > MAX_RPC_BYTES) { fail(new Error("SSH output exceeds size limit")); return; }

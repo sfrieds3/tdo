@@ -6,9 +6,10 @@ import * as path from "node:path";
 import test from "node:test";
 import { run } from "../src/cli.ts";
 import { addItem, openDb, schemaVersion } from "../src/core.ts";
-import { createStore, createAsyncStore, parseTarget, handleRpc, MAX_RPC_BYTES, RPC_VERSION } from "../src/store.ts";
+import { createStore, createAsyncStore, parseTarget, handleRpc, MAX_RPC_BYTES, RPC_VERSION, SSH_TIMEOUT_MS } from "../src/store.ts";
 
 const script = new URL("../src/cli.ts", import.meta.url).pathname;
+const storeUrl = new URL("../src/store.ts", import.meta.url).href;
 function harness(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tdo-ssh-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -33,8 +34,17 @@ if (process.env.SSH_MODE === 'large') { process.stdout.write('x'.repeat(9*1024*1
 const input = fs.readFileSync(0);
 const request = JSON.parse(input);
 if (process.env.SSH_FAIL_OP === request.operation && (!process.env.SSH_FAIL_ID || String(request.args[0]?.id) === process.env.SSH_FAIL_ID)) { console.error('injected store failure'); process.exit(255); }
-const result = spawnSync(process.execPath, [process.env.TDO_HELPER, 'internal-rpc'], {input, encoding:'utf8', maxBuffer:${MAX_RPC_BYTES}, env:{...process.env,TDO_CONFIG:'/does-not-exist',TDO_DB:'/not-the-requested-db',TDO_PROJECT:'server-project',TDO_REMOTE_HELPER:'1'}});
-process.stdout.write(result.stdout || ''); process.stderr.write(result.stderr || ''); process.exitCode = result.status ?? 1;
+const serverEnv = {TDO_CONFIG:'/does-not-exist',TDO_DB:'/not-the-requested-db',TDO_PROJECT:'server-project',TDO_REMOTE_HELPER:'1'};
+if (process.env.SSH_MODE === 'real-helper') {
+  // Full path: a separate 'tdo internal-rpc' process reading stdin, as on a real server.
+  const result = spawnSync(process.execPath, [process.env.TDO_HELPER, 'internal-rpc'], {input, encoding:'utf8', maxBuffer:${MAX_RPC_BYTES}, env:{...process.env,...serverEnv}});
+  process.stdout.write(result.stdout || ''); process.stderr.write(result.stderr || ''); process.exitCode = result.status ?? 1;
+  return;
+}
+// Default: the same handleRpc the helper runs, in this process, saving one node startup per call.
+Object.assign(process.env, serverEnv);
+require('node:module').enableCompileCache?.();
+import(${JSON.stringify(storeUrl)}).then(({ handleRpc }) => process.stdout.write(handleRpc(input.toString('utf8')) + '\\n'));
 `, { mode: 0o755 });
   const db = path.join(dir, "remote space;$(touch injected).db");
   const target = `ssh://alice@test-alias:2222${db.split("/").map(encodeURIComponent).join("/")}`;
@@ -84,6 +94,28 @@ test("SSH CLI full CRUD, FTS, metadata, project refs, tags, counts and exports u
   assert.ok(!args.join(" ").includes(h.db));
   assert.ok(fs.existsSync(h.db));
   assert.ok(!fs.existsSync(path.join(h.dir, "injected")));
+});
+
+test("SSH CLI round-trips through a real internal-rpc helper process", (t) => {
+  const h = harness(t);
+  // Most tests answer RPC in the fake ssh process; this one keeps the separate
+  // helper process, its bounded stdin reader and server-side env isolation under test.
+  h.env.SSH_MODE = "real-helper";
+  const added = h.cli("add", "real helper !high #ci", "--json").json();
+  assert.equal(added.project, "caller/project", "the helper ignores server-side TDO_PROJECT");
+  h.cli("done", "1", "-m", "via helper");
+  const shown = h.cli("show", "1", "--json").json();
+  assert.equal(shown.status, "done");
+  assert.equal(shown.notes[0].body, "via helper");
+  assert.ok(fs.existsSync(h.db), "the helper opens the requested path, not server-side TDO_DB");
+  assert.ok(!fs.existsSync(path.join(h.dir, "injected")));
+  const oversized = spawnSync(process.execPath, [script, "internal-rpc"], { input: "x".repeat(MAX_RPC_BYTES + 1), encoding: "utf8" });
+  assert.notEqual(oversized.status, 0);
+  assert.match(oversized.stderr, /exceeds size limit/);
+  const rejected = spawnSync(process.execPath, [script, "internal-rpc"], { input: JSON.stringify({ version: RPC_VERSION, path: "relative.db", operation: "check", args: [] }), encoding: "utf8", cwd: h.dir });
+  assert.equal(rejected.status, 0);
+  assert.match(JSON.parse(rejected.stdout).error, /absolute local database path/);
+  assert.ok(!fs.existsSync(path.join(h.dir, "relative.db")));
 });
 
 test("SSH grouped listings honor per-project caps, priority, filters and JSON", (t) => {
@@ -290,14 +322,17 @@ test("async SSH store reports the exit status when ssh exits without reading std
 
 test("sync and async SSH operations enforce the overall timeout", async (t) => {
   const h = harness(t);
+  assert.equal(SSH_TIMEOUT_MS, 20_000, "the documented default deadline");
+  // A short deadline exercises the same timer and kill paths without waiting out the default.
+  const timeoutMs = 1_000;
   h.env.SSH_MODE = "descendant";
-  const pending = assert.rejects(createAsyncStore(h.target, { env: h.env }).call("check"), /timed out/);
+  const pending = assert.rejects(createAsyncStore(h.target, { env: h.env, timeoutMs }).call("check"), /timed out/);
   h.env.SSH_MODE = "hang";
   const start = Date.now();
   try {
-    assert.throws(() => createStore(h.target, { env: h.env }).call("check"), /SSH database operation failed/);
+    assert.throws(() => createStore(h.target, { env: h.env, timeoutMs }).call("check"), /SSH database operation failed/);
     await pending;
-    assert.ok(Date.now() - start < 30_000, "inherited proxy pipes cannot extend the deadline");
+    assert.ok(Date.now() - start < 10_000, "inherited proxy pipes cannot extend the deadline");
     assert.ok(!fs.existsSync(h.db));
   } finally {
     const pidFile = h.log + ".pid";
