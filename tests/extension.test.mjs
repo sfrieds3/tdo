@@ -321,7 +321,7 @@ test("/tdo --all browses every project with project-qualified ids", async () => 
   assert.match(h.pickerTitles.at(-1), /gadgets#1 +normal +elsewhere/);
 });
 
-/** A fake transport only: all protocol handling and database work use the real CLI. */
+/** A fake transport only: all protocol handling and database work use the real RPC handler. */
 function remoteHarness(t, options) {
   const saved = { ...process.env };
   const h = harness(options);
@@ -330,16 +330,15 @@ function remoteHarness(t, options) {
   const marker = path.join(h.dir, "ready");
   fs.writeFileSync(path.join(bin, "ssh"), `#!${process.execPath}
 const fs = require('node:fs');
-const { spawnSync } = require('node:child_process');
 const input = fs.readFileSync(0);
 if (process.env.TDO_TEST_FAIL === '1' || process.env.TDO_TEST_FAIL === JSON.parse(input).operation) { console.error('offline'); process.exit(255); }
-const result = spawnSync(process.execPath, [${JSON.stringify(new URL("../src/cli.ts", import.meta.url).pathname)}, 'internal-rpc'], { input, encoding: 'utf8' });
-if (process.env.TDO_TEST_DELAY) fs.writeFileSync(${JSON.stringify(marker)}, 'ready');
-setTimeout(() => {
-  process.stdout.write(result.stdout || '');
-  process.stderr.write(result.stderr || '');
-  process.exitCode = result.status ?? 1;
-}, Number(process.env.TDO_TEST_DELAY || 0));
+// Answer with the helper's own handleRpc in this process rather than spawning 'tdo internal-rpc'.
+require('node:module').enableCompileCache?.();
+import(${JSON.stringify(new URL("../src/store.ts", import.meta.url).href)}).then(({ handleRpc }) => {
+  const reply = handleRpc(input.toString('utf8')) + '\\n';
+  if (process.env.TDO_TEST_DELAY) fs.writeFileSync(${JSON.stringify(marker)}, 'ready');
+  setTimeout(() => process.stdout.write(reply), Number(process.env.TDO_TEST_DELAY || 0));
+});
 `, { mode: 0o755 });
   process.env.PATH = `${bin}:${process.env.PATH}`;
   process.env.TDO_DB = `ssh://test-alias${h.dbPath}`;
