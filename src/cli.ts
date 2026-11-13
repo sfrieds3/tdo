@@ -81,6 +81,8 @@ usage:
   tdo projects              all projects with active counts
   tdo project               show the resolved project key
   tdo paths                 show the database and config file locations
+  tdo skill [--all | --claude | --pi | --agents] [--local | --global]
+                            install the agent skill (default: --agents --global)
   tdo db use <target>        validate and save a local path or ssh:// URI
   tdo db check               check connection and schema
   tdo migrate [--dry-run]   upgrade an older database (backs it up first) and print id changes
@@ -98,7 +100,14 @@ options:
   --json          machine-readable output (all commands)
   --no-sync       save lifecycle intent without contacting GitHub
   --no-float      keep the browser inline even with config floating: true
-  -a, --all       across all projects
+  -a, --all       across all projects (skill: all installation targets)
+
+skill options:
+  --claude        Claude Code skills directory
+  --pi            Pi skills directory
+  --agents        shared Agent Skills directory (default)
+  --local         install at the Git repository root (honors -C DIR)
+  -g, --global    install user-wide (default); cannot combine with --local
 
 priorities: ${PRIORITIES.join(", ")} (prefixes and 0-3 accepted)
 statuses:   ${STATUS_FILTERS.join(", ")} (ls default: active = open + doing)
@@ -117,6 +126,11 @@ const OPTIONS = {
   "no-sync": { type: "boolean" },
   retry: { type: "boolean" },
   all: { type: "boolean", short: "a" },
+  claude: { type: "boolean" },
+  pi: { type: "boolean" },
+  agents: { type: "boolean" },
+  local: { type: "boolean" },
+  global: { type: "boolean", short: "g" },
   priority: { type: "string", short: "p" },
   tags: { type: "string", short: "t", multiple: true },
   body: { type: "string", short: "b" },
@@ -285,6 +299,61 @@ function dbCommand(args: string[], dbPath: string, io: CliIO, json: boolean): nu
   throw new UsageError("usage: tdo db use <target> | tdo db check");
 }
 
+/** Existing links are reusable only when they point to this installation's bundle. */
+function skillLinkExists(source: string, destination: string): boolean {
+  try {
+    const existing = fs.lstatSync(destination);
+    if (existing.isSymbolicLink() && path.resolve(path.dirname(destination), fs.readlinkSync(destination)) === path.resolve(source)) return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  throw new Error(`Refusing to replace ${destination}; it already exists. Move it aside if you want to install the bundled tdo skill.`);
+}
+
+type SkillOptions = { all?: boolean; claude?: boolean; pi?: boolean; agents?: boolean; local?: boolean; global?: boolean; C?: string };
+
+/** Resolve local installs from the Git root, not whichever subdirectory was used. */
+function skillRoot(io: CliIO, options: SkillOptions): string {
+  if (!options.local) return io.env.HOME || os.homedir();
+  const cwd = options.C ? path.resolve(io.cwd, options.C) : io.cwd;
+  const git = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd, env: io.env, encoding: "utf8" });
+  if (git.error || git.status !== 0 || !git.stdout.trim()) throw new UsageError("tdo skill --local requires a Git repository (use -C DIR to select one).");
+  return git.stdout.trim();
+}
+
+/** Link selected agent locations without replacing existing user-managed content. */
+function skillCommand(args: string[], io: CliIO, json: boolean, options: SkillOptions): number {
+  if (args.length && (args.length !== 1 || args[0] !== "install")) throw new UsageError("usage: tdo skill [--all | --claude | --pi | --agents] [--local | --global]");
+  if (options.local && options.global) throw new UsageError("Choose either --local or --global, not both.");
+  const source = fileURLToPath(new URL("../skills/tdo/", import.meta.url));
+  // Validate the bundle and every destination before creating anything.
+  fs.accessSync(path.join(source, "SKILL.md"), fs.constants.R_OK);
+  const root = skillRoot(io, options);
+  const targets = {
+    agents: ".agents/skills",
+    claude: ".claude/skills",
+    pi: options.local ? ".pi/skills" : ".pi/agent/skills",
+  };
+  const selected = (Object.keys(targets) as (keyof typeof targets)[]).filter((target) => options.all || options[target]);
+  if (!selected.length) selected.push("agents");
+  const installations = selected.map((target) => {
+    const destination = path.join(root, targets[target], "tdo");
+    return { target, destination, status: skillLinkExists(source, destination) ? "already-installed" : "installed" };
+  });
+  for (const installation of installations) {
+    if (installation.status === "already-installed") continue;
+    fs.mkdirSync(path.dirname(installation.destination), { recursive: true });
+    // symlinkSync refuses replacement even if something appears after preflight.
+    fs.symlinkSync(source, installation.destination, "dir");
+  }
+  io.out(json ? JSON.stringify({ source, scope: options.local ? "local" : "global", installations }, null, 2) : [
+    ...installations.map(({ status, destination }) => `${status === "installed" ? "installed" : "already installed"}: ${destination}`),
+    "Restart your agent or reload its skills to pick it up.",
+  ].join("\n"));
+  return 0;
+}
+
 /** Recovery actions must also offer closed items; ordinary push only offers active ones. */
 function pickerDefaultStatus(command: string, values: { attach?: string; detach?: boolean }): StatusFilter {
   if (command === "reopen") return "closed";
@@ -300,6 +369,7 @@ export function run(argv: string[], io: Io): number {
     return 0;
   }
   const json = !!values.json;
+  if (command === "skill") return skillCommand(args, io, json, values);
   const emit = (data: unknown, text: string) => io.out(json ? JSON.stringify(data, null, 2) : text);
   const cwd = values.C ? path.resolve(io.cwd, values.C) : io.cwd;
   const config = loadConfig(io.env);

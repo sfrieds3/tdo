@@ -59,6 +59,7 @@ A future session — possibly another agent on another machine — must understa
 
 ## Notes
 
+- With `tdo` already on PATH, `tdo skill --all` installs this skill for all targets; `--claude`, `--pi`, and `--agents` select Claude Code, Pi, or the shared Agent Skills directory. The default is `--agents --global`; add `--local` to install at the current Git repo root instead of user-wide. Target flags can be combined. The installer creates symlinks and refuses to overwrite an unrelated installation; use `--json` for machine-readable results. Restart the agent or reload its skills afterward. Installing a skill is not required to initialize a backlog: run `tdo project --json` inside the repo to check its resolved project key.
 - If `tdo` is not on PATH, tell the user; don't try to install it.
 - `tdo project` prints the resolved project key; `tdo paths` shows where the database and config live.
 - Item ids are per project: `3` / `#3` is item 3 in the current project. For another project use `NAME#3` or `--project KEY`. A filed item also answers to `gh#45` (its GitHub issue number, current project) or its issue URL; `↗gh#45` in lists is the issue number, not a tdo id. In JSON, `id` is that per-project number and `projectId` is the project's UUID.
