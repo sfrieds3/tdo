@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.10.0](https://github.com/sfrieds3/tdo/compare/v0.9.0...v0.10.0) (2026-11-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* make the Pi statusline counts opt-in; show only the focused item by default ([#63](https://github.com/sfrieds3/tdo/issues/63))
+
+### Features
+
+* install agent skills with target and scope flags ([#65](https://github.com/sfrieds3/tdo/issues/65)) ([86a22e5](https://github.com/sfrieds3/tdo/commit/86a22e5338aa61d481fb33a543fac613570f0832))
+* make the Pi statusline counts opt-in; show only the focused item by default ([#63](https://github.com/sfrieds3/tdo/issues/63)) ([aee79d3](https://github.com/sfrieds3/tdo/commit/aee79d3263a7880e6959ee65a0558dc654215d7b))
+
 ## [0.9.0](https://github.com/sfrieds3/tdo/compare/v0.8.0...v0.9.0) (2026-11-09)
 
 
