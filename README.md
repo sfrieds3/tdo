@@ -309,6 +309,19 @@ The Pi picker shows at most 200 active items. If more match, its title shows `20
 
 By default the footer stays out of your statusline until you work on an item: then it shows `☑ ▸ #3 login test flakes on CI` and clears once the item is closed or deleted. Set `"statusline": true` in the [config file](#configuration) to always show the backlog too: `☑ 4 (2!) ▸ #3 login test flakes on CI` — open items, how many are urgent or high, items awaiting filing approval, and the focused item. The checkbox is the terminal counterpart of the [tdo icon](assets/tdo.svg): a plain Unicode glyph (U+2611), with no Nerd Font or terminal image support required. The focus survives `/reload` and session resume. The footer refreshes after each agent run, so items the agent adds or closes through the CLI show up right away. An empty backlog hides the counts; a store error shows `☑ unavailable` instead of a stale value. Without `statusline` and with no focused item, the extension never reads the store for the footer.
 
+Custom statuslines can render tdo themselves instead of reading the footer text. Each time the footer changes, the extension also emits a `tdo:status` event on `pi.events` with the same state, uncolored:
+
+```ts
+pi.events.on("tdo:status", (status) => {
+  // status.state: "hidden" | "ready" | "unavailable"
+  // status.text: footer text without colors, e.g. "☑ 4 (2!) ▸ #3 login test flakes on CI" ("" when hidden)
+  // status.counts?: { total, urgent, awaiting }  (only with "statusline": true)
+  // status.focus?: { ref, title, status }        (the item this session is working on)
+});
+```
+
+The footer status (`ctx.ui.setStatus("tdo", …)`) is still set as before, so default footers are unaffected.
+
 ## How projects are identified
 
 In order, the first that applies:

@@ -34,6 +34,20 @@ import {
 import { callStore } from "./store.ts";
 
 const STATUS_KEY = "tdo";
+/** Structured footer state on `pi.events`, so a custom statusline can place and style tdo itself. */
+export const STATUS_EVENT = "tdo:status";
+/**
+ * Payload of {@link STATUS_EVENT}. `text` is the footer text without colors ("" when tdo shows nothing);
+ * the other fields carry the same data for statuslines that render it their own way.
+ */
+export type TdoStatusEvent = {
+  state: "hidden" | "ready" | "unavailable";
+  text: string;
+  /** Present when `"statusline": true`: active items, how many are urgent or high, and items awaiting filing approval. */
+  counts?: { total: number; urgent: number; awaiting: number };
+  /** The item this session is working on. */
+  focus?: { ref: string; title: string; status: "open" | "doing" };
+};
 /** Text counterpart of assets/tdo.svg (U+2611); no Nerd Font or image protocol needed. */
 const TDO_ICON = "☑";
 const FOCUS_ENTRY = "tdo-focus";
@@ -53,6 +67,20 @@ export function linkedIssueInstruction(ctx: ExtensionContext, item: Item): strin
   if (!parsed || parsed.id !== link.externalId || normalizeDestination(parsed.destination) !== parsed.destination || parsed.destination.toLowerCase() !== link.destination.toLowerCase()) return "";
   // A saved link keeps its original destination even when the configured filing repository changes.
   return ` If this work results in a PR, include \`Closes https://${parsed.destination}/issues/${parsed.id}\` in its description; this is the linked GitHub issue, not a local tdo id.`;
+}
+
+/** Footer pieces as [theme color, text]: counts, awaiting approvals, then the focused item. */
+export function statusParts(status: Pick<TdoStatusEvent, "counts" | "focus">): ["muted" | "accent", string][] {
+  const parts: ["muted" | "accent", string][] = [];
+  const counts = status.counts;
+  if (counts?.total) parts.push(["muted", `${TDO_ICON} ${counts.total}${counts.urgent ? ` (${counts.urgent}!)` : ""}`]);
+  if (counts?.awaiting) parts.push(["muted", `${counts.awaiting} awaiting`]);
+  if (status.focus) {
+    // Lead with the icon when there are no counts, so the focus still reads as tdo.
+    if (!parts.length) parts.push(["muted", TDO_ICON]);
+    parts.push(["accent", `▸ ${status.focus.ref} ${truncate(status.focus.title, FOCUS_TITLE_CHARS)}`]);
+  }
+  return parts;
 }
 
 const ALL_ARGS = new Set(["all", "--all", "-a"]);
@@ -186,6 +214,12 @@ export default function tdoExtension(pi: ExtensionAPI) {
     }
   }
 
+  /** Sets the footer status and emits the same state as {@link STATUS_EVENT}; `formatted` is the colored footer text. */
+  function publishStatus(ctx: ExtensionContext, status: TdoStatusEvent, formatted = status.text && ctx.ui.theme.fg("muted", status.text)): void {
+    ctx.ui.setStatus(STATUS_KEY, formatted || undefined);
+    pi.events?.emit(STATUS_EVENT, status);
+  }
+
   /** Counts are opt-in (`"statusline": true`); without it the footer shows only the item being worked on. */
   function fullStatus(): boolean {
     try {
@@ -202,7 +236,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
     const full = fullStatus();
     // Not opted in and not working on anything: never touch the footer or the store.
     if (!full && !key) {
-      ctx.ui.setStatus(STATUS_KEY, undefined);
+      publishStatus(ctx, { state: "hidden", text: "" });
       return;
     }
     try {
@@ -213,21 +247,18 @@ export default function tdoExtension(pi: ExtensionAPI) {
       if (current !== generation || stopped) return;
       // Only a successful lookup can invalidate the saved focus, never a transport error.
       if (key && focused?.status !== "doing" && focused?.status !== "open") setFocus(undefined);
-      const parts: string[] = [];
-      if (counts) {
-        const urgent = counts.urgent + counts.high;
-        if (counts.total) parts.push(ctx.ui.theme.fg("muted", `${TDO_ICON} ${counts.total}${urgent ? ` (${urgent}!)` : ""}`));
+      const awaiting = links?.["awaiting-approval"]?.length ?? 0;
+      const status: TdoStatusEvent = { state: "ready", text: "" };
+      if (counts) status.counts = { total: counts.total, urgent: counts.urgent + counts.high, awaiting };
+      if (focus && focused && (focused.status === "open" || focused.status === "doing")) {
+        status.focus = { ref: itemRef(focused, { showProject: focused.project !== projectKey }), title: focused.title, status: focused.status };
       }
-      if (links?.["awaiting-approval"]?.length) parts.push(ctx.ui.theme.fg("muted", `${links["awaiting-approval"]!.length} awaiting`));
-      if (focus && focused) {
-        const ref = itemRef(focused, { showProject: focused.project !== projectKey });
-        // Lead with the icon when there are no counts, so the focus still reads as tdo.
-        if (!parts.length) parts.push(ctx.ui.theme.fg("muted", TDO_ICON));
-        parts.push(ctx.ui.theme.fg("accent", `▸ ${ref} ${truncate(focused.title, FOCUS_TITLE_CHARS)}`));
-      }
-      ctx.ui.setStatus(STATUS_KEY, parts.length ? parts.join(" ") : undefined);
+      const parts = statusParts(status);
+      status.text = parts.map(([, text]) => text).join(" ");
+      if (!status.text) status.state = "hidden";
+      publishStatus(ctx, status, parts.map(([color, text]) => ctx.ui.theme.fg(color, text)).join(" "));
     } catch {
-      if (current === generation && !stopped) ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("muted", `${TDO_ICON} unavailable`));
+      if (current === generation && !stopped) publishStatus(ctx, { state: "unavailable", text: `${TDO_ICON} unavailable` });
     }
   }
 
@@ -253,7 +284,7 @@ export default function tdoExtension(pi: ExtensionAPI) {
     lifecycle++;
     stopped = true;
     generation++;
-    if (ctx?.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
+    if (ctx?.hasUI) publishStatus(ctx, { state: "hidden", text: "" });
   });
 
   async function pick(ctx: ExtensionContext, items: Item[], title: string, showProject: boolean, selected?: ItemKey): Promise<Picked | undefined> {
