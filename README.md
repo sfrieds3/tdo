@@ -113,6 +113,7 @@ Use `@v0.2.3` to pin an exact release, or a local path (`"~/code/tdo"`) while ha
 | `tdo tracker [status\|approve\|revoke] [--yes]` | Inspect tracker settings and manage approval of repository settings. |
 | `tdo rm [id]` | Delete an item outright. |
 | `tdo pick [-a] [-s STATUS]` | Pick items with fzf and print their refs, for scripting: `tdo done $(tdo pick)`. |
+| `tdo work` | [Pick an active item in Rex](#start-work-in-rex) and open a new worktree tab, optionally with Pi. |
 | `tdo count` | One-line summary, e.g. `4 open (1 urgent, 1 high)`. |
 | `tdo tags [-a]` · `tdo projects` · `tdo project` | Tag counts, every project, the resolved project key. |
 | `tdo export [-a] [--md]` | Dump everything as JSON, or as a Markdown checklist. |
@@ -247,6 +248,14 @@ Set `"floating": true` in the [config file](#configuration) to open the CLI brow
 Requires tmux with `display-popup` and multi-argument command support (tmux 3.3+), or a Rex CLI/server with `session.new_layer` and the terminal shell block flavor. The browser runs on the same host with the caller's working directory, database, project, filters, and browser/editor/SSH settings. Rex launches asynchronously and closes the pane when the browser exits; quick startup failures remain visible for diagnosis. tmux waits for the popup to close. Launcher failures are reported rather than silently falling back (a Rex launch may already have succeeded if the response times out).
 
 Use `tdo --no-float` or `tdo browse --no-float` for an inline browser without changing your config.
+
+### Start work in Rex
+
+Run `tdo work setup`, add the printed `dofile(...)` line to your Rex `init.lua`, then run `rex config reload`. This registers the bundled native prompt action without changing your Rex config automatically. You need a Rex CLI/server and a connected Rex app that support native prompts (Rex API revision 17 or later). If you move the tdo installation, regenerate the line.
+
+From a Git checkout in a Rex terminal, run `tdo work`. Pick an open or doing item in the current project, edit the suggested worktree directory and branch names, then choose **Open a shell** or **Start Pi with this tdo as its prompt**. The final choice confirms creating the branch from the current checkout's `HEAD`, putting the new worktree under the main checkout's `.worktrees/`, and opening a tab there in the current Rex session. Pi must be available in the new tab's shell. Its initial prompt includes the item's title, description, and any file reference.
+
+Canceling any prompt leaves the backlog, Git, and tabs unchanged. A successful tab launch marks an open item `doing`. If Rex can't confirm the tab launch after Git succeeds, tdo reports the worktree path and leaves it intact; check Rex before retrying. This command is separate from the fzf browser and Pi's `/tdo` picker.
 
 ### All projects
 

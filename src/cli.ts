@@ -9,6 +9,7 @@ import * as path from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { floatingBackend, launchFloatingBrowser } from "./floating.ts";
+import { launchRexWork, pickRexWork, rexWorkSetup } from "./rex-work.ts";
 import { createStore, parseTarget, saveDbTarget, serveRpc, type Store } from "./store.ts";
 import { isApproved, resolveTracker, saveApproval, statusPolicy, type EffectiveTracker, type TrackerResolution } from "./trackers/config.ts";
 import { autoIntent, isHumanCommand } from "./trackers/auto.ts";
@@ -76,6 +77,8 @@ usage:
                             issue tracker config from .tdo/config.json and your approval
   tdo pick [-a] [-s STATUS] print the refs of items picked with fzf
                             (any command above picks with fzf when the id is left out)
+  tdo work                  pick active work in Rex and open it in a new worktree tab
+  tdo work setup            print the line to add to Rex's init.lua, then run rex config reload
   tdo count                 open-item summary for the current project
   tdo tags [-a]             tag counts for active items
   tdo projects              all projects with active counts
@@ -412,6 +415,12 @@ export function run(argv: string[], io: Io): number {
     return browse(io, { all: !!values.all, status, project: values.project, cwd: values.C ? cwd : undefined, db: dbPath });
   }
 
+  if (command === "work" && args.length === 1 && args[0] === "setup") {
+    const lua = rexWorkSetup();
+    emit({ lua }, lua);
+    return 0;
+  }
+
   if (command === "db") return dbCommand(args, dbPath, io, json);
   const warn = io.err ?? ((text: string) => console.error(text));
   const tracker = (): TrackerResolution => resolveTracker(project(), config, { configPath: getConfigPath(io.env) });
@@ -495,6 +504,35 @@ export function run(argv: string[], io: Io): number {
   };
   try {
     switch (command) {
+      case "work": {
+        if (args.length || all || values.project || values.status) throw new UsageError("usage: tdo work (active items in the current checkout only)");
+        const key = project().key;
+        const items = db.call("listItems", { project: key, status: "active", limit: 0 }).sort(byStatusThenPriority);
+        if (!items.length) {
+          emit(null, `No active items in ${key}.`);
+          return 0;
+        }
+        const context = { cwd, env: io.env };
+        const selection = pickRexWork(context, key, items);
+        if (!selection) throw new Cancelled();
+        const item = db.call("getItemByNumber", key, selection.id);
+        if (!item || (item.status !== "open" && item.status !== "doing")) throw new Error("the selected item is no longer active.");
+        // Use the source checkout for the same project and repo tracker policy, rather than forcing --project.
+        const projectEnv = io.env.TDO_PROJECT ? `TDO_PROJECT=${shellQuote(io.env.TDO_PROJECT)} ` : "";
+        const configEnv = `TDO_CONFIG=${shellQuote(path.resolve(io.cwd, getConfigPath(io.env)))} `;
+        const close = `${projectEnv}${configEnv}tdo done ${item.id} -C ${shellQuote(cwd)} --db ${shellQuote(savedTarget(dbPath, io.cwd))} -m "<what changed>"`;
+        const prompt = ["Work on this tdo item in the current worktree. Keep local tdo IDs out of commit messages, PR text, and branch names.",
+          `When it is fixed, close it with \`${close}\`.`, formatItemDetail(item)].join("\n\n");
+        const created = launchRexWork(context, selection, prompt);
+        // Mark it only after Rex confirms the tab; skip items that are no longer open.
+        try {
+          if (db.call("getItem", item)?.status === "open") db.call("setStatus", item, "doing", undefined, false);
+        } catch (error) {
+          warn(`tdo: opened the Rex tab but could not mark #${item.id} doing: ${(error as Error).message}`);
+        }
+        emit({ ...created, id: item.id, branch: selection.branch, launch: selection.launch }, `Opened Rex tab in ${created.worktree} for #${item.id} ${item.title}`);
+        return 0;
+      }
       case "add": {
         const quick = parseQuickAdd(args.join(" "));
         if (!quick.title) throw new UsageError("tdo add needs a title.");
