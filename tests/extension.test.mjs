@@ -33,6 +33,7 @@ function harness({ selections = [], keys = [], editorText, confirm = true, confi
   const tools = [];
   const entries = [];
   const pickerTitles = [];
+  const events = [];
   let command;
   const pi = {
     on(name, handler) { handlers.set(name, [...(handlers.get(name) || []), handler]); },
@@ -40,6 +41,7 @@ function harness({ selections = [], keys = [], editorText, confirm = true, confi
     registerCommand(_name, definition) { command = definition; },
     sendUserMessage(text, options) { sent.push({ text, options }); },
     appendEntry(customType, data) { entries.push({ type: "custom", customType, data }); },
+    events: { emit(name, data) { events.push({ name, data }); }, on() { return () => {}; } },
   };
   const theme = { fg: (_color, text) => text, bold: (text) => text };
   const ctx = {
@@ -75,7 +77,7 @@ function harness({ selections = [], keys = [], editorText, confirm = true, confi
   const items = () => { const db = core.openDb(dbPath); try { return core.listItems(db, { status: "all" }); } finally { db.close(); } };
   const addDirect = (input) => { const db = core.openDb(dbPath); try { return core.addItem(db, { project: PROJECT, ...input }); } finally { db.close(); } };
   const byTitle = (title) => items().find((item) => item.title === title);
-  return { dir, dbPath, tools, command, ctx, emit, items, byTitle, addDirect, notifications, statuses, sent, entries, pickerTitles, dialogs };
+  return { dir, dbPath, tools, command, ctx, emit, items, byTitle, addDirect, notifications, statuses, sent, entries, pickerTitles, dialogs, events };
 }
 
 const DOWN = "\x1b[B";
@@ -214,6 +216,25 @@ test("statusline false still shows the item being worked on, then clears when it
   await h.emit("agent_end");
   assert.equal(h.statuses.get("tdo"), undefined);
   assert.equal(h.entries.at(-1).data, null);
+});
+
+test("footer state is also emitted as a structured tdo:status event", async () => {
+  const h = harness({ keys: [[ENTER]] });
+  const last = () => h.events.filter((event) => event.name === extension.STATUS_EVENT).at(-1)?.data;
+  await h.emit("session_start");
+  assert.deepEqual(last(), { state: "hidden", text: "", counts: { total: 0, urgent: 0, awaiting: 0 } });
+  h.addDirect({ title: "rename helpers", priority: "high" });
+  h.addDirect({ title: "other", priority: "low" });
+  await h.command.handler("", h.ctx);
+  assert.deepEqual(last(), {
+    state: "ready",
+    text: "☑ 2 (1!) ▸ #1 rename helpers",
+    counts: { total: 2, urgent: 1, awaiting: 0 },
+    focus: { ref: "#1", title: "rename helpers", status: "doing" },
+  });
+  assert.equal(last().text, h.statuses.get("tdo"), "text matches the uncolored footer");
+  await h.emit("session_shutdown");
+  assert.deepEqual(last(), { state: "hidden", text: "" });
 });
 
 test("config rejects a non-boolean statusline", () => {
@@ -404,6 +425,7 @@ test("SSH failures preserve saved focus and recover; only a successful absent lo
   process.env.TDO_TEST_FAIL = "1";
   await h.emit("agent_end");
   assert.equal(h.statuses.get("tdo"), "☑ unavailable");
+  assert.deepEqual(h.events.at(-1), { name: extension.STATUS_EVENT, data: { state: "unavailable", text: "☑ unavailable" } });
   assert.equal(h.entries.length, entryCount);
   assert.equal(h.notifications.length, 0, "background refresh errors stay quiet");
   await h.command.handler("not saved", h.ctx);

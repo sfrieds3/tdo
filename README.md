@@ -309,6 +309,24 @@ The Pi picker shows at most 200 active items. If more match, its title shows `20
 
 By default the footer stays out of your statusline until you work on an item: then it shows `☑ ▸ #3 login test flakes on CI` and clears once the item is closed or deleted. Set `"statusline": true` in the [config file](#configuration) to always show the backlog too: `☑ 4 (2!) ▸ #3 login test flakes on CI` — open items, how many are urgent or high, items awaiting filing approval, and the focused item. The checkbox is the terminal counterpart of the [tdo icon](assets/tdo.svg): a plain Unicode glyph (U+2611), with no Nerd Font or terminal image support required. The focus survives `/reload` and session resume. The footer refreshes after each agent run, so items the agent adds or closes through the CLI show up right away. An empty backlog hides the counts; a store error shows `☑ unavailable` instead of a stale value. Without `statusline` and with no focused item, the extension never reads the store for the footer.
 
+#### Custom statuslines
+
+A Pi extension that draws its own footer can place and style tdo itself instead of parsing the footer text. Every time the tdo footer is updated, the extension also emits a `tdo:status` event on `pi.events` with the same state, uncolored:
+
+```ts
+pi.events.on("tdo:status", (status) => {
+  // status.state: "hidden" | "ready" | "unavailable"
+  // status.text: footer text without colors, e.g. "☑ 4 (2!) ▸ #3 login test flakes on CI" ("" when hidden)
+  // status.counts?: { total, urgent, awaiting }  (only with "statusline": true)
+  // status.focus?: { ref, title, status }        (the item this session is working on)
+});
+```
+
+- **Requires the [Pi package](#pi-package).** The event comes from the Pi extension; installing only the agent skill does not emit it, and Claude Code and Codex have no equivalent.
+- **When it fires:** on session start and session tree changes, after each agent run, after `/tdo` actions (quick-add, work on an item, edit, priority, done, delete) and filing checks, and once more with `state: "hidden"` on session shutdown. `unavailable` means the store could not be read; `text` is then `☑ unavailable`.
+- **Not replayed:** a listener registered after an update misses it and gets the next one, so keep the last event you saw and render from that.
+- **Default footers are unaffected:** the footer status (`ctx.ui.setStatus("tdo", …)`) is still set as before, so footers that show extension statuses keep showing tdo with its own colors. A custom statusline that renders the event should hide the `tdo` status key to avoid showing it twice.
+
 ## How projects are identified
 
 In order, the first that applies:
