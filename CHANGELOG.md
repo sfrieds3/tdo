@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.11.0](https://github.com/sfrieds3/tdo/compare/v0.10.0...v0.11.0) (2026-11-21)
+
+
+### Features
+
+* emit a structured tdo:status event for Pi statuslines ([#69](https://github.com/sfrieds3/tdo/issues/69)) ([2c4a404](https://github.com/sfrieds3/tdo/commit/2c4a40460941449f2bf9ca35670efa52719bd5a6))
+* pick and launch tdo work in Rex ([#68](https://github.com/sfrieds3/tdo/issues/68)) ([44d6d71](https://github.com/sfrieds3/tdo/commit/44d6d7187190c3794e776a290d466d8f649655b2))
+
 ## [0.10.0](https://github.com/sfrieds3/tdo/compare/v0.9.0...v0.10.0) (2026-11-13)
 
 
